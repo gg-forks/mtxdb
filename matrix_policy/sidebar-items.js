@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EventIdPolicy","MatrixRecordClass","MatrixRoomVersion","RedactionPolicy","ReferenceHashEncoding","ReferenceHashInputPolicy","RoomIdPolicy","StateResolutionPolicy","ValidationProfile"],"fn":["matrix_pool_policies"],"struct":["RoomMetadata"]};
