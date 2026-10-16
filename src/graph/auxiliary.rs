@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use crate::database::DatabaseTransaction;
+use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
@@ -256,6 +258,91 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             }
         }
         self.engine.put_many(&self.collection_id, &physical)
+    }
+
+    /// Stage removal of one value by logical key. Returns `true` if a value
+    /// was present in the transaction's read snapshot. The caller must commit
+    /// the transaction to publish the removal.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Collision`] for a digest collision,
+    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
+    /// storage error. A concurrent change is reported as
+    /// [`StorageError::StaleRead`] when the transaction is committed.
+    pub fn remove(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        key: &[u8],
+    ) -> Result<bool, StorageError> {
+        Ok(self.stage_remove_many(transaction, pool, &[key])? != 0)
+    }
+
+    /// Stage several removals in one database transaction, returning the
+    /// number of values present in the transaction's read snapshot. The caller
+    /// must commit `transaction` to publish the removals. Duplicate keys are
+    /// removed once. Record-version preconditions protect the envelope checks
+    /// from concurrent replacement between validation and commit.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Collision`] for a digest collision,
+    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
+    /// storage error. A concurrent change is reported as
+    /// [`StorageError::StaleRead`] when the transaction is committed.
+    pub fn stage_remove_many(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        keys: &[&[u8]],
+    ) -> Result<usize, StorageError> {
+        let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
+        if engine_identity != transaction.pool_identity(pool) {
+            return Err(StorageError::Internal(
+                "auxiliary index and transaction use different storage pools".to_owned(),
+            ));
+        }
+
+        let mut ids = Vec::with_capacity(keys.len());
+        let mut digests_by_id: HashMap<NodeId, AuxiliaryKeyDigest> =
+            HashMap::with_capacity(keys.len());
+        for key in keys {
+            let digest = auxiliary_key_digest(key);
+            let id = physical_id(&digest);
+            if let Some(previous) = digests_by_id.insert(id, digest) {
+                if previous != digest {
+                    return Err(StorageError::Collision(
+                        "auxiliary-index key digest collision".to_owned(),
+                    ));
+                }
+            } else {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let (existing, versions) =
+            transaction.get_with_record_versions(pool, &self.collection_id, &ids)?;
+        let mut present = 0usize;
+        for ((id, record), version) in ids.iter().zip(&existing).zip(versions) {
+            if let Some(record) = record {
+                let digest = digests_by_id.get(id).ok_or_else(|| {
+                    StorageError::Internal("auxiliary digest lookup failed".to_owned())
+                })?;
+                decode_value(digest, &record.bytes)?;
+                present = present.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("auxiliary removal count overflow".to_owned())
+                })?;
+            }
+            transaction
+                .expect_record_version(pool, self.collection_id, *id, version)
+                .map_err(StorageError::Io)?;
+        }
+        transaction
+            .remove_many(pool, self.collection_id, &ids)
+            .map_err(StorageError::Io)?;
+        Ok(present)
     }
 }
 

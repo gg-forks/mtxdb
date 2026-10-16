@@ -335,6 +335,12 @@ pub trait StorageEngine: Send + Sync {
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError>;
 
+    /// Remove one record from a collection. Missing records are a no-op.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on storage failure.
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError>;
+
     /// Delete all nodes for a given collection (range delete).
     ///
     /// # Errors
@@ -1124,6 +1130,14 @@ impl StorageEngine for InMemoryStorage {
             collection.insert(*id, data.clone());
         }
         Ok(entries.len())
+    }
+
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
+        Ok(self
+            .collections
+            .write()
+            .get_mut(collection_id)
+            .is_some_and(|collection| collection.remove(id).is_some()))
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
