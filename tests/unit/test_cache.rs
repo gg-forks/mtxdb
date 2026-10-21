@@ -1,7 +1,11 @@
 #![allow(clippy::tests_outside_test_module)]
 
 use mtxdb::cache::*;
-use std::sync::Arc;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use mtxdb::storage::{NodeData, NodeId};
 
@@ -70,7 +74,7 @@ fn test_hit_rate() {
 
     assert_eq!(cache.hits(), 2);
     assert_eq!(cache.misses(), 1);
-    assert!((cache.hit_rate() - 0.666).abs() < 0.01);
+    assert_eq!(cache.hit_rate().total_cmp(&0.6666), Ordering::Equal);
 }
 
 #[test]
@@ -115,5 +119,158 @@ fn test_remove() {
     cache.insert(id, test_data("data"));
     assert!(cache.remove(&id).is_some());
     assert!(cache.get(&id).is_none());
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_generic_lru_eviction_and_refresh() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    assert_eq!(cache.get(&"a"), Some(1));
+    cache.insert("c", 3);
+    assert_eq!(cache.get(&"b"), None);
+    assert_eq!(cache.get(&"a"), Some(1));
+    assert_eq!(cache.get(&"c"), Some(3));
+}
+
+#[test]
+fn test_generic_lru_zero_capacity_and_stats() {
+    let cache = LruCache::<u8, u8>::new(0);
+    cache.insert(1, 1);
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.hits(), 0);
+    assert_eq!(cache.misses(), 1);
+    assert_eq!(cache.hit_rate().total_cmp(&0.0), Ordering::Equal);
+}
+
+struct MaybePanicCloneKey {
+    value: u8,
+    panic_on_clone: bool,
+}
+
+impl Clone for MaybePanicCloneKey {
+    fn clone(&self) -> Self {
+        assert!(!self.panic_on_clone, "test clone panic");
+        Self {
+            value: self.value,
+            panic_on_clone: self.panic_on_clone,
+        }
+    }
+}
+
+impl PartialEq for MaybePanicCloneKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for MaybePanicCloneKey {}
+
+impl Hash for MaybePanicCloneKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+#[test]
+fn test_generic_lru_panic_during_key_clone_is_transactional() {
+    let cache = LruCache::new(1);
+    let resident = MaybePanicCloneKey {
+        value: 1,
+        panic_on_clone: false,
+    };
+    cache.insert(resident, 10);
+
+    let panicking = MaybePanicCloneKey {
+        value: 2,
+        panic_on_clone: true,
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| cache.insert(panicking, 20)));
+    assert!(result.is_err());
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache.get(&MaybePanicCloneKey {
+            value: 1,
+            panic_on_clone: false
+        }),
+        Some(10)
+    );
+}
+
+#[test]
+fn test_generic_lru_hit_rate_preserves_small_positive_values() {
+    let cache = LruCache::new(1);
+    cache.insert(1, 1);
+    assert_eq!(cache.get(&1), Some(1));
+    for key in 2..=10_001 {
+        assert_eq!(cache.get(&key), None);
+    }
+    assert!(cache.hit_rate() > 0.0);
+}
+
+#[test]
+fn test_generic_lru_remove_and_reinsert() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+
+    assert_eq!(cache.remove(&"a"), Some(1));
+    assert_eq!(cache.get(&"a"), None);
+    assert_eq!(cache.len(), 1);
+
+    cache.insert("a", 3);
+    assert_eq!(cache.get(&"a"), Some(3));
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn test_generic_lru_clear() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    cache.clear();
+
+    assert!(cache.is_empty());
+    assert_eq!(cache.get(&"a"), None);
+    assert_eq!(cache.get(&"b"), None);
+}
+
+#[test]
+fn test_generic_lru_replacement_refreshes_recency() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    cache.insert("a", 10);
+    cache.insert("c", 3);
+
+    assert_eq!(cache.get(&"a"), Some(10));
+    assert_eq!(cache.get(&"b"), None);
+    assert_eq!(cache.get(&"c"), Some(3));
+}
+
+#[test]
+fn test_generic_lru_concurrent_access() {
+    const THREADS: usize = 8;
+    const ITEMS_PER_THREAD: usize = 64;
+    let cache = Arc::new(LruCache::new(THREADS * ITEMS_PER_THREAD));
+    let ready = Arc::new(Barrier::new(THREADS));
+
+    thread::scope(|scope| {
+        for thread_id in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            let ready = Arc::clone(&ready);
+            scope.spawn(move || {
+                ready.wait();
+                for offset in 0..ITEMS_PER_THREAD {
+                    let key = thread_id * ITEMS_PER_THREAD + offset;
+                    cache.insert(key, key * 2);
+                    assert_eq!(cache.get(&key), Some(key * 2));
+                    assert_eq!(cache.remove(&key), Some(key * 2));
+                }
+            });
+        }
+    });
+
     assert!(cache.is_empty());
 }
