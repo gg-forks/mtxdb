@@ -310,78 +310,21 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
 /// Version byte of the signing-key record value encoding.
 pub const KEY_RECORD_VERSION: u8 = 1;
 
-/// Which of an origin's signing-key records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyRecordKind {
-    /// Cumulative `verify_keys` and `old_verify_keys` ever seen.
-    Historical,
-    /// Key ids bound only through a notary so far.
-    Provisional,
-    /// Key ids observed as currently active by a direct fetch.
-    Corroborated,
-    /// The last verbatim self-signed payload, re-served by the notary.
-    Notary,
-}
-
-impl KeyRecordKind {
-    /// Every kind, for scan and summary paths.
-    pub const ALL: [Self; 4] = [
-        Self::Historical,
-        Self::Provisional,
-        Self::Corroborated,
-        Self::Notary,
-    ];
-
-    /// The kind tag written into the record-id pre-image.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Historical => "historical",
-            Self::Provisional => "provisional",
-            Self::Corroborated => "corroborated",
-            Self::Notary => "notary",
-        }
-    }
-
-    /// Parse a kind tag, or `None` for an unknown tag.
-    #[must_use]
-    pub fn parse(tag: &str) -> Option<Self> {
-        match tag {
-            "historical" => Some(Self::Historical),
-            "provisional" => Some(Self::Provisional),
-            "corroborated" => Some(Self::Corroborated),
-            "notary" => Some(Self::Notary),
-            _ => None,
-        }
-    }
-
-    fn as_bytes(self) -> &'static [u8] {
-        self.as_str().as_bytes()
-    }
-}
-
 /// Derive the collection holding every origin's signing-key records.
 #[must_use]
 pub fn server_keys_collection_id() -> [u8; 16] {
     derive_id(b"sys", b"server-keys")
 }
 
-/// Derive the record id of one signing-key record of `origin`.
+/// Derive the record id of `origin`'s Notary record, the verbatim self-signed
+/// payload the notary endpoint re-serves. Its keys live in per-origin
+/// collections; see [`crate::server_keys`].
 #[must_use]
-pub fn server_key_record_id(kind: KeyRecordKind, origin: &[u8]) -> [u8; 16] {
-    let mut identifier = Vec::with_capacity(
-        kind.as_bytes()
-            .len()
-            .saturating_add(origin.len())
-            .saturating_add(1),
-    );
-    identifier.extend_from_slice(kind.as_bytes());
-    identifier.push(0);
-    identifier.extend_from_slice(origin);
-    derive_id(b"server-key", &identifier)
+pub fn notary_record_id(origin: &[u8]) -> [u8; 16] {
+    derive_id(b"server-key-notary", origin)
 }
 
-/// Encode one signing-key record for storage.
+/// Encode a Notary record for storage: the origin, then the payload verbatim.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] if the origin does not fit its length
@@ -401,7 +344,7 @@ pub fn encode_server_key(origin: &[u8], payload: &[u8]) -> Result<Vec<u8>, Stora
     Ok(out)
 }
 
-/// Decode a stored signing-key record into its origin and payload.
+/// Decode a stored Notary record into its origin and payload.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] for a truncated record or an unknown

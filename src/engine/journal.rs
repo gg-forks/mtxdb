@@ -2047,6 +2047,10 @@ pub struct JournalCoordinator {
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Why a published group could not be applied to the packs and index, once
+    /// one failed. Unlike `poisoned` this leaves the committer running, so
+    /// groups already published still reach disk and a reopen replays them.
+    apply_failure: std::sync::OnceLock<String>,
     /// Number of sync requests entering the coordinator.
     sync_calls: AtomicU64,
     /// Number of sync requests that found the journal mutex occupied.
@@ -2261,6 +2265,7 @@ impl JournalCoordinator {
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
+            apply_failure: std::sync::OnceLock::new(),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
@@ -2495,8 +2500,8 @@ impl JournalCoordinator {
         }
     }
 
-    /// Record that the transaction group whose first frame is `first_lsn` has
-    /// been fully written to the packs, so coverage may pass it.
+    /// Record that the group whose first frame is `first_lsn` has been fully
+    /// written to the packs, so coverage may pass it.
     pub fn transaction_materialized(&self, first_lsn: u64) {
         self.unmaterialized.lock().remove(&first_lsn);
         self.notify_materialized();
@@ -2518,7 +2523,7 @@ impl JournalCoordinator {
     }
 
     /// Highest LSN a reader may treat as applied by every pool's index: one
-    /// below the earliest published-but-not-yet-materialized transaction group,
+    /// below the earliest published-but-not-yet-materialized group,
     /// or `u64::MAX` when nothing is pending.
     ///
     /// A pool-wide *materialized* watermark is a maximum, so out-of-order
@@ -3301,6 +3306,33 @@ impl JournalCoordinator {
         false
     }
 
+    /// Record that a published group could not be applied to the packs and
+    /// index. The WAL holds it, so the data is not lost, but this process's
+    /// index no longer matches the journal: new publications and versioned
+    /// reads that would wait for the group fail with `cause` until the database
+    /// is reopened and the WAL replayed. Only the first cause is kept.
+    pub(crate) fn fail_apply(&self, cause: String) {
+        let _ = self.apply_failure.set(cause);
+        // Wake reads waiting for the group so they see the failure.
+        self.notify_materialized();
+    }
+
+    /// The reason a published group failed to apply, if one did.
+    pub(crate) fn apply_failure(&self) -> Option<&str> {
+        self.apply_failure.get().map(String::as_str)
+    }
+
+    /// Fail if a published group could not be applied (see [`Self::fail_apply`]).
+    fn reject_if_apply_failed(&self) -> io::Result<()> {
+        match self.apply_failure() {
+            Some(cause) => Err(io::Error::other(format!(
+                "a published group failed to apply; reopen the database to \
+                 replay the WAL: {cause}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Fail if a failed commit or append poisoned the journal.
     fn reject_if_poisoned(&self) -> io::Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -3456,7 +3488,7 @@ impl JournalCoordinator {
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(ShardType::State, mutations)], false, &[], &[])?
+        self.publish_groups(&[(ShardType::State, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3473,7 +3505,7 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, &[], &[])?
+        self.publish_groups(&[(pool, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3493,7 +3525,7 @@ impl JournalCoordinator {
         mutations: &[Mutation],
         expectations: &[CollectionExpectation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, expectations, &[])?
+        self.publish_groups(&[(pool, mutations)], expectations, &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3532,7 +3564,7 @@ impl JournalCoordinator {
             .iter()
             .map(|(pool, mutations)| (*pool, *mutations))
             .collect::<Vec<_>>();
-        self.publish_groups(&staged, true, expectations, record_expectations)?
+        self.publish_groups(&staged, expectations, record_expectations)?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3653,22 +3685,22 @@ impl JournalCoordinator {
     /// Single publication path. Holds `publication` for the whole append so
     /// LSN assignment, the append and the visibility advance are one step.
     ///
-    /// A transaction group (`transaction` set) is published before its writes
-    /// are materialized into the packs. Until [`Self::transaction_materialized`]
-    /// says otherwise, no pool may claim coverage at or past its first frame:
+    /// Every group is published before its writes are materialized into the
+    /// packs. Until [`Self::transaction_materialized`] says otherwise, no pool
+    /// may claim coverage at or past its first frame:
     /// the packs do not hold those frames yet, so a claim (and the reclaim it
     /// would license) could lose an acknowledged commit to a crash. It is
-    /// registered here, under the journal lock, so no sync can promote a
-    /// watermark past the group before the group is on the floor list.
+    /// registered here, under the journal lock, so neither a read nor a sync
+    /// can advance past the group before it is on the floor list.
     fn publish_groups(
         &self,
         staged: &[(ShardType, &[Mutation])],
-        transaction: bool,
         expectations: &[CollectionExpectation],
         record_expectations: &[RecordExpectation],
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         self.validate_expectations(expectations, record_expectations)?;
+        self.reject_if_apply_failed()?;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -3702,9 +3734,9 @@ impl JournalCoordinator {
                 return Err(self.explain_full_segment(error, &journal));
             }
         };
-        if transaction {
-            self.unmaterialized.lock().insert(receipt.first_lsn);
-        }
+        // Register before advancing the visible version below, so a reader
+        // cannot observe this group without also seeing the floor it holds.
+        self.unmaterialized.lock().insert(receipt.first_lsn);
         debug_assert_eq!(
             receipt.first_lsn, expected_first_lsn,
             "appended group must start at the journal tail"

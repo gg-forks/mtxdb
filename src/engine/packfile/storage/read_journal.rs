@@ -1350,15 +1350,19 @@ impl PackfileStorage {
                 // materialization signal so the read wakes as soon as that
                 // thread finishes instead of polling; the timeout bounds a
                 // missed wake.
+                // A published group that failed to apply never materializes, so
+                // waiting for it would block until the caller times out.
+                if let Some(error) = apply_failed_error(&journal) {
+                    return Err(error);
+                }
                 if attempt < 2 {
                     std::thread::yield_now();
                 } else {
                     journal.wait_for_materialized(std::time::Duration::from_micros(50));
                 }
             }
-            Err(StorageError::WouldBlock(format!(
-                "collection version kept advancing during the read; retry \
-                 (version={version}, boundary={boundary})"
+            Err(StorageError::WouldBlock(stalled_boundary_message(
+                &journal, version, boundary,
             )))
         }
     }
@@ -1415,15 +1419,19 @@ impl PackfileStorage {
                         return Ok((data, versions));
                     }
                 }
+                // A published group that failed to apply never materializes, so
+                // waiting for it would block until the caller times out.
+                if let Some(error) = apply_failed_error(&journal) {
+                    return Err(error);
+                }
                 if attempt < 2 {
                     std::thread::yield_now();
                 } else {
                     journal.wait_for_materialized(std::time::Duration::from_micros(50));
                 }
             }
-            Err(StorageError::WouldBlock(format!(
-                "record versions kept advancing during the read; retry \
-                 (version={version}, boundary={boundary})"
+            Err(StorageError::WouldBlock(stalled_boundary_message(
+                &journal, version, boundary,
             )))
         }
     }
@@ -1725,3 +1733,37 @@ impl ReadSnapshot {
 #[cfg(test)]
 #[path = "test_read_journal.rs"]
 mod tests;
+
+/// Describe a versioned read whose boundary never reached its sampled version.
+/// The version is held fixed during the wait, so this means a published group
+/// is not materialized yet, not that the collection kept moving.
+fn stalled_boundary_message(
+    journal: &crate::journal::JournalCoordinator,
+    version: u64,
+    boundary: u64,
+) -> String {
+    let floor = journal.unmaterialized_floor();
+    if floor == u64::MAX {
+        format!(
+            "read boundary is behind the collection version \
+             (version={version}, boundary={boundary}); retry"
+        )
+    } else {
+        format!(
+            "read boundary is behind a published but unmaterialized group \
+             (version={version}, boundary={boundary}, pending_first_lsn={}); retry",
+            floor.saturating_add(1)
+        )
+    }
+}
+
+/// The error a versioned read returns once a published group failed to apply,
+/// instead of waiting for a boundary that can no longer advance.
+fn apply_failed_error(journal: &crate::journal::JournalCoordinator) -> Option<StorageError> {
+    journal.apply_failure().map(|cause| {
+        StorageError::Internal(format!(
+            "a published group failed to apply; reopen the database to replay \
+             the WAL: {cause}"
+        ))
+    })
+}
