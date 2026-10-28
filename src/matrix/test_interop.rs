@@ -13,6 +13,21 @@ fn derive_id_separates_domains_and_is_stable() {
 }
 
 #[test]
+fn room_version_record_round_trips_and_rejects_malformed_values() {
+    let encoded = encode_room_version_record("!room:example.com", "12").unwrap();
+    assert_eq!(
+        decode_room_version_record(&encoded).unwrap(),
+        ("!room:example.com", "12")
+    );
+    assert!(decode_room_version_record(&encoded[..7]).is_err());
+    assert!(decode_room_version_record(b"bad!").is_err());
+    assert_ne!(
+        room_version_collection_id(b"!a:example.com"),
+        room_version_collection_id(b"!b:example.com")
+    );
+}
+
+#[test]
 fn state_root_handle_v1_has_the_servers_pinned_layout() {
     let handle = StateRootHandleV1 {
         codec_version: 1,
@@ -126,24 +141,10 @@ fn server_keys_round_trip_and_reject_truncation() {
 }
 
 #[test]
-fn server_key_record_ids_are_distinct_per_kind_and_origin() {
-    let historical = server_key_record_id(KeyRecordKind::Historical, b"a.example");
-    let provisional = server_key_record_id(KeyRecordKind::Provisional, b"a.example");
-    let other = server_key_record_id(KeyRecordKind::Historical, b"b.example");
-    assert_ne!(historical, provisional);
-    assert_ne!(historical, other);
-    assert_eq!(
-        historical,
-        server_key_record_id(KeyRecordKind::Historical, b"a.example")
-    );
-}
-
-#[test]
-fn key_record_kinds_parse_their_tags() {
-    for kind in KeyRecordKind::ALL {
-        assert_eq!(KeyRecordKind::parse(kind.as_str()), Some(kind));
-    }
-    assert_eq!(KeyRecordKind::parse("wat"), None);
+fn notary_record_ids_are_distinct_per_origin() {
+    let one = notary_record_id(b"a.example");
+    assert_ne!(one, notary_record_id(b"b.example"));
+    assert_eq!(one, notary_record_id(b"a.example"));
 }
 
 #[test]

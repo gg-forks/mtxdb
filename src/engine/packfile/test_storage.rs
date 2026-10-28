@@ -900,7 +900,6 @@ fn post_repack_delta_epoch_replays_for_a_cold_reader() {
 
     let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
     reader.enable_read_journal(&wal).unwrap();
-
     let timings = reader
         .stats()
         .last_open_timings
@@ -3052,12 +3051,12 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .put(&collection, &batch_node(1), &NodeData::from_slice(b"one"))
         .unwrap();
     store.sync_all().unwrap();
-    store.delta_log_cap_override.store(1024, Ordering::Relaxed);
+    store.delta_log_cap_override.store(512, Ordering::Relaxed);
     store.invalidate_delta_log(&collection);
 
     let state = store.delta_state.lock().clone();
     let Err(error) = store.build_v1_pending_batch(&state, false) else {
-        panic!("the snapshot must not fit under a 1 KiB cap");
+        panic!("the snapshot must not fit under a 512-byte cap");
     };
     let detail = PackfileStorage::delta_batch_too_large(&error).expect("a too-large batch");
     let blob_len = store
@@ -3067,7 +3066,7 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .unwrap();
     let expected = delta::v1_empty_batch_len() + delta::v1_snapshot_frame_len(blob_len).unwrap();
     assert_eq!(detail.batch_bytes, expected);
-    assert_eq!(detail.cap, 1024);
+    assert_eq!(detail.cap, 512);
 
     // With the real cap the same pending snapshot builds.
     store.delta_log_cap_override.store(0, Ordering::Relaxed);
@@ -4055,6 +4054,154 @@ fn test_rebuild_index_triggers_on_full_table() {
 
     let got = store.get(&TEST_COLLECTION, &extra).unwrap().unwrap();
     assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+}
+
+#[test]
+fn full_scan_rebuild_keeps_latest_cross_shard_tombstone() {
+    let dir = test_dir("streaming_rebuild_latest_tombstone");
+    let collection = [0xA7; 16];
+    let victim = distinct_id(251);
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 48 * 1024).unwrap();
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 10_000, 120);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"new"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 20_000, 120);
+        assert!(store.remove(&collection, &victim).unwrap());
+        store.sync_all().unwrap();
+
+        let versions: Vec<_> = store
+            .scan_collection_records(&collection)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, id, _, _, _)| *id == victim)
+            .collect();
+        assert_eq!(versions.len(), 3, "old, overwrite, and tombstone frames");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|record| record.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each version should land in a different shard"
+        );
+    }
+
+    // Removing both derived index files forces the next open to rebuild from
+    // pack frames rather than trusting a checkpoint or shard-count sidecar.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    fs::remove_file(PackfileStorage::shard_collections_path(&dir)).unwrap();
+    let rebuilt = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(rebuilt.open_timings().unwrap().path, OpenPath::FullScan);
+    assert!(
+        rebuilt.get(&collection, &victim).unwrap().is_none(),
+        "the newest tombstone must win over both older values"
+    );
+    assert!(
+        !rebuilt.remove(&collection, &victim).unwrap(),
+        "lookup_removed must report the key as already removed"
+    );
+    drop(rebuilt);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn slots_only_reopen_resolves_removed_state_from_the_frame() {
+    let dir = test_dir("slots_only_lookup_removed");
+    let collection = [0xA8; 16];
+    let id = distinct_id(252);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&collection, &id, &NodeData::from_slice(b"value"))
+            .unwrap();
+        assert!(store.remove(&collection, &id).unwrap());
+        store.sync_all().unwrap();
+    }
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let generation = reopened.generation(&collection).unwrap();
+    assert_eq!(
+        generation.index.lookup_removed(&id),
+        None,
+        "the slots-only index cannot prove identity before hydration"
+    );
+    assert_eq!(
+        reopened.durable_removed(&collection, &id).unwrap(),
+        Some(true),
+        "the storage fallback verifies the full key and removal bit in the frame header"
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
+    let dir = test_dir("collection_len_slots_only_overlay_tombstone");
+    let wal = dir.join("wal.bin");
+    let collection = [0xA9; 16];
+    let tombstoned = distinct_id(250);
+    let live = distinct_id(251);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&collection, &tombstoned, &NodeData::from_slice(b"old"))
+            .unwrap();
+        assert!(store.remove(&collection, &tombstoned).unwrap());
+        store
+            .put(&collection, &live, &NodeData::from_slice(b"live"))
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: tombstoned,
+            payload: b"resurrected".to_vec(),
+        }])
+        .unwrap();
+    let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+    reader.enable_read_journal(&wal).unwrap();
+    assert_eq!(
+        reader.durable_removed(&collection, &tombstoned).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        reader.generation(&collection).unwrap().index.live_count(),
+        1
+    );
+    assert_eq!(
+        reader
+            .get_read_committed(&collection, &[tombstoned])
+            .unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"resurrected"[..])
+    );
+    assert_eq!(reader.collection_len(&collection).unwrap(), Some(2));
+
+    journal
+        .append_group(&[JournalMutation::RemoveRecord {
+            collection_id: collection,
+            node_id: tombstoned,
+        }])
+        .unwrap();
+    assert_eq!(
+        reader.collection_len(&collection).unwrap(),
+        Some(1),
+        "overlay removal of an already-tombstoned durable key must not subtract twice"
+    );
+
+    drop(reader);
+    drop(journal);
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -6648,6 +6795,78 @@ fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
 }
 
 #[test]
+fn physical_only_collection_bytes_survive_reopen_without_live_shard_membership() {
+    let dir = test_dir("physical_only_collection_bytes");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let target = distinct_id(0x41);
+    let neighbor = distinct_id(0x42);
+    store
+        .put(&TEST_COLLECTION, &target, &NodeData::from_slice(b"target"))
+        .unwrap();
+    store
+        .put(
+            &SECOND_COLLECTION,
+            &neighbor,
+            &NodeData::from_slice(b"neighbor"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let source_pack = *store
+        .index_tables
+        .read()
+        .collection_shards
+        .get(&TEST_COLLECTION)
+        .and_then(|packs| packs.iter().next())
+        .expect("target collection has a source pack");
+    assert!(
+        store
+            .index_tables
+            .read()
+            .collection_shards
+            .get(&SECOND_COLLECTION)
+            .is_some_and(|packs| packs.contains(&source_pack)),
+        "neighbor shares the target's source pack"
+    );
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let persisted = read_persisted_shard_collections(&dir).unwrap();
+    assert!(persisted.records.iter().any(|record| {
+        record.pack_id == source_pack
+            && record.collection_id == TEST_COLLECTION
+            && record.count == 0
+            && record.disk_bytes > 0
+    }));
+
+    let physical_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections[&TEST_COLLECTION]
+        .disk_bytes;
+    drop(store);
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION),
+        Some(&physical_bytes),
+        "physical totals include old frames retained in the shared source pack"
+    );
+    assert!(!reopened
+        .index_tables
+        .read()
+        .shard_collections
+        .get(&source_pack)
+        .is_some_and(|collections| collections.contains_key(&TEST_COLLECTION)));
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_collection_summaries_from_disk_capacity_matches_new_collection_floor() {
     // A one-node collection's live index starts at
     // `NEW_COLLECTION_INDEX_FLOOR` (64), never `LossyIndex::new`'s own
@@ -8890,7 +9109,12 @@ fn logical_redo_replays_in_order_and_the_counter_resumes_above_the_log() {
     drop(store);
 
     let reopened = PackfileStorage::open(dir.clone()).unwrap();
-    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "open timings: {:?}",
+        reopened.open_timings()
+    );
     assert_eq!(
         reopened
             .get(&collection, &batch_node(1))
@@ -9238,12 +9462,25 @@ fn applying_redo_sets_is_idempotent_and_order_convergent() {
         });
     }
     let fresh = || LossyIndex::with_config(16, config);
-    let once = PackfileStorage::apply_redo_sets(fresh(), &records, &pack_lookup).unwrap();
-    let twice = PackfileStorage::apply_redo_sets(once.clone(), &records, &pack_lookup).unwrap();
+    let once =
+        PackfileStorage::apply_redo_sets(&[1; 16], fresh(), &records, &pack_lookup, |_, _| None)
+            .unwrap();
+    let twice =
+        PackfileStorage::apply_redo_sets(&[1; 16], once.clone(), &records, &pack_lookup, |_, _| {
+            None
+        })
+        .unwrap();
     let over_prefix = {
-        let prefix =
-            PackfileStorage::apply_redo_sets(fresh(), &records[..350], &pack_lookup).unwrap();
-        PackfileStorage::apply_redo_sets(prefix, &records, &pack_lookup).unwrap()
+        let prefix = PackfileStorage::apply_redo_sets(
+            &[1; 16],
+            fresh(),
+            &records[..350],
+            &pack_lookup,
+            |_, _| None,
+        )
+        .unwrap();
+        PackfileStorage::apply_redo_sets(&[1; 16], prefix, &records, &pack_lookup, |_, _| None)
+            .unwrap()
     };
     assert_eq!(once.len(), 300, "300 distinct identities");
     for candidate in [&twice, &over_prefix] {
@@ -9769,13 +10006,14 @@ fn changes_since_includes_removals_and_pages_across_groups() {
         collection_id: collection,
         node_id: victim,
     };
-    let removal_lsn = store
+    let published = store
         .publish_mutation(|| removal.clone())
         .unwrap()
         .expect("journal is enabled");
     store
-        .apply_transaction_mutation(&removal, removal_lsn)
+        .apply_transaction_mutation(&removal, published.lsn)
         .unwrap();
+    store.note_published_materialized(Some(published));
     store
         .put(
             &collection,
@@ -10880,87 +11118,6 @@ fn build_index_fails_closed_when_the_table_rejects_an_insert() {
     assert_eq!(index.len(), offsets.len());
 }
 
-#[test]
-fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
-    // `open` hardcodes the default index config, so the FullScan rebuild path
-    // can only be starved by calling `init_collection_from_scan` directly. Its
-    // table is sized at 2× the record count (floored at 64), so a 1% load
-    // factor makes the first insert fail; the rebuild must surface that as
-    // `Corrupt`, not publish an index silently missing the record — the exact
-    // gap that let the original large-index rescan truncate.
-    let dir = test_dir("init_scan_fails_closed");
-    let store = PackfileStorage::open(dir.clone()).unwrap();
-    store
-        .put(
-            &TEST_COLLECTION,
-            &distinct_id(1),
-            &NodeData::new(bytes::Bytes::from_static(b"scan-record")),
-        )
-        .unwrap();
-    store.sync().unwrap();
-
-    // Collect the real on-disk (slot, hash, offset) for the seeded record so
-    // the control path's disk-length pass has a true offset to read.
-    let mut records: Vec<ShardRecord> = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|extension| extension != "pack") {
-            continue;
-        }
-        for (collection, hash, offset) in ShardPool::scan_shard(&path).unwrap() {
-            if collection == TEST_COLLECTION {
-                records.push((
-                    0,
-                    hash,
-                    offset,
-                    PackId([0u8; crate::packfile::PACK_ID_LEN]),
-                    false,
-                ));
-            }
-        }
-    }
-    assert_eq!(records.len(), 1, "the seeded record must be on disk");
-
-    let starved = crate::index::IndexConfig {
-        load_factor_percent: 1,
-        ..crate::index::IndexConfig::default()
-    };
-    let mut out = RoomScanOutput::default();
-    let error = PackfileStorage::init_collection_from_scan(
-        &TEST_COLLECTION,
-        &records,
-        &store.shards,
-        0,
-        starved,
-        &mut out,
-    )
-    .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("index rebuild dropped") && message.contains("too full"),
-        "unexpected error: {message}"
-    );
-
-    // Control: the same records rebuild completely at the default load factor,
-    // and the scan output counts their on-disk bytes.
-    let mut out = RoomScanOutput::default();
-    PackfileStorage::init_collection_from_scan(
-        &TEST_COLLECTION,
-        &records,
-        &store.shards,
-        0,
-        crate::index::IndexConfig::default(),
-        &mut out,
-    )
-    .unwrap();
-    let bytes =
-        out.collection_disk_bytes[&PackId([0u8; crate::packfile::PACK_ID_LEN])][&TEST_COLLECTION];
-    assert!(
-        bytes > 0,
-        "the rebuild must account for the record's disk bytes"
-    );
-}
-
 // ---- Removal markers when runtime slot order disagrees with write order ----
 //
 // A live pool recycles shard slots, so after the allocator wraps a newer pack
@@ -11063,33 +11220,23 @@ fn marker_in_lower_slot(
 /// frame in the highest slot.
 #[test]
 fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
-    let (dir, store, collection, victim, marker_slot, value_slot) =
+    let (dir, store, collection, victim, _marker_slot, _value_slot) =
         marker_in_lower_slot("lower_slot_rebuild", false);
-    let mut records: Vec<ShardRecord> = Vec::new();
-    records.extend(store.scan_collection_records(&collection).unwrap());
-    // The scan visits the lower slot (the marker) before the higher (the value).
-    let marker_pos = records
-        .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == marker_slot)
-        .unwrap();
-    let value_pos = records
-        .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == value_slot)
-        .unwrap();
-    assert!(marker_pos < value_pos, "the layout must be misordered");
-
-    let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
-    let chosen: Vec<_> = latest
-        .iter()
-        .filter(|(_, hash, _, _, _)| *hash == victim)
-        .collect();
-    assert_eq!(chosen.len(), 1, "one frame per key");
-    let (slot, _, offset, _, _) = *chosen[0];
-    assert!(
-        frame_is_removed(&store, slot, offset),
-        "the newest frame is the removal marker, whatever the slot order"
-    );
     drop(store);
+
+    // Remove persisted index state so open exercises the production streaming scan.
+    for entry in fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
+            || name.starts_with(INDEX_DELTA_FILE)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(reopened.get(&collection, &victim).unwrap().is_none());
+    drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11682,4 +11829,295 @@ fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
         "claimed coverage without a durable log entry"
     );
     crate::shard::clear_directory_sync_failure(&dir);
+}
+
+#[test]
+fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
+    let dir = test_dir("slots_only_identity_reads");
+    let collection = [0x7Au8; 16];
+
+    // Equal bucket bytes (0..8) and equal tag bytes (8..12): the lossy index
+    // cannot tell these two apart without reading the frame header. Only the
+    // bytes it does not inspect (12..16, plus the tail it does) differ.
+    let mut first = [0u8; 16];
+    first[..8].copy_from_slice(&[0x11; 8]);
+    first[8..12].copy_from_slice(&[0x22; 4]);
+    first[12..].copy_from_slice(&[0x33; 4]);
+    let mut second = first;
+    second[12..].copy_from_slice(&[0x44; 4]);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.force_index_checkpoint().unwrap();
+    drop(store);
+
+    // A checkpoint contains the collection's persisted index slots.
+    let checkpoint =
+        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
+            .expect("forced checkpoint is readable");
+    assert!(
+        checkpoint
+            .collections
+            .iter()
+            .any(|loaded| loaded.collection_id == collection),
+        "the forced checkpoint must contain this collection"
+    );
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening does not read identities"
+    );
+
+    store
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.stats().index_identity_reads,
+        1,
+        "a same-tag probe against a slots-only index must hydrate from the frame"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &first)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"first")),
+        "the colliding predecessor must still resolve"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &second)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"second"))
+    );
+}
+
+#[test]
+fn slots_only_delta_snapshot_is_short_and_replays() {
+    let dir = test_dir("slots_only_delta_snapshot");
+    let collection = [0x6Du8; 16];
+    let ids: Vec<[u8; 16]> = (0..200u8).map(distinct_id).collect();
+    let entries: Vec<([u8; 16], NodeData)> = ids
+        .iter()
+        .map(|id| (*id, NodeData::from_slice(b"payload")))
+        .collect();
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.put_many(&collection, &entries).unwrap();
+    // Baseline slots-only checkpoint gives the delta log a continuable base.
+    store.sync_all().unwrap();
+
+    // Promote the collection to a whole-index snapshot in the delta log.
+    store.invalidate_delta_log(&collection);
+    // A write marks the checkpoint dirty so the next sync takes the delta
+    // path; the snapshot serialized at sync time includes this record.
+    let extra = distinct_id(0xFE);
+    store
+        .put(
+            &collection,
+            &extra,
+            &NodeData::new(bytes::Bytes::from_static(b"extra")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let (len, _memory, capacity) = store
+        .collection_index_info(&collection)
+        .expect("collection");
+    assert_eq!(len, ids.len() + 1);
+    let capacity_bytes = u64::from(capacity);
+    let short_blob = 8 + capacity_bytes * 8;
+    let full_blob = 8 + capacity_bytes * 24;
+    let delta_bytes: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::index::delta::INDEX_DELTA_FILE)
+        })
+        .map(|entry| entry.metadata().map_or(0, |m| m.len()))
+        .sum();
+    assert!(
+        delta_bytes > short_blob,
+        "the batch must carry the snapshot: {delta_bytes} bytes"
+    );
+    assert!(
+        delta_bytes < full_blob,
+        "the snapshot must use the short form: {delta_bytes} bytes, full form is {full_blob}"
+    );
+    drop(store);
+
+    // Replay must accept the short snapshot and keep every record.
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for id in ids.iter().chain(std::iter::once(&extra)) {
+        assert!(
+            store.get(&collection, id).unwrap().is_some(),
+            "replayed snapshot lost a record"
+        );
+    }
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening must not read identities"
+    );
+
+    // The replayed collection is slots-only, so an overwrite hydrates from the
+    // frame exactly as a short checkpoint does.
+    let before = store.stats().index_identity_reads;
+    store
+        .put(
+            &collection,
+            &ids[0],
+            &NodeData::new(bytes::Bytes::from_static(b"again")),
+        )
+        .unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        before + 1,
+        "a replayed slots-only snapshot must hydrate on the first overwrite"
+    );
+}
+
+#[test]
+fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
+    let dir = test_dir("packidx_seal");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        let payload_byte = u8::try_from(index).expect("index is less than 200");
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[payload_byte; 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let (sidecars, packs) = fs::read_dir(&dir).unwrap().filter_map(Result::ok).fold(
+        (0_usize, 0_usize),
+        |(sidecars, packs), entry| {
+            let path = entry.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("idx") => (sidecars + 1, packs),
+                Some("pack") => (sidecars, packs + 1),
+                _ => (sidecars, packs),
+            }
+        },
+    );
+    assert!(sidecars > 0, "rotation seals at least one pack index");
+    assert!(packs > sidecars, "the active pack is not sealed yet");
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        reopened.open_timings().unwrap().packfile_recovery_calls,
+        u64::try_from(packs - sidecars).unwrap(),
+        "only the active pack pays the recovery scan"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .map(|collection| collection.disk_bytes);
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        expected_disk_bytes,
+        "reopened sidecar accounting matches physical pack bytes"
+    );
+    let rebuilt = reopened.rebuild_index(&TEST_COLLECTION).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(rebuilt.lookup(&id).is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
+    let dir = test_dir("packidx_full_scan");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index % 256).unwrap(); 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    // Remove the checkpoint so the next open takes the full-scan path. The
+    // sealed sidecars must still serve the indexes.
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+    let reopened = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Disabled,
+    )
+    .unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert!(
+        timings.pack_index_sidecars > 0,
+        "the full scan ingested at least one sealed sidecar"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .map(|collection| collection.disk_bytes);
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        expected_disk_bytes,
+        "full-scan sidecar accounting matches physical pack bytes"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
 }

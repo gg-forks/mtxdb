@@ -33,13 +33,14 @@
 //! collection ID that happens to spell a magic value can never misdirect the
 //! parser. A torn suffix is ignored and only complete batches are trusted.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
 use super::format::{DeltaFrame, DELTA_FRAME_LEN};
-use super::redo::{RedoRecord, REDO_RECORD_LEN};
+use super::redo::{RedoOp, RedoRecord, REDO_RECORD_LEN};
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
@@ -140,8 +141,9 @@ pub enum DeltaOperation {
         generation: u64,
         /// Stable position in `collection_order`.
         order_key: u64,
-        /// `LossyIndex::serialize()` bytes; semantic validation occurs during
-        /// replay, where the configured index policy is available.
+        /// `LossyIndex::serialize()` bytes in the slots-only v1 format. The
+        /// payload is self-describing by length; semantic validation occurs
+        /// during replay, where the configured index policy is available.
         index_blob: Vec<u8>,
     },
     /// Remove a collection from the replayed checkpoint state.
@@ -1068,6 +1070,175 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         coverage,
         coverage_prefix_ops,
     })
+}
+
+/// Identity used to discard superseded operations during delta compaction.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CompactKey {
+    /// One logical redo set, identified by its content hash.
+    RedoSet([u8; 16], [u8; 16]),
+    /// One physical slot overwrite, identified by its target bucket.
+    Incremental([u8; 16], u32),
+}
+
+/// Drop operations that a later operation in the same covered prefix supersedes.
+///
+/// The returned sequence preserves relative order and keeps the last coverage
+/// claim last. A collection snapshot or tombstone is a hard cut: everything
+/// earlier for that collection is dropped, and only the newest cut survives.
+/// The caller must only pass a prefix ending at a coverage claim; compacting
+/// past one would change what the claim proves.
+#[must_use]
+pub fn compact_operations(operations: &[DeltaOperation]) -> Vec<DeltaOperation> {
+    let mut last_cut: HashMap<[u8; 16], usize> = HashMap::new();
+    let mut last_dedup: HashMap<CompactKey, usize> = HashMap::new();
+    let mut last_coverage = None;
+
+    for (index, operation) in operations.iter().enumerate() {
+        match operation {
+            DeltaOperation::Redo(record) => match record.op {
+                RedoOp::Set { full_hash, .. } => {
+                    last_dedup.insert(CompactKey::RedoSet(record.collection_id, full_hash), index);
+                }
+                RedoOp::CollectionTombstone => {
+                    last_cut.insert(record.collection_id, index);
+                }
+            },
+            DeltaOperation::Incremental(frame) => {
+                last_dedup.insert(
+                    CompactKey::Incremental(frame.collection_id, frame.bucket),
+                    index,
+                );
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. }
+            | DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                last_cut.insert(*collection_id, index);
+            }
+            DeltaOperation::Coverage { .. } => last_coverage = Some(index),
+        }
+    }
+
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| match operation {
+            DeltaOperation::Coverage { .. } => {
+                (last_coverage == Some(index)).then(|| operation.clone())
+            }
+            DeltaOperation::Redo(record) => {
+                if last_cut
+                    .get(&record.collection_id)
+                    .is_some_and(|cut| index < *cut)
+                {
+                    return None;
+                }
+                let keep = match record.op {
+                    RedoOp::Set { full_hash, .. } => {
+                        last_dedup.get(&CompactKey::RedoSet(record.collection_id, full_hash))
+                            == Some(&index)
+                    }
+                    RedoOp::CollectionTombstone => {
+                        last_cut.get(&record.collection_id) == Some(&index)
+                    }
+                };
+                keep.then(|| operation.clone())
+            }
+            DeltaOperation::Incremental(frame) => {
+                if last_cut
+                    .get(&frame.collection_id)
+                    .is_some_and(|cut| index < *cut)
+                {
+                    return None;
+                }
+                (last_dedup.get(&CompactKey::Incremental(frame.collection_id, frame.bucket))
+                    == Some(&index))
+                .then(|| operation.clone())
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. }
+            | DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                (last_cut.get(collection_id) == Some(&index)).then(|| operation.clone())
+            }
+        })
+        .collect()
+}
+
+/// Minimum share of the log a compaction must release before it is worth the
+/// rewrite. Below this, the ordinary checkpoint path is cheaper than repeatedly
+/// compacting a working set that is genuinely growing.
+pub const MIN_COMPACTION_SAVINGS_PERCENT: u64 = 25;
+
+/// Rewrite a v1 delta log without the operations superseded inside its covered
+/// prefix. Returns the new on-disk length when a compaction was written.
+///
+/// This is an *in-place rewrite of the same epoch*: it keeps the log name, the
+/// base fingerprint, the tail fingerprint, and the final coverage claim, so all
+/// existing trust gates are unchanged. The rewrite goes to a sibling temp file,
+/// is fsynced, read back and compared, and only then renamed over the live log.
+/// A crash before the rename leaves the old log untouched; a crash after it
+/// leaves the new log, which is semantically identical for replay.
+///
+/// # Errors
+/// Returns an I/O error if the log cannot be read or the replacement cannot be
+/// written. A malformed or compacting-useless log returns `Ok(None)` and is
+/// left alone.
+pub fn compact_delta_log(path: &Path) -> io::Result<Option<u64>> {
+    let Some(log) = read_delta_log(path) else {
+        return Ok(None);
+    };
+    // Compaction is only safe over the prefix a coverage claim already proves.
+    // Requiring the claim to be the final operation keeps the rewritten batch's
+    // "coverage is last" rule intact.
+    if log.coverage_prefix_ops == 0 || log.coverage_prefix_ops != log.operations.len() {
+        return Ok(None);
+    }
+    let compacted = compact_operations(&log.operations);
+    if compacted.len() == log.operations.len() {
+        return Ok(None);
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("delta log path has no file name"))?;
+    let temp = path.with_file_name(format!(".{name}.compact"));
+    let _ = fs::remove_file(&temp);
+
+    let result = (|| {
+        append_batch_with_durability(
+            &temp,
+            true,
+            log.base_fingerprint,
+            &compacted,
+            log.tail_fingerprint,
+            true,
+        )?;
+        let check = read_delta_log(&temp)
+            .ok_or_else(|| io::Error::other("compacted delta log does not read back"))?;
+        if check.coverage != log.coverage || check.operations.len() != compacted.len() {
+            return Err(io::Error::other(
+                "compacted delta log failed its read-back check",
+            ));
+        }
+        let len = fs::metadata(&temp)?.len();
+        let original_len = fs::metadata(path)?.len();
+        // Avoid a compaction treadmill: a log that is mostly live keys gains
+        // little from a rewrite and would be back at the threshold after a few
+        // batches. Only publish when the freed fraction justifies it.
+        let required_max = original_len.saturating_mul(100 - MIN_COMPACTION_SAVINGS_PERCENT);
+        if len.saturating_mul(100) > required_max {
+            return Ok(None);
+        }
+        fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            crate::shard::sync_directory(parent)?;
+        }
+        Ok(Some(len))
+    })();
+
+    if !matches!(result.as_ref(), Ok(Some(_))) {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Append one batch (optional header, then a count-framed batch) to the delta

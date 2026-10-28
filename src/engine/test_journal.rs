@@ -153,10 +153,10 @@ fn shared_committed_watermark_is_per_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // Group one: state only. Only state's watermark may advance past zero.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_only = coordinator.committed_lsn();
     assert_eq!(
@@ -172,10 +172,10 @@ fn shared_committed_watermark_is_per_pool() {
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
 
     // Group two: event-DAG only. State's watermark must stay put.
-    coordinator
+    let event_receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(event_receipt.first_lsn);
     coordinator.sync().unwrap();
     assert_eq!(
         coordinator.committed_lsn_for_pool(ShardType::State),
@@ -215,13 +215,14 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
 
     // A transaction stages an event-DAG frame without going through
     // `publish`; it must still block reclaim until event-DAG checkpoints.
-    coordinator
+    let receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
         .unwrap();
-    coordinator
+    coordinator.transaction_materialized(receipt.first_lsn);
+    let receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(receipt.first_lsn);
     coordinator.sync().unwrap();
     let committed = coordinator.committed_lsn();
     assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);
@@ -249,20 +250,20 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // State contributes only the first group, then goes idle.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
 
     // Event-DAG writes several later groups that never carry a state frame.
     let mut event_lsn = 0;
     for id in 0..4u8 {
-        coordinator
+        let receipt = coordinator
             .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
-            .map(|receipt| receipt.last_lsn)
             .unwrap();
+        coordinator.transaction_materialized(receipt.first_lsn);
         coordinator.sync().unwrap();
         event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
     }
@@ -546,6 +547,8 @@ fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
 
     // One sync makes both groups durable and promotes each pool.
     coordinator.sync_through(2).unwrap();
+    coordinator.transaction_materialized(first.first_lsn);
+    coordinator.transaction_materialized(second.first_lsn);
     assert_eq!(coordinator.committed_lsn(), 2);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
@@ -3603,4 +3606,101 @@ fn either_segment_a_rewrite_crash_leaves_opens_and_numbers_consistently() {
         "numbering continues identically"
     );
     assert_eq!(next_lsns[0], second.last_lsn.saturating_add(1));
+}
+
+/// The original lookup: one pass over every staged mutation. Kept as the
+/// reference the incremental index must agree with.
+fn scan_lookup(
+    mutations: &[Mutation],
+    collection_id: &[u8; 16],
+    node_ids: &[[u8; 16]],
+) -> Vec<super::StagedLookup> {
+    use super::StagedLookup;
+    use std::collections::{HashMap, HashSet};
+
+    let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+    let mut newest: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
+    let mut last_delete: Option<usize> = None;
+    for (position, mutation) in mutations.iter().enumerate() {
+        match mutation {
+            Mutation::Put {
+                collection_id: staged,
+                node_id,
+                payload,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, Some(payload)));
+            }
+            Mutation::RemoveRecord {
+                collection_id: staged,
+                node_id,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, None));
+            }
+            Mutation::DeleteCollection {
+                collection_id: staged,
+            } if staged == collection_id => last_delete = Some(position),
+            _ => {}
+        }
+    }
+    node_ids
+        .iter()
+        .map(|node_id| match (newest.get(node_id), last_delete) {
+            (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+            (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+            (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
+            (None, None) => StagedLookup::Absent,
+        })
+        .collect()
+}
+
+#[test]
+fn staged_lookup_index_matches_a_full_scan() {
+    use crate::layout::ShardType;
+    use std::collections::HashSet;
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % u64::try_from(bound).unwrap()).unwrap()
+    };
+    let pool = ShardType::EventDag;
+    let pool_position = pool.index();
+    let ids: Vec<[u8; 16]> = (0..12_u8).map(|n| [n; 16]).collect();
+    let collections = [[0xa0_u8; 16], [0xb0_u8; 16]];
+    let stage = TxnStage::new();
+
+    for step in 0..600_u32 {
+        let collection = collections[next(2)];
+        let id = ids[next(12)];
+        match next(8) {
+            0..=2 => stage
+                .stage_put(pool, collection, id, step.to_le_bytes().to_vec())
+                .unwrap(),
+            3 => stage.stage_remove_record(pool, collection, id).unwrap(),
+            4 => stage.stage_delete_collection(pool, collection).unwrap(),
+            5 => stage
+                .stage_puts(pool, collection, &[(id, vec![1]), (ids[next(12)], vec![2])])
+                .unwrap(),
+            // These two rewrite the staged vector and must invalidate the index.
+            6 => stage
+                .forget_staged_records(pool, collection, &HashSet::from([id]))
+                .unwrap(),
+            _ => stage
+                .stage_removals_normalized(pool, collection, &[(id, 0)], &[id])
+                .unwrap(),
+        }
+        let mutations = stage.snapshot_mutations()[pool_position].clone();
+        for collection in &collections {
+            assert_eq!(
+                stage.lookup_many(pool, collection, &ids),
+                scan_lookup(&mutations, collection, &ids),
+                "step {step}"
+            );
+        }
+    }
+
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
 }

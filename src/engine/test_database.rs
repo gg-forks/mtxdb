@@ -320,7 +320,7 @@ fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
 
 /// A large batch of reads against a large stage preserves request order
 /// and resolves every id. This is a correctness test for the batch
-/// layering; the single-pass complexity is implemented by `lookup_many`.
+/// layering; the indexed lookup is implemented by `lookup_many`.
 #[test]
 fn a_large_batch_read_preserves_order_and_values() {
     const RECORDS: u16 = 4000;
@@ -2375,6 +2375,243 @@ fn unmaterialized_floor_pins_until_group_is_materialized() {
         u64::MAX,
         "materialization must release the floor"
     );
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `finish_recovery_stage` uses `swap_remove`, so finishing the first of three
+/// queued groups moves the last one into its slot. The read floor must still
+/// be pinned by the earliest unmaterialized group, whatever the queue order.
+#[test]
+fn recovery_queue_reorder_does_not_let_later_group_pass_earlier() {
+    let root = test_root("recovery_queue_reorder");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5bu8; 16];
+    let pool = ShardType::State;
+
+    let mut staged = Vec::new();
+    for id in 1..=3u8 {
+        let txn = database.begin_transaction();
+        txn.put(
+            pool,
+            collection,
+            node(id),
+            &NodeData::new(bytes::Bytes::from_static(b"pending")),
+        )
+        .unwrap();
+        let mut overlay = Some(activate_for(&database, &txn.stage));
+        database.publish_transaction(&txn.stage).unwrap();
+        let receipt = txn.stage.published_receipt().unwrap();
+        txn.stage.begin_materialization().unwrap();
+        database
+            .register_new_recovery_stage(Arc::clone(&txn.stage), receipt, &mut overlay)
+            .unwrap();
+        staged.push((Arc::clone(&txn.stage), receipt));
+        drop(txn);
+    }
+    let finish = |index: usize| {
+        let (stage, _) = &staged[index];
+        database.materialize_transaction(stage).unwrap();
+        stage.mark_published().unwrap();
+        database.finish_recovery_stage(stage).unwrap();
+    };
+    let second_first_lsn = staged[1].1.first_lsn;
+
+    // Finish the first group; swap_remove moves the third into slot 0.
+    finish(0);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "the second group must still pin the floor"
+    );
+    // The third group materializes ahead of the second.
+    finish(2);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "a later group must not lift the floor past an earlier pending one"
+    );
+
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+
+    drop(staged);
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A cross-pool transaction is one journal group whose `last_lsn` is the last
+/// pool's last entry. Versions are seeded from the group's `last_lsn`, so after
+/// a restart each pool's read boundary must reach that LSN once its own entries
+/// are replayed, even when the group's trailing entries belong to another pool.
+/// The live path already does this (`finish_recovery_stage` notes the group's
+/// `last_lsn` for every touched pool).
+#[test]
+fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
+    let root = test_root("replayed_cross_pool_boundary");
+    let event_collection = [0x70u8; 16];
+    let edge_collection = [0x71u8; 16];
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                node(1),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        for id in 1..=2u8 {
+            transaction
+                .put(
+                    ShardType::Edges,
+                    edge_collection,
+                    node(id),
+                    &NodeData::new(bytes::Bytes::from_static(b"edge")),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(transaction);
+        drop(database);
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    for (pool, collection, id) in [
+        (ShardType::EventDag, event_collection, node(1)),
+        (ShardType::Edges, edge_collection, node(2)),
+    ] {
+        let (records, _) = database
+            .pool(pool)
+            .get_with_collection_version(&collection, &[id])
+            .expect("a replayed group must not leave the pool's boundary behind its version");
+        assert!(records[0].is_some());
+    }
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A published autocommit write whose apply never completes means the live
+/// index no longer matches the journal. The database must fail fast with the
+/// cause (no version left ahead of the data, nothing blocking forever), and a
+/// reopen must replay the write from the WAL.
+#[test]
+fn failed_autocommit_apply_fails_fast_and_reopen_replays_it() {
+    let root = test_root("autocommit_apply_failure");
+    let collection = [0x5du8; 16];
+    let pool = ShardType::State;
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let store = database.pool(pool);
+        let published = store
+            .publish_mutation(|| crate::journal::Mutation::Put {
+                collection_id: collection,
+                node_id: node(9),
+                payload: b"published".to_vec(),
+            })
+            .unwrap();
+        assert!(published.is_some());
+        // The apply "fails": the guard is dropped without completing.
+        drop(published);
+
+        let error = store
+            .get_with_collection_version(&collection, &[node(9)])
+            .expect_err("a read must fail fast, not wait for a group that cannot apply");
+        assert!(
+            error.to_string().contains("failed to apply"),
+            "unexpected error: {error}"
+        );
+        let error = store
+            .put(
+                &collection,
+                &node(10),
+                &NodeData::new(bytes::Bytes::from_static(b"later")),
+            )
+            .expect_err("new writes must be rejected until a reopen");
+        assert!(error.to_string().contains("failed to apply"), "{error}");
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    let (records, _) = store
+        .get_with_collection_version(&collection, &[node(9)])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"published");
+    store
+        .put(
+            &collection,
+            &node(10),
+            &NodeData::new(bytes::Bytes::from_static(b"later")),
+        )
+        .unwrap();
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writers race while one publishes and fails to apply. Everything after the
+/// failure must error promptly (no hang), and after a reopen every write that
+/// did publish must be readable.
+#[test]
+fn concurrent_writers_see_a_failed_apply_promptly_and_reopen_keeps_published() {
+    let root = test_root("concurrent_apply_failure");
+    let collection = [0x5fu8; 16];
+    let pool = ShardType::State;
+    let published_ids = std::sync::Mutex::new(Vec::<u8>::new());
+    {
+        let database = Arc::new(Database::open(root.clone()).unwrap());
+        std::thread::scope(|scope| {
+            for writer in 0..4u8 {
+                let database = Arc::clone(&database);
+                let published_ids = &published_ids;
+                scope.spawn(move || {
+                    let store = database.pool(pool);
+                    for index in 0..40u8 {
+                        let id = writer * 40 + index;
+                        let mutation = crate::journal::Mutation::Put {
+                            collection_id: collection,
+                            node_id: node(id),
+                            payload: vec![id],
+                        };
+                        let published = match store.publish_mutation(|| mutation.clone()) {
+                            Ok(published) => published,
+                            Err(error) => {
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("published group failed to apply"),
+                                    "unexpected publication failure after apply error: {error}"
+                                );
+                                continue;
+                            }
+                        };
+                        published_ids.lock().unwrap().push(id);
+                        if writer == 0 && index == 10 {
+                            drop(published); // the apply fails
+                        } else {
+                            let lsn = published.as_ref().map(|published| published.lsn).unwrap();
+                            store.apply_transaction_mutation(&mutation, lsn).unwrap();
+                            store.note_published_materialized(published);
+                        }
+                        let _ = store.get_with_collection_version(&collection, &[node(id)]);
+                    }
+                });
+            }
+        });
+        assert!(database.coordinator().apply_failure().is_some());
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    for id in published_ids.into_inner().unwrap() {
+        let (records, _) = store
+            .get_with_collection_version(&collection, &[node(id)])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
+    }
 
     drop(database);
     let _ = std::fs::remove_dir_all(&root);

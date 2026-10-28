@@ -25,27 +25,75 @@ fn sample_inputs() -> Vec<PackIndexInput> {
             collection_id: [2; 16],
             logical_id: [0x80; 16],
             offset: frame_offset(40),
+            removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(20),
+            removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(80),
+            removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x20; 16],
             offset: frame_offset(60),
+            removed: false,
+            disk_bytes: 0,
         },
     ]
 }
 
 fn sample_index() -> PackIndex {
     PackIndex::build(sample_identity(), sample_inputs()).unwrap()
+}
+
+#[test]
+fn tombstone_wins_only_when_it_is_the_newest_version() {
+    let collection = [9; 16];
+    let key = [7; 16];
+    let build = |versions: &[(u64, bool)]| {
+        PackIndex::build(
+            sample_identity(),
+            versions
+                .iter()
+                .map(|(offset, removed)| PackIndexInput {
+                    collection_id: collection,
+                    logical_id: key,
+                    offset: frame_offset(*offset),
+                    removed: *removed,
+                    disk_bytes: 0,
+                })
+                .collect(),
+        )
+        .unwrap()
+    };
+
+    let removed_last = build(&[(20, false), (40, true)]);
+    assert_eq!(
+        removed_last.get_locator(&collection, &key),
+        Some(PackIndexLocator::Removed(
+            u32::try_from(frame_offset(40)).unwrap()
+        ))
+    );
+    assert_eq!(removed_last.get(&collection, &key), None);
+
+    let re_added_last = build(&[(20, false), (40, true), (60, false)]);
+    assert_eq!(
+        re_added_last.get_locator(&collection, &key),
+        Some(PackIndexLocator::Frame(
+            u32::try_from(frame_offset(60)).unwrap()
+        ))
+    );
+    assert!(PackIndex::decode(re_added_last.as_bytes()).is_some());
 }
 
 #[test]
@@ -71,6 +119,16 @@ fn sorted_pack_index_roundtrips_and_keeps_newest_duplicate() {
     );
     assert_eq!(decoded.get(&[3; 16], &[0x10; 16]), None);
     assert_eq!(decoded.identity(), built.identity());
+}
+
+#[test]
+fn dedup_accumulates_superseded_frame_disk_bytes() {
+    let mut inputs = sample_inputs();
+    inputs[1].disk_bytes = 25;
+    inputs[2].disk_bytes = 35;
+    let built = PackIndex::build(sample_identity(), inputs).unwrap();
+    let decoded = PackIndex::decode(built.as_bytes()).unwrap();
+    assert_eq!(decoded.collection_disk_bytes(&[1; 16]), Some(60));
 }
 
 #[test]
@@ -122,6 +180,8 @@ fn pack_index_rejects_offsets_before_frame_data() {
         collection_id: [1; 16],
         logical_id: [2; 16],
         offset: frame_offset(0).checked_sub(1).unwrap(),
+        removed: false,
+        disk_bytes: 0,
     }];
     assert_eq!(
         PackIndex::build(
@@ -146,6 +206,8 @@ fn pack_index_rejects_offsets_at_pack_end_during_build_and_decode() {
         collection_id: [1; 16],
         logical_id: [2; 16],
         offset: end,
+        removed: false,
+        disk_bytes: 0,
     };
     assert_eq!(
         PackIndex::build(
@@ -243,16 +305,22 @@ fn fanout_edges_and_equal_ids_are_isolated_by_collection() {
             collection_id: [1; 16],
             logical_id: [0x00; 16],
             offset: frame_offset(1),
+            removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0xff; 16],
             offset: frame_offset(2),
+            removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [2; 16],
             logical_id: [0x00; 16],
             offset: frame_offset(3),
+            removed: false,
+            disk_bytes: 0,
         },
     ];
     let index = PackIndex::build(
@@ -280,6 +348,8 @@ fn write_atomic_replaces_an_existing_complete_index() {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(100),
+            removed: false,
+            disk_bytes: 0,
         }],
     )
     .unwrap();
@@ -302,6 +372,62 @@ fn pack_index_writer_publishes_a_decodable_file() {
     let decoded = PackIndex::decode(&bytes).unwrap();
     assert_eq!(decoded.entry_count(), 3);
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn build_for_pack_round_trips_live_and_removed_records() {
+    use crate::storage::{NodeData, StorageEngine as _};
+    use crate::PackfileStorage;
+
+    let dir = std::env::temp_dir().join(format!("mtxdb-packidx-pack-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let collection = [0xAA; 16];
+    let live = [1; 16];
+    let removed = [2; 16];
+    store
+        .put(&collection, &live, &NodeData::from_slice(b"live"))
+        .unwrap();
+    store
+        .put(&collection, &removed, &NodeData::from_slice(b"gone"))
+        .unwrap();
+    store.remove(&collection, &removed).unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let pack = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .expect("the store wrote a pack");
+    build_and_write(&pack, true).unwrap();
+    let index = open_for_pack(&pack).expect("the sealed sidecar opens");
+    assert!(!index.identity().pack_id.is_zero());
+    let expected_disk_bytes: u64 = crate::packfile::scan_packfile_from_with_removal(&pack, 0, true)
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.collection_id == collection)
+        .map(|entry| entry.disk_bytes)
+        .sum();
+    assert_eq!(
+        index.collection_disk_bytes(&collection),
+        Some(expected_disk_bytes),
+        "the sidecar preserves the pack's physical byte total"
+    );
+    let mut live_seen = false;
+    let mut removed_seen = false;
+    index.for_each_entry(|collection_id, logical_id, locator| {
+        assert_eq!(collection_id, collection);
+        if logical_id == live {
+            live_seen = matches!(locator, PackIndexLocator::Frame(_));
+        }
+        if logical_id == removed {
+            removed_seen = matches!(locator, PackIndexLocator::Removed(_));
+        }
+    });
+    assert!(live_seen && removed_seen);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn test_path() -> PathBuf {

@@ -2,18 +2,20 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
+use mtxdb::export_schema::RejectionCode;
 use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
+use mtxdb::server_keys::KeyTier;
 use mtxdb::shard::ShardPool;
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
@@ -26,7 +28,7 @@ use mtxdb::{
 use rezzy::json::{self, Object, Value as OwnedValue};
 
 use crate::export_import;
-use crate::interchange::{self, KeyKind, KeyRecord, RoomExport};
+use crate::interchange::{self, KeyRecord, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
 use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
@@ -2562,15 +2564,6 @@ fn cmd_collections_in_dir(
             .collection_summaries(),
     };
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
-    let canonical_ids: HashMap<[u8; 16], String> = if canonical {
-        PackfileStorage::open_read_only(dir.to_path_buf())
-            .ok()
-            .map_or_else(HashMap::new, |store| {
-                canonical_collection_ids(&store, &collections)
-            })
-    } else {
-        HashMap::new()
-    };
     let physical_needed = layout
         || sort.is_some_and(|column| {
             matches!(
@@ -2656,10 +2649,6 @@ fn cmd_collections_in_dir(
         };
         ordering.then_with(|| left.0.cmp(&right.0))
     });
-    let canonical_width = canonical_column_width(canonical_ids.values());
-    let role_width = canonical_role_width(canonical_ids.values());
-    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
-    print_collection_table_header(layout, canonical, canonical_width, role_width);
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
@@ -2679,7 +2668,22 @@ fn cmd_collections_in_dir(
     } else {
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
-    for (_, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
+    let displayed: Vec<_> = ordered.into_iter().take(max_rows).collect();
+    let canonical_ids: HashMap<[u8; 16], String> = if canonical {
+        let displayed_summaries: Vec<_> = displayed.iter().map(|(_, s)| **s).collect();
+        PackfileStorage::open_read_only(dir.to_path_buf())
+            .ok()
+            .map_or_else(HashMap::new, |store| {
+                canonical_collection_ids(&store, &displayed_summaries)
+            })
+    } else {
+        HashMap::new()
+    };
+    let canonical_width = canonical_column_width(canonical_ids.values());
+    let role_width = canonical_role_width(canonical_ids.values());
+    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
+    print_collection_table_header(layout, canonical, canonical_width, role_width);
+    for (_, (collection_id, nodes, memory, capacity)) in displayed {
         let hex = format_id(collection_id);
         let canonical_id = canonical_ids
             .get(collection_id)
@@ -4008,7 +4012,7 @@ fn json_string_raw(text: &str) -> String {
 }
 
 /// A JSON string value including surrounding quotes.
-fn json_string(text: &str) -> String {
+pub(crate) fn json_string(text: &str) -> String {
     json_string_raw(text)
 }
 
@@ -8057,7 +8061,7 @@ fn cmd_import(
     // State-group mappings belong in the State pool, not the event pool.
     let state_store: &PackfileStorage = db.pool(ShardType::State);
     state_store.set_read_plan_policy(cli.read_plan);
-    let run = import_data(
+    let mut run = import_data(
         &db,
         store,
         state_store,
@@ -8066,6 +8070,56 @@ fn cmd_import(
         &import_template,
         &mut established_collections,
     );
+    let hash_audit_path = layout.root().join("content-hash-mismatches.jsonl");
+    if let Err(error) = write_hash_audit(&hash_audit_path, &run.hash_audit) {
+        eprintln!("writing {}: {error:#}", hash_audit_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        let differs = run
+            .hash_audit
+            .iter()
+            .filter(|row| !row.content_matches_redaction)
+            .count();
+        eprintln!(
+            "content-hash audit: {differs} content-differing events; details for {} total mismatches in {}",
+            run.hash_audit.len(),
+            hash_audit_path.display()
+        );
+    }
+    let signature_audit_path = layout.root().join("signature-findings.jsonl");
+    if let Err(error) = write_signature_audit(&signature_audit_path, &run.signature_audit) {
+        eprintln!("writing {}: {error:#}", signature_audit_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        eprintln!(
+            "signature audit: {} events did not verify; details in {}",
+            run.signature_audit.len(),
+            signature_audit_path.display()
+        );
+    }
+    let signature_late_path = layout.root().join("signature-late.jsonl");
+    if let Err(error) = write_signature_audit(&signature_late_path, &run.signature_late) {
+        eprintln!("writing {}: {error:#}", signature_late_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        eprintln!(
+            "signature late: {} events verified after their key's cached valid_until_ts; details in {}",
+            run.signature_late.len(),
+            signature_late_path.display()
+        );
+    }
+    let rejected_total = run
+        .rejection_counts
+        .values()
+        .copied()
+        .fold(0_usize, usize::saturating_add);
+    eprintln!("derived rejections: {rejected_total} events");
+    for (code, count) in run.rejection_counts.iter().filter(|(_, count)| **count > 0) {
+        eprintln!("  {count:>8}  {}", RejectionCode::from_u8(*code).tag());
+    }
     let (failures, server_keys_imported) = (run.failures, run.server_keys);
     store
         .sync_all()
@@ -8107,10 +8161,170 @@ struct ImportRun {
     /// vouches only for such a run: anything else leaves records the server
     /// cannot read, or data that did not all arrive.
     all_exports: bool,
+    /// Whether usable signing-key bytes were present after key inputs were
+    /// processed, including keys already stored by an earlier import.
+    signature_keys_available: bool,
+    /// Keys imported from this run's keys export, when present.
+    signature_catalog: Option<export_import::SignatureKeyCatalog>,
+    /// Content-hash mismatches captured with the same redaction used to store
+    /// each event and written as a JSONL sidecar after the input pass.
+    hash_audit: Vec<export_import::HashAudit>,
+    /// Events whose signature did not verify, written as a JSONL sidecar.
+    signature_audit: Vec<export_import::SignatureAudit>,
+    /// Newly imported bindings whose candidate timestamps must be reconciled.
+    imported_key_bindings: HashSet<export_import::KeyBinding>,
+    /// Verified time ranges observed across this run's room files.
+    verified_keys: HashMap<export_import::KeyBinding, (u64, u64)>,
+    /// Events that verified after their key's cached deadline, written as a
+    /// separate JSONL sidecar.
+    signature_late: Vec<export_import::SignatureAudit>,
+    /// Derived rejections by stored rejection code, across the run.
+    rejection_counts: std::collections::BTreeMap<u8, usize>,
+    /// Events with no usable in-window key for their signer.
+    signature_no_key: usize,
+    /// Events without the material needed to attempt signature verification.
+    signature_no_material: usize,
+    /// Events rejected because a usable key had a bad signature.
+    signature_invalid: usize,
+    /// Events that verified after their key's cached `valid_until_ts`.
+    signature_verified_late: usize,
 }
 
-/// The data phase of a run: import every input. Commits no marker, so a run
-/// that stops after this leaves the database visibly incomplete.
+fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
+    run.server_keys = run.server_keys || outcome.server_keys;
+    if let Some(catalog) = outcome.signature_catalog {
+        if let Some(existing) = &mut run.signature_catalog {
+            existing.extend(catalog);
+        } else {
+            run.signature_catalog = Some(catalog);
+        }
+    }
+    run.hash_audit.extend(outcome.hash_audit);
+    run.signature_audit.extend(outcome.signature_audit);
+    run.signature_late.extend(outcome.signature_late);
+    for (code, count) in outcome.rejection_counts {
+        let total = run.rejection_counts.entry(code).or_insert(0);
+        *total = total.saturating_add(count);
+    }
+    run.signature_no_key = run
+        .signature_no_key
+        .saturating_add(outcome.signature_no_key);
+    run.signature_no_material = run
+        .signature_no_material
+        .saturating_add(outcome.signature_no_material);
+    run.signature_invalid = run
+        .signature_invalid
+        .saturating_add(outcome.signature_invalid);
+    run.signature_verified_late = run
+        .signature_verified_late
+        .saturating_add(outcome.signature_verified_late);
+    run.imported_key_bindings.extend(outcome.key_bindings);
+    for observation in outcome.verified_keys {
+        run.verified_keys
+            .entry(observation.binding)
+            .and_modify(|(first, last)| {
+                *first = (*first).min(observation.first_seen_ms);
+                *last = (*last).max(observation.last_active_ms);
+            })
+            .or_insert((observation.first_seen_ms, observation.last_active_ms));
+    }
+    match outcome.exported {
+        Some(counts) => {
+            run.exported_events = run.exported_events.saturating_add(counts.events);
+            run.exported_closures = run.exported_closures.saturating_add(counts.closures);
+        }
+        None => run.all_exports = false,
+    }
+}
+
+/// Replace the run's content-hash audit sidecar, including an empty file when
+/// this run had no computable mismatches so stale rows cannot survive.
+fn write_hash_audit(path: &Path, rows: &[export_import::HashAudit]) -> anyhow::Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for row in rows {
+        writeln!(writer, "{}", row.json_line())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flushing {}", path.display()))
+}
+
+/// Replace the run's signature sidecar, including an empty file when every
+/// event verified so stale rows cannot survive.
+fn write_signature_audit(
+    path: &Path,
+    rows: &[export_import::SignatureAudit],
+) -> anyhow::Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for row in rows {
+        writeln!(writer, "{}", row.json_line())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flushing {}", path.display()))
+}
+
+/// `paths` with every server-keys export first, the rest after them, each
+/// group in argument order.
+fn keys_first(paths: &[PathBuf]) -> Vec<&PathBuf> {
+    let (keys, rest): (Vec<_>, Vec<_>) = paths.iter().partition(|path| is_server_keys_export(path));
+    keys.into_iter().chain(rest).collect()
+}
+
+/// The tagged format declared by an input's first nonblank line. Read only
+/// that line so large room exports need not be loaded during input ordering.
+/// A read or parse failure is left to the normal import pass, which reports it
+/// with the input path.
+fn input_export_format(path: &Path) -> Option<interchange::InputFormat> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) if line.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(_) => return interchange::detect(&line),
+        }
+    }
+}
+
+fn is_server_keys_export(path: &Path) -> bool {
+    input_export_format(path) == Some(interchange::InputFormat::Keys)
+}
+
+/// Whether the server-info pool contains at least one signing key with public
+/// key bytes. Notary payloads and evicted digest-only bindings do not enable
+/// signature verification.
+fn has_signing_key_material(store: &PackfileStorage) -> anyhow::Result<bool> {
+    for (collection, entries, _, _) in store.collection_summaries() {
+        if entries == 0 {
+            continue;
+        }
+        for item in store.scan_collection(&collection)? {
+            let (_, data) = item?;
+            let Ok((origin, key)) = mtxdb::server_keys::decode_server_key_record(&data.bytes)
+            else {
+                continue;
+            };
+            if mtxdb::server_keys::origin_keys_collection_id(&origin) == collection
+                && !key.key.is_empty()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The data phase of a run: import every input. Server keys are imported
+/// before room exports regardless of argument order, so later room verdict
+/// derivation can consult the imported keys. Commits no marker, so a run that
+/// stops after this leaves the database visibly incomplete.
 fn import_data(
     db: &Database,
     store: &PackfileStorage,
@@ -8120,17 +8334,77 @@ fn import_data(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
 ) -> ImportRun {
+    // Clear the marker before reading any input: an input that fails to parse
+    // never reaches the importers that clear it, and must not leave the marker
+    // of an earlier run vouching for a store this run may have changed.
+    let marker_cleared = export_import::clear_marker(db);
+    if let Err(error) = &marker_cleared {
+        eprintln!("clearing the import marker: {error:#}");
+    }
     let mut run = ImportRun {
-        failures: 0,
+        failures: usize::from(marker_cleared.is_err()),
         server_keys: false,
         exported_events: 0,
         exported_closures: 0,
-        all_exports: !paths.is_empty(),
+        all_exports: !paths.is_empty() && marker_cleared.is_ok(),
+        signature_keys_available: false,
+        signature_catalog: None,
+        hash_audit: Vec::new(),
+        signature_audit: Vec::new(),
+        imported_key_bindings: HashSet::new(),
+        verified_keys: HashMap::new(),
+        signature_no_key: 0,
+        signature_no_material: 0,
+        signature_invalid: 0,
+        signature_verified_late: 0,
+        signature_late: Vec::new(),
+        rejection_counts: std::collections::BTreeMap::new(),
     };
-    for (index, path) in paths.iter().enumerate() {
+    let mut key_state_checked = false;
+    let mut key_import_failed = false;
+    let mut signature_checks_enabled = false;
+    for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
+        if !key_state_checked && input_export_format(path) == Some(interchange::InputFormat::Room) {
+            key_state_checked = true;
+            let mut key_pool_ready = true;
+            if run.server_keys {
+                if let Err(error) = db.pool(ShardType::ServerInfo).sync_all() {
+                    eprintln!(
+                        "signature checks off: unable to persist imported signing keys: {error:#}"
+                    );
+                    run.failures = run.failures.saturating_add(1);
+                    run.all_exports = false;
+                    key_pool_ready = false;
+                }
+            }
+            if key_pool_ready {
+                if let Some(catalog) = &run.signature_catalog {
+                    run.signature_keys_available = catalog.has_key_material();
+                } else {
+                    match has_signing_key_material(db.server_info()) {
+                        Ok(available) => run.signature_keys_available = available,
+                        Err(error) => {
+                            eprintln!(
+                                "signature checks off: unable to inspect the signing-key store: {error:#}"
+                            );
+                            run.failures = run.failures.saturating_add(1);
+                            run.all_exports = false;
+                        }
+                    }
+                }
+            }
+            if key_import_failed {
+                eprintln!("signature checks off: signing keys failed to import");
+            } else if !run.signature_keys_available {
+                eprintln!("signature checks off: no signing keys loaded");
+            }
+            signature_checks_enabled =
+                key_pool_ready && run.signature_keys_available && !key_import_failed;
+        }
+        let is_keys_input = input_export_format(path) == Some(interchange::InputFormat::Keys);
         match cmd_import_file(
             db,
             store,
@@ -8139,26 +8413,55 @@ fn import_data(
             collection_override,
             template,
             established_collections,
+            signature_checks_enabled,
+            run.signature_catalog.as_ref(),
         ) {
-            Ok(outcome) => {
-                run.server_keys = run.server_keys || outcome.server_keys;
-                match outcome.exported {
-                    Some(counts) => {
-                        run.exported_events = run.exported_events.saturating_add(counts.events);
-                        run.exported_closures =
-                            run.exported_closures.saturating_add(counts.closures);
-                    }
-                    None => run.all_exports = false,
-                }
-            }
+            Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
                 eprintln!("{}: {error:#}", path.display());
                 run.failures = run.failures.saturating_add(1);
                 run.all_exports = false;
+                if is_keys_input {
+                    key_import_failed = true;
+                }
             }
         }
     }
+    reconcile_verified_key_observations(db, &mut run);
     run
+}
+
+fn reconcile_verified_key_observations(db: &Database, run: &mut ImportRun) {
+    let bindings: Vec<_> = run.imported_key_bindings.iter().collect();
+    let updates: Vec<_> = bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.origin.as_slice(),
+                binding.key_id.as_slice(),
+                run.verified_keys.get(binding).copied(),
+            )
+        })
+        .collect();
+    match mtxdb::server_keys::set_verified_observations(db, &updates) {
+        Ok(missing) => {
+            for index in missing {
+                let binding = bindings[index];
+                eprintln!(
+                    "updating verified signing-key metadata: {}/{} was not found",
+                    String::from_utf8_lossy(&binding.origin),
+                    String::from_utf8_lossy(&binding.key_id)
+                );
+                run.failures = run.failures.saturating_add(1);
+                run.all_exports = false;
+            }
+        }
+        Err(error) => {
+            eprintln!("updating verified signing-key metadata: {error}");
+            run.failures = run.failures.saturating_add(1);
+            run.all_exports = false;
+        }
+    }
 }
 
 /// The final phase of a run: make the data durable, then commit the marker in
@@ -8182,6 +8485,20 @@ fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
     eprintln!(
         "import complete: {} events, {} auth closures",
         run.exported_events, run.exported_closures
+    );
+    let corroborated = run
+        .verified_keys
+        .keys()
+        .filter(|binding| run.imported_key_bindings.contains(*binding))
+        .count();
+    eprintln!(
+        "signature checks: {} events with no usable key; {} without signature material; {} invalid signatures; {} verified late (past their key's cached valid_until_ts); {} of {} keys corroborated",
+        run.signature_no_key,
+        run.signature_no_material,
+        run.signature_invalid,
+        run.signature_verified_late,
+        corroborated,
+        run.imported_key_bindings.len()
     );
     Ok(())
 }
@@ -8746,7 +9063,7 @@ fn export_envelope_line(
 
 /// Compact, single-line JSON object from pre-rendered fields. Keys are static
 /// ASCII literals, so only the values need escaping (done by the callers).
-fn json_compact_object(fields: &[(&str, String)]) -> String {
+pub(crate) fn json_compact_object(fields: &[(&str, String)]) -> String {
     let mut out = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -9098,13 +9415,38 @@ struct ImportOutcome {
     /// batch must sync once: that pool is otherwise outside `cmd_import`'s
     /// default sync set.
     server_keys: bool,
+    /// Parsed key records, retained so each room can verify without scanning
+    /// the live `ServerInfo` pool during journal reclamation.
+    signature_catalog: Option<export_import::SignatureKeyCatalog>,
     /// The input was an `mtxdb-export` file, written in the server's layout;
     /// holds the event records it wrote (zero for a keys export). Only a run
     /// whose every input did this can be vouched for by the marker.
     exported: Option<export_import::ImportCounts>,
+    /// Content-hash mismatches from the room export, if this was one.
+    hash_audit: Vec<export_import::HashAudit>,
+    /// Events whose signature did not verify, from the room export.
+    signature_audit: Vec<export_import::SignatureAudit>,
+    /// Key bindings written by this input, whose candidate observation times
+    /// must be replaced by verified observations after all rooms are read.
+    key_bindings: Vec<export_import::KeyBinding>,
+    /// Verified key observations found in this input's room export.
+    verified_keys: Vec<export_import::VerifiedKeyObservation>,
+    /// Events that verified after their key's cached deadline.
+    signature_late: Vec<export_import::SignatureAudit>,
+    /// Derived rejections by stored rejection code, from this input.
+    rejection_counts: std::collections::BTreeMap<u8, usize>,
+    /// Events with no usable in-window key for their signer.
+    signature_no_key: usize,
+    /// Events without the material needed to attempt signature verification.
+    signature_no_material: usize,
+    /// Events rejected because a usable key had a bad signature.
+    signature_invalid: usize,
+    /// Events that verified after their key's cached `valid_until_ts`.
+    signature_verified_late: usize,
 }
 
 /// Import one input file through the state the batch shares with its readers.
+#[allow(clippy::too_many_arguments)]
 fn cmd_import_file(
     db: &Database,
     store: &PackfileStorage,
@@ -9113,6 +9455,8 @@ fn cmd_import_file(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
+    signature_checks_enabled: bool,
+    signature_catalog: Option<&export_import::SignatureKeyCatalog>,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -9120,6 +9464,8 @@ fn cmd_import_file(
         state_store,
         template,
         established_collections,
+        signature_checks_enabled,
+        signature_catalog,
     };
     context.import(path, collection_override)
 }
@@ -9137,6 +9483,8 @@ struct ImportContext<'a> {
     state_store: &'a PackfileStorage,
     template: &'a CollectionTemplate,
     established_collections: &'a mut HashSet<[u8; 16]>,
+    signature_checks_enabled: bool,
+    signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
 }
 
 impl ImportContext<'_> {
@@ -9174,21 +9522,36 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                let events = self
-                    .import_room_export(&export, collection_override)
-                    .with_context(|| format!("importing {}", path.display()))?;
-                Ok(ImportOutcome {
-                    server_keys: false,
-                    exported: Some(events),
-                })
+                if !self.signature_checks_enabled {
+                    self.import_room_export(&export, collection_override, None)
+                        .with_context(|| format!("importing {}", path.display()))
+                } else if let Some(catalog) = self.signature_catalog {
+                    self.import_room_export(&export, collection_override, Some(catalog))
+                        .with_context(|| format!("importing {}", path.display()))
+                } else {
+                    let catalog = export_import::SignatureKeyCatalog::read_for_room(
+                        self.db.server_info(),
+                        &export,
+                    )
+                    .with_context(|| {
+                        format!("reading signing keys needed by {}", export.room_id)
+                    })?;
+                    self.import_room_export(&export, collection_override, Some(&catalog))
+                        .with_context(|| format!("importing {}", path.display()))
+                }
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                self.import_keys_export(path, &records)?;
+                let signature_catalog = export_import::SignatureKeyCatalog::from_records(&records);
+                let key_bindings = self.import_keys_export(path, &records)?;
                 Ok(ImportOutcome {
                     server_keys: true,
+                    signature_catalog: Some(signature_catalog),
                     exported: Some(export_import::ImportCounts::default()),
+                    hash_audit: Vec::new(),
+                    key_bindings,
+                    ..ImportOutcome::default()
                 })
             }
         }
@@ -9345,16 +9708,16 @@ impl ImportContext<'_> {
 
     /// Import one `mtxdb-export/v1` room file.
     ///
-    /// The events go through the ordinary PDU path — that is what rebuilds
-    /// locators, short ids, auth closures, and state groups — while the
-    /// record's verdicts and the untouched PDU bytes take the two routes they
-    /// need: the verdicts into the room's metadata index, the bytes into the
-    /// store.
+    /// The untouched PDU bytes are stored as exported, and the edges, locators
+    /// and auth closures are rebuilt from them. Rejections are derived by
+    /// running the auth rules over the events; the export's own rejection
+    /// flags are not trusted. State groups are not built here yet.
     fn import_room_export(
         &mut self,
         export: &RoomExport,
         collection_override: Option<&str>,
-    ) -> anyhow::Result<export_import::ImportCounts> {
+        signature_keys: Option<&export_import::SignatureKeyCatalog>,
+    ) -> anyhow::Result<ImportOutcome> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
         }
@@ -9374,8 +9737,16 @@ impl ImportContext<'_> {
         }
         validate_establishment_room_version(&events)?;
         export_import::clear_marker(self.db)?;
-        let (written, findings) =
-            export_import::write_room_with_findings(self.db, export, export_import::BATCH_BYTES)?;
+        let (written, findings) = export_import::write_room_with_signature_keys(
+            self.db,
+            export,
+            export_import::BATCH_BYTES,
+            signature_keys,
+        )?;
+        eprintln!(
+            "  {}",
+            export_import::room_collections_line(&export.room_id)
+        );
         eprintln!(
             "  imported {} events, {} auth closures",
             written.events, written.closures
@@ -9384,30 +9755,58 @@ impl ImportContext<'_> {
             eprintln!("  warning: {warning}");
         }
         eprintln!("  exported by {}", export.server);
-        Ok(written)
+        Ok(ImportOutcome {
+            server_keys: false,
+            exported: Some(written),
+            hash_audit: findings.hash_audit,
+            signature_audit: findings.signature_audit,
+            verified_keys: findings.verified_keys,
+            signature_no_key: findings.signature_no_key,
+            signature_no_material: findings.signature_no_material,
+            signature_invalid: findings.signature_failures.len(),
+            signature_verified_late: findings.signature_verified_late,
+            signature_late: findings.signature_late,
+            rejection_counts: findings.rejection_counts,
+            ..ImportOutcome::default()
+        })
     }
 
     /// Import one `server_keys` export into the server-info pool, in the
-    /// layout the server reads. The payload bytes are stored as the export
-    /// decoded them: they are slipstream-encoded JSON the federation layer
-    /// decodes itself.
-    fn import_keys_export(&self, path: &Path, records: &[KeyRecord]) -> anyhow::Result<()> {
+    /// layout the server reads: one record per key in its origin's collection,
+    /// and each notary payload stored as the export decoded it.
+    fn import_keys_export(
+        &self,
+        path: &Path,
+        records: &[KeyRecord],
+    ) -> anyhow::Result<Vec<export_import::KeyBinding>> {
         export_import::clear_marker(self.db)?;
         export_import::write_keys(self.db, records)
             .with_context(|| format!("importing signing keys from {}", path.display()))?;
-        let mut summary = Vec::with_capacity(KeyKind::ALL.len());
-        for kind in KeyKind::ALL {
-            let count = records.iter().filter(|record| record.kind == kind).count();
-            if count > 0 {
-                summary.push(format!("{count} {}", kind.as_str()));
+        let (mut provisional, mut permanent, mut notary) = (0_usize, 0_usize, 0_usize);
+        for record in records {
+            match record {
+                KeyRecord::Key { key, .. } if key.tier == KeyTier::Provisional => {
+                    provisional = provisional.saturating_add(1);
+                }
+                KeyRecord::Key { .. } => permanent = permanent.saturating_add(1),
+                KeyRecord::Notary { .. } => notary = notary.saturating_add(1),
             }
         }
         eprintln!(
-            "imported {} signing-key records ({})",
-            records.len(),
-            summary.join(", ")
+            "imported {} signing-key records ({provisional} provisional, \
+             {permanent} permanent, {notary} notary)",
+            records.len()
         );
-        Ok(())
+        Ok(records
+            .iter()
+            .filter_map(|record| match record {
+                KeyRecord::Key { origin, key } => Some(export_import::KeyBinding {
+                    origin: origin.as_bytes().to_vec(),
+                    key_id: key.key_id.clone(),
+                }),
+                KeyRecord::Notary { .. } => None,
+            })
+            .collect())
     }
 }
 

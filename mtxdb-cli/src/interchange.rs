@@ -6,14 +6,20 @@
 //!   the first line, so the importer can tell this input apart from a plain
 //!   event stream before it reads anything else.
 //! * `event` — the `event_id`, the `pdu` as the source stored it, the
-//!   `prev_events` / `auth_events` lists, the `outlier` / `soft_failed` /
-//!   `rejected` verdicts, and verdict codes or `redacted_by` when the source
-//!   recorded them.
+//!   `prev_events` / `auth_events` lists, an optional `outlier` flag, and `redacted_by`
+//!   when the source recorded it. Verdicts are not part of an export: the
+//!   `rejected` / `soft_failed` flags and their codes are optional, read for
+//!   old files, and ignored by the importer, which derives rejections itself.
 //! * `end` — the event count. A file without it was truncated.
 //!
 //! A keys export drops the framing: every line is a `server_keys` record with
-//! an `origin`, one of four lifecycle kinds, and the base64 encoding of a
-//! slipstream-encoded JSON signing-key record.
+//! an `origin` and a `kind`. A `provisional` or `permanent` line is one
+//! signing key (`key_id`, base64 `key`, `valid_until_ts`, `source`,
+//! `ts_added_ms`, and optionally `expired_ts`, `first_seen_ms`,
+//! `last_active_ms`, `corroborated`, `inferred_retired` and, for a provisional
+//! key, `promote_by_ms`; a key whose bytes were evicted carries a base64
+//! `digest` and no `key`); a `notary` line is the origin's self-signed payload, base64
+//! of its exact bytes.
 //!
 //! # What the importer derives from this
 //!
@@ -30,18 +36,23 @@
 //!   routing keeps one write's cost proportional to one room. Sparse verdicts
 //!   also rule out sorted runs — they are point lookups on tiny values, so the
 //!   engine's in-memory index is the right shape.
-//! * Federation signing keys go to a single index in the server-info pool,
-//!   keyed by lifecycle kind then origin. Signing keys are few (one per
-//!   origin, a handful per kind) and read as a unit, so they need no routing.
+//! * Federation signing keys go to the server-info pool, one collection per
+//!   origin holding one record per key id; the tier is a field of the key's
+//!   record. An origin has a handful of keys and reads them as a unit, so a
+//!   collection scan is the whole query and no index is kept. The notary
+//!   payload is stored beside them, byte for byte: re-encoding it would
+//!   invalidate its signature.
 //!
-//! The exported `pdu` bytes are stored exactly as written: redacting them again
-//! would lose whatever the source already redacted, and re-encoding the parsed
-//! JSON would not promise the same bytes back.
+//! The exported `pdu` bytes are retained as provenance. On a computed content
+//! hash mismatch, the importer stores the canonical redacted PDU instead, as
+//! required by Matrix event validation; all other PDUs keep their exported
+//! bytes.
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use bytes::Bytes;
-use mtxdb::export_schema::{field, tag};
+use mtxdb::export_schema::{field, key_kind, tag};
+use mtxdb::server_keys::{key_digest, KeyTier, ServerKey};
 use rezzy::json::{self, Object, Value as OwnedValue};
 
 /// The export format this importer accepts, as written on the `header` line.
@@ -55,10 +66,6 @@ pub(crate) enum InputFormat {
     /// A keys export: `server_keys` records only.
     Keys,
 }
-
-/// Which of an origin's signing-key records one `server_keys` line carries:
-/// the layout crate's kind, whose tags are the wire `kind` values.
-pub(crate) use mtxdb::interop::KeyRecordKind as KeyKind;
 
 /// Everything an `event` record says about an event beyond the PDU itself.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -96,6 +103,26 @@ pub(crate) struct RoomEvent {
 }
 
 impl RoomEvent {
+    /// [`Self::annotated`] without the source's verdicts: the `rejected` and
+    /// `soft_failed` flags are removed, so an auth check judges the event by
+    /// its own contents and cannot read the answer the exporting server
+    /// already gave.
+    pub(crate) fn unflagged(&self, room_id: &str) -> OwnedValue {
+        self.unflagged_from(&self.pdu, room_id)
+    }
+
+    /// [`Self::unflagged`] over `pdu` in place of the exported one, for an
+    /// auth check that must judge the event in a different form, such as its
+    /// redaction.
+    pub(crate) fn unflagged_from(&self, pdu: &OwnedValue, room_id: &str) -> OwnedValue {
+        let mut event = self.annotated_from(pdu, room_id);
+        if let OwnedValue::Object(fields) = &mut event {
+            set_flag(fields, "rejected", false);
+            set_flag(fields, "soft_failed", false);
+        }
+        event
+    }
+
     /// The event as this importer's analysis path should see it: the PDU with
     /// the record's verdicts merged in and the identity fields supplied when
     /// the PDU carries none.
@@ -103,7 +130,11 @@ impl RoomEvent {
     /// Only the returned value is analyzed. [`Self::pdu_bytes`] is what gets
     /// stored, so these merged flags never reach the store.
     pub(crate) fn annotated(&self, room_id: &str) -> OwnedValue {
-        let mut event = self.pdu.clone();
+        self.annotated_from(&self.pdu, room_id)
+    }
+
+    fn annotated_from(&self, pdu: &OwnedValue, room_id: &str) -> OwnedValue {
+        let mut event = pdu.clone();
         let OwnedValue::Object(fields) = &mut event else {
             return event;
         };
@@ -137,15 +168,23 @@ pub(crate) struct RoomExport {
     pub(crate) events: Vec<RoomEvent>,
 }
 
-/// One `server_keys` record with its decoded payload.
+/// One `server_keys` record.
 #[derive(Debug)]
-pub(crate) struct KeyRecord {
-    /// The server the keys belong to.
-    pub(crate) origin: String,
-    /// Which of the origin's records these keys are.
-    pub(crate) kind: KeyKind,
-    /// The payload bytes the export base64-encoded, decoded.
-    pub(crate) payload: Bytes,
+pub(crate) enum KeyRecord {
+    /// One signing key of an origin.
+    Key {
+        /// The server the key belongs to.
+        origin: String,
+        /// The key with its tier, source and timestamps.
+        key: ServerKey,
+    },
+    /// The origin's self-signed payload, exactly as exported.
+    Notary {
+        /// The server the payload belongs to.
+        origin: String,
+        /// The payload bytes the export base64-encoded, decoded.
+        payload: Bytes,
+    },
 }
 
 /// Classify an input by its first tagged line, without reading the rest.
@@ -230,8 +269,8 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
 ///
 /// # Errors
 /// Returns an error for a line that is not a JSON object, is not tagged
-/// `server_keys`, lacks `origin` / `kind` / `payload`, names an unknown kind,
-/// or carries payload bytes that are not base64.
+/// `server_keys`, lacks a field its kind requires, names an unknown kind, or
+/// carries key or payload bytes that are not base64 or are empty.
 pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
     let mut records = Vec::new();
     for (line, value, _) in tagged_lines(content)? {
@@ -243,27 +282,66 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
         if origin.is_empty() {
             bail!("line {line}: `origin` is empty");
         }
-        let kind_tag = require_string(line, object, field::KIND)?;
-        let Some(kind) = KeyKind::parse(kind_tag) else {
-            bail!("line {line}: unknown signing-key kind `{kind_tag}`");
+        let record = match require_string(line, object, field::KIND)? {
+            key_kind::NOTARY => KeyRecord::Notary {
+                origin,
+                payload: Bytes::from(require_base64(line, object, field::PAYLOAD)?),
+            },
+            kind @ (key_kind::PROVISIONAL | key_kind::PERMANENT) => {
+                let key_id = require_string(line, object, field::KEY_ID)?;
+                if key_id.is_empty() {
+                    bail!("line {line}: `key_id` is empty");
+                }
+                let tier = if kind == key_kind::PROVISIONAL {
+                    KeyTier::Provisional
+                } else {
+                    KeyTier::Permanent
+                };
+                let ts_added_ms = require_number(line, object, field::TS_ADDED_MS)?;
+                let (key, digest) = key_and_digest(line, object)?;
+                KeyRecord::Key {
+                    origin,
+                    key: ServerKey {
+                        key_id: key_id.as_bytes().to_vec(),
+                        key,
+                        valid_until_ts: require_number(line, object, field::VALID_UNTIL_TS)?,
+                        source: require_string(line, object, field::SOURCE)?
+                            .as_bytes()
+                            .to_vec(),
+                        ts_added_ms,
+                        tier,
+                        digest,
+                        first_seen_ms: optional_number(line, object, field::FIRST_SEEN_MS)?
+                            .unwrap_or(ts_added_ms),
+                        last_active_ms: optional_number(line, object, field::LAST_ACTIVE_MS)?
+                            .unwrap_or(ts_added_ms),
+                        corroborated: optional_bool(line, object, field::CORROBORATED)?,
+                        inferred_retired: optional_bool(line, object, field::INFERRED_RETIRED)?,
+                        expired_ts: optional_number(line, object, field::EXPIRED_TS)?,
+                        promote_by_ms: optional_number(line, object, field::PROMOTE_BY_MS)?
+                            .unwrap_or(0),
+                    },
+                }
+            }
+            other => bail!("line {line}: unknown signing-key kind `{other}`"),
         };
-        let payload = require_string(line, object, field::PAYLOAD)?;
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|error| anyhow!("line {line}: `payload` is not base64: {error}"))?;
-        if payload.is_empty() {
-            bail!("line {line}: `payload` is empty");
-        }
-        records.push(KeyRecord {
-            origin,
-            kind,
-            payload: Bytes::from(payload),
-        });
+        records.push(record);
     }
     if records.is_empty() {
         bail!("export has no `server_keys` records");
     }
     Ok(records)
+}
+
+/// A required, non-empty base64 field of a record, decoded.
+fn require_base64(line: usize, object: &Object, field: &str) -> anyhow::Result<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(require_string(line, object, field)?)
+        .map_err(|error| anyhow!("line {line}: `{field}` is not base64: {error}"))?;
+    if bytes.is_empty() {
+        bail!("line {line}: `{field}` is empty");
+    }
+    Ok(bytes)
 }
 
 /// Parse every non-empty line of an export as a tagged record.
@@ -302,9 +380,9 @@ fn parse_event(
     let prev_events = require_array(line, object, field::PREV_EVENTS)?.clone();
     let auth_events = require_array(line, object, field::AUTH_EVENTS)?.clone();
     let metadata = EventMetadata {
-        outlier: require_bool(line, object, field::OUTLIER)?,
-        rejected: require_bool(line, object, field::REJECTED)?,
-        soft_failed: require_bool(line, object, field::SOFT_FAILED)?,
+        outlier: optional_bool(line, object, field::OUTLIER)?,
+        rejected: optional_bool(line, object, field::REJECTED)?,
+        soft_failed: optional_bool(line, object, field::SOFT_FAILED)?,
         rejection_code: optional_code(line, object, field::REJECTION_CODE)?,
         soft_fail_code: optional_code(line, object, field::SOFT_FAIL_CODE)?,
         redacted_by: match object.get(field::REDACTED_BY) {
@@ -452,6 +530,54 @@ fn require_number(line: usize, object: &Object, field: &str) -> anyhow::Result<u
             .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer")),
         None => bail!("line {line}: record is missing `{field}`"),
     }
+}
+
+/// The key bytes and digest of a key record: `key`, `digest`, or both. With
+/// only a digest the bytes were evicted; with both they must agree.
+fn key_and_digest(line: usize, object: &Object) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+    let digest = match object.get(field::DIGEST) {
+        Some(_) => Some(require_base64(line, object, field::DIGEST)?),
+        None => None,
+    };
+    let key = match object.get(field::KEY) {
+        Some(_) => require_base64(line, object, field::KEY)?,
+        None if digest.is_some() => Vec::new(),
+        None => bail!("line {line}: record is missing `{}`", field::KEY),
+    };
+    let computed = key_digest(&key);
+    let digest = match digest {
+        Some(bytes) => <[u8; 32]>::try_from(bytes)
+            .map_err(|_| anyhow!("line {line}: `{}` is not 32 bytes", field::DIGEST))?,
+        None => computed,
+    };
+    if !key.is_empty() && digest != computed {
+        bail!(
+            "line {line}: `{}` does not match `{}`",
+            field::DIGEST,
+            field::KEY
+        );
+    }
+    Ok((key, digest))
+}
+
+/// An optional boolean field of a record, false when absent.
+fn optional_bool(line: usize, object: &Object, field: &str) -> anyhow::Result<bool> {
+    match object.get(field) {
+        None => Ok(false),
+        Some(_) => require_bool(line, object, field),
+    }
+}
+
+/// An optional non-negative integer field of a record.
+fn optional_number(line: usize, object: &Object, field: &str) -> anyhow::Result<Option<u64>> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer"))
+        })
+        .transpose()
 }
 
 /// An optional verdict code: absent, or an integer from 0 to 255.
@@ -735,47 +861,107 @@ mod tests {
         );
     }
 
+    const KEY_LINE: &str =
+        "{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"provisional\",\
+        \"key_id\":\"ed25519:A\",\"key\":\"AQID\",\"valid_until_ts\":99,\
+        \"source\":\"notary.example\",\"ts_added_ms\":7}\n";
+
     #[test]
-    fn parse_keys_reads_every_kind_and_decodes_the_payload() {
-        let mut export = String::new();
-        for kind in KeyKind::ALL {
-            writeln!(
-                export,
-                "{{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"{}\",\
-                 \"payload\":\"eyJrZXlzIjp7fX0=\"}}",
-                kind.as_str()
-            )
-            .expect("writing to a String cannot fail");
-        }
+    fn parse_keys_reads_keys_and_the_verbatim_notary_payload() {
+        let notary = "{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"notary\",\
+                      \"payload\":\"eyJrZXlzIjp7fX0=\"}\n";
+        let permanent = KEY_LINE.replace("provisional", "permanent");
+        let export = format!("{KEY_LINE}{permanent}{notary}");
         let records = parse_keys(export.as_bytes()).expect("keys export must parse");
-        assert_eq!(records.len(), KeyKind::ALL.len());
-        assert!(records
-            .iter()
-            .zip(KeyKind::ALL)
-            .all(|(record, kind)| record.kind == kind && record.origin == "example.org"));
+        assert_eq!(records.len(), 3);
+        let KeyRecord::Key { origin, key } = &records[0] else {
+            panic!("the first line is a key");
+        };
+        assert_eq!(origin, "example.org");
+        assert_eq!(key.key_id, b"ed25519:A");
+        assert_eq!(key.key, [1, 2, 3], "the key is base64-decoded");
         assert_eq!(
-            records[0].payload,
+            (key.valid_until_ts, key.ts_added_ms, key.tier),
+            (99, 7, KeyTier::Provisional)
+        );
+        assert_eq!(key.source, b"notary.example");
+        let KeyRecord::Key { key, .. } = &records[1] else {
+            panic!("the second line is a key");
+        };
+        assert_eq!(key.tier, KeyTier::Permanent);
+        let KeyRecord::Notary { payload, .. } = &records[2] else {
+            panic!("the third line is the notary payload");
+        };
+        assert_eq!(
+            *payload,
             Bytes::from_static(b"{\"keys\":{}}"),
             "the base64 payload must decode to its original bytes"
         );
     }
 
     #[test]
+    fn parse_keys_reads_an_evicted_key_by_its_digest() {
+        let digest = base64::engine::general_purpose::STANDARD.encode(key_digest(&[1, 2, 3]));
+        let line = KEY_LINE.replace("\"key\":\"AQID\"", &format!("\"digest\":\"{digest}\""));
+        let records = parse_keys(line.as_bytes()).expect("a digest alone is a key");
+        let KeyRecord::Key { key, .. } = &records[0] else {
+            panic!("a key");
+        };
+        assert!(key.key.is_empty(), "the bytes were evicted");
+        assert_eq!(key.digest, key_digest(&[1, 2, 3]));
+
+        let both = KEY_LINE.replace("\"key\"", &format!("\"digest\":\"{digest}\",\"key\""));
+        assert!(parse_keys(both.as_bytes()).is_ok(), "digest and key agree");
+        let wrong = both.replace("AQID", "AQIE");
+        assert!(parse_keys(wrong.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        let neither = KEY_LINE.replace("\"key\":\"AQID\",", "");
+        assert!(parse_keys(neither.as_bytes()).is_err());
+    }
+
+    #[test]
     fn parse_keys_rejects_a_bad_record() {
-        let cases: [(&str, &str); 5] = [
-            ("", "no `server_keys` records"),
-            ("{\"t\":\"header\"}\n", "carries only `server_keys`"),
+        let without = |field: &str| {
+            let members = [
+                ("origin", "\"example.org\""),
+                ("kind", "\"provisional\""),
+                ("key_id", "\"ed25519:A\""),
+                ("key", "\"AQID\""),
+                ("valid_until_ts", "99"),
+                ("source", "\"notary.example\""),
+                ("ts_added_ms", "7"),
+            ];
+            let body: Vec<String> = members
+                .iter()
+                .filter(|(name, _)| *name != field)
+                .map(|(name, value)| format!("\"{name}\":{value}"))
+                .collect();
+            format!("{{\"t\":\"server_keys\",{}}}\n", body.join(","))
+        };
+        let cases: Vec<(String, &str)> = vec![
+            (String::new(), "no `server_keys` records"),
             (
-                "{\"t\":\"server_keys\",\"origin\":\"o\",\"kind\":\"nope\",\"payload\":\"e30=\"}\n",
+                "{\"t\":\"header\"}\n".to_owned(),
+                "carries only `server_keys`",
+            ),
+            (
+                KEY_LINE.replace("provisional", "historical"),
                 "unknown signing-key kind",
             ),
+            (KEY_LINE.replace("AQID", "!!"), "not base64"),
+            (KEY_LINE.replace("\"AQID\"", "\"\""), "`key` is empty"),
+            (KEY_LINE.replace("example.org", ""), "`origin` is empty"),
+            (KEY_LINE.replace("ed25519:A", ""), "`key_id` is empty"),
+            (without("key"), "missing `key`"),
+            (without("valid_until_ts"), "missing `valid_until_ts`"),
+            (without("source"), "missing `source`"),
+            (without("ts_added_ms"), "missing `ts_added_ms`"),
             (
-                "{\"t\":\"server_keys\",\"origin\":\"o\",\"kind\":\"notary\",\"payload\":\"!!\"}\n",
+                "{\"t\":\"server_keys\",\"origin\":\"o\",\"kind\":\"notary\",\"payload\":\"!!\"}\n"
+                    .to_owned(),
                 "not base64",
-            ),
-            (
-                "{\"t\":\"server_keys\",\"origin\":\"\",\"kind\":\"notary\",\"payload\":\"e30=\"}\n",
-                "`origin` is empty",
             ),
         ];
         for (input, expected) in cases {

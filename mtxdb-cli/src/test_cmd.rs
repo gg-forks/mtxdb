@@ -6,15 +6,16 @@ use super::{
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
-    matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
-    meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
+    pretty_print_payload, record_matrix_adjacency, redacted_event_bytes, resolve_import_collection,
+    run, scan_payload_suffix, split_canonical_display, template_collection_id, template_node_id,
+    topological_event_order, valid_state_group_id, verify_auth_chain_edges, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
+    MetaReport, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -1961,11 +1962,33 @@ fn auth_chain_reimport_writes_nothing_new() {
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+    )
+    .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
     let first_import_records = count_pack_records(&auth_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         count_pack_records(&auth_dir),
@@ -2010,7 +2033,18 @@ fn import_establishment_persists_the_matrix_extension() {
     .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+    )
+    .unwrap();
 
     let collection_id = template_collection_id(&template, "!room");
     let metadata = store
@@ -2376,6 +2410,8 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        false,
+        None,
     )
     .unwrap();
 
@@ -2410,6 +2446,8 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        false,
+        None,
     )
     .unwrap();
 
@@ -2446,6 +2484,8 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         None,
         &template,
         &mut established,
+        false,
+        None,
     )
     .unwrap();
 
@@ -3299,6 +3339,8 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         None,
         &template,
         &mut established,
+        false,
+        None,
     )
     .unwrap();
     db.edges().sync_all().unwrap();
@@ -4517,23 +4559,27 @@ fn real_resolution_decides_a_fork_by_power_level_not_prev_order() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10","creator":"@admin:x"}}"#,
     );
+    let member = owned_value(
+        r#"{"event_id":"$admin-member","room_id":"!r:x","type":"m.room.member","state_key":"@admin:x","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"membership":"join"}}"#,
+    );
     let power_levels = owned_value(
-        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$admin-member"],"auth_events":["$create","$admin-member"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
     );
     let admin_topic = owned_value(
-        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"kept"}}"#,
+        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$admin-member","$pl"],"content":{"topic":"kept"}}"#,
     );
     let nobody_topic = owned_value(
-        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
+        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
     );
     let merge = |first: &str, second: &str, id: &str| {
         owned_value(&format!(
-            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["{first}","{second}"],"auth_events":["$create","$pl"],"content":{{}}}}"#
+            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":5,"prev_events":["{first}","{second}"],"auth_events":["$create","$admin-member","$pl"],"content":{{}}}}"#
         ))
     };
     let batch = |first: &str, second: &str, id: &str| {
         vec![
             create.clone(),
+            member.clone(),
             power_levels.clone(),
             admin_topic.clone(),
             nobody_topic.clone(),
@@ -4758,6 +4804,77 @@ const KEYS_EXPORT_FIXTURE: &str =
 
 const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 
+/// Replace the fixture's placeholder content hashes with the hashes its PDUs
+/// actually have. The exporter fixture uses `"sha256":"dummy"` because its
+/// byte-for-byte test does not run the hash check; the importer does, and a
+/// mismatch now stores the redacted form. The layout test wants the unchanged
+/// body, so make the hashes valid. The mismatch path has its own test.
+fn with_valid_content_hashes(content: &str) -> String {
+    let room_version = content
+        .lines()
+        .filter_map(|line| OwnedValue::parse_bytes(line.as_bytes()).ok())
+        .find_map(|value| {
+            let pdu = value.get("pdu")?;
+            (pdu.get("type")?.as_str()? == "m.room.create")
+                .then(|| {
+                    pdu.get("content")?
+                        .get("room_version")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .expect("layout fixture create event has a room version");
+
+    content
+        .lines()
+        .map(|line| {
+            if !line.contains("\"t\":\"event\"") {
+                return line.to_owned();
+            }
+            let value = OwnedValue::parse_bytes(line.as_bytes()).expect("valid fixture line");
+            let pdu = value.get("pdu").expect("fixture event has a pdu");
+            let hash = rezzy::compute_content_hash(pdu, &room_version)
+                .expect("fixture content hash is computable");
+            line.replacen("\"sha256\":\"dummy\"", &format!("\"sha256\":\"{hash}\""), 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The exporter fixture with the auth chain a real export carries: a member
+/// event for the creator, cited alongside the create event by every other
+/// event. The exporter's own fixture has empty auth lists, which is right for
+/// its byte-for-byte test but describes a room the auth rules refuse.
+///
+/// Every event passes the first auth check, so `$rejected` is a deliberate
+/// disagreement: the exporter rejected it, but the first check does not.
+fn room_export_with_auth() -> String {
+    const CREATE: &str = "$create:test.conduwuit.local";
+    const JOIN: &str = "$join:test.conduwuit.local";
+
+    let join = format!(
+        r#"{{"auth_events":["{CREATE}"],"event_id":"{JOIN}","outlier":false,"prev_events":[],"pdu":{{"auth_events":["{CREATE}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{JOIN}","origin_server_ts":123456789,"prev_events":[],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"#,
+    );
+
+    let mut lines = Vec::new();
+    for line in ROOM_EXPORT_FIXTURE.lines() {
+        if line.starts_with("{\"events\":") {
+            lines.push(join.clone());
+            lines.push(line.replace("\"events\":5", "\"events\":6"));
+            continue;
+        }
+        if !line.contains("\"t\":\"event\"") || line.contains(CREATE) {
+            lines.push(line.to_owned());
+            continue;
+        }
+        let auth = format!("[\"{JOIN}\",\"{CREATE}\"]");
+        let line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
+        lines.push(line);
+    }
+    with_valid_content_hashes(&lines.join("\n"))
+}
+
 /// Import `inputs` the way `mtxdb import` does, minus the final phase.
 fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)]) -> ImportRun {
     let paths: Vec<PathBuf> = inputs
@@ -4801,25 +4918,29 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    let content = room_export_with_auth();
+    let run = import_inputs(&db, &root, &[("room.jsonl", &content)]);
     assert_eq!(
         (run.failures, run.all_exports, run.exported_events),
-        (0, true, 5)
+        (0, true, 6)
     );
     finish_import(&db, &run).unwrap();
 
-    // The exporter's fixture: `$soft` is soft-failed with code 2 (Manual),
-    // `$rejected` is rejected with code 7 (AuthCheckFailed), `$redacted` was
-    // redacted by `$redaction`, and `$ok` carries no verdict.
-    let parsed = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    // The fixture with a creator membership: the export marks `$soft`
+    // soft-failed and `$rejected` rejected, but verdicts are derived, not
+    // migrated, so neither is stored. `$redacted` was redacted by
+    // `$redaction`, which is a fact about the stored event, and `$ok` carries
+    // no verdict.
+    let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
-    assert_eq!(parsed.events.len(), 5);
+    assert_eq!(parsed.events.len(), 6);
     let room_bytes = FIXTURE_ROOM.as_bytes();
     for event in &parsed.events {
         let id = event.event_id.as_bytes();
         let record = event_record_id(id);
 
-        // The body is the export's PDU, byte for byte.
+        // The body is the export's PDU, byte for byte. The fixture's hashes are
+        // valid (or absent), so no event here takes the redaction path.
         let body = stored(
             &db,
             EVENT_POOL,
@@ -4881,20 +5002,13 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             verdict
         })
     };
-    assert_eq!(
-        verdict("soft").unwrap(),
-        Verdict {
-            soft_fail: Some(2),
-            ..Verdict::default()
-        }
+    assert!(
+        verdict("soft").is_none(),
+        "an exported soft-fail is not migrated"
     );
-    assert_eq!(
-        verdict("rejected").unwrap(),
-        Verdict {
-            rejection: Some(7),
-            outlier: true,
-            ..Verdict::default()
-        }
+    assert!(
+        verdict("rejected").is_none(),
+        "an exported rejection is not migrated; it passes the derived check"
     );
     assert_eq!(
         verdict("redacted").unwrap(),
@@ -4910,16 +5024,17 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
 }
 
 #[test]
-fn outlier_is_independent_of_soft_fail_and_redaction_status() {
+fn an_exported_outlier_flag_is_not_migrated() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    // The exporter marks `$ok` an outlier; `$redacted` stays on the timeline.
-    let content = ROOM_EXPORT_FIXTURE.replace(
+    // The exporter marks `$ok` an outlier; the import derives its own.
+    let content = room_export_with_auth().replace(
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
     );
     assert_ne!(
-        content, ROOM_EXPORT_FIXTURE,
+        content,
+        room_export_with_auth(),
         "the fixture line this test edits moved"
     );
     import_inputs(&db, &root, &[("room.jsonl", &content)]);
@@ -4935,21 +5050,9 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
         )
         .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
     };
-    assert_eq!(
-        outlier("ok"),
-        Some(true),
-        "an exported outlier stays visible"
-    );
-    assert_eq!(
-        outlier("soft"),
-        Some(false),
-        "soft-failed does not imply outlier"
-    );
-    assert_eq!(
-        outlier("rejected"),
-        Some(true),
-        "a rejected event is not on the timeline"
-    );
+    assert_eq!(outlier("ok"), None, "an exported outlier is not migrated");
+    assert_eq!(outlier("soft"), None);
+    assert_eq!(outlier("rejected"), None);
     assert_eq!(
         outlier("redacted"),
         Some(false),
@@ -4959,8 +5062,7 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
 
 #[test]
 fn imported_keys_export_is_readable_in_the_servers_layout() {
-    use crate::interchange::KeyKind;
-    use mtxdb::interop::*;
+    use mtxdb::server_keys::{read_notary_payload, read_server_keys, KeyTier};
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
@@ -4970,39 +5072,77 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
         (0, true, 0)
     );
 
-    let mut seen = Vec::new();
+    let mut expected_keys = Vec::new();
+    let mut expected_notary = None;
     for line in KEYS_EXPORT_FIXTURE.lines() {
         let record = owned_value(line);
-        let kind = KeyKind::parse(&json_str(&record, "kind").unwrap())
-            .expect("the exporter writes only kinds the importer knows");
-        let origin = json_str(&record, "origin").unwrap();
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(json_str(&record, "payload").unwrap())
-            .unwrap();
-        let bytes = stored(
-            &db,
-            SERVER_INFO_POOL,
-            server_keys_collection_id(),
-            server_key_record_id(kind, origin.as_bytes()),
-        )
-        .expect("key record");
-        assert_eq!(
-            decode_server_key(&bytes).unwrap(),
-            (origin.as_bytes(), payload.as_slice()),
-            "{} payload must come back byte for byte",
-            kind.as_str()
-        );
-        seen.push(kind);
+        let decode = |field: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(json_str(&record, field).unwrap())
+                .unwrap()
+        };
+        match json_str(&record, "kind").unwrap().as_str() {
+            "notary" => expected_notary = Some(decode("payload")),
+            kind => expected_keys.push((
+                json_str(&record, "key_id").unwrap().into_bytes(),
+                record.get("key").map_or_else(Vec::new, |_| decode("key")),
+                json_str(&record, "source").unwrap().into_bytes(),
+                kind == "permanent",
+                record.get("expired_ts").and_then(OwnedValue::as_u64),
+                record
+                    .get("promote_by_ms")
+                    .and_then(OwnedValue::as_u64)
+                    .unwrap_or(0),
+                record.get("digest").is_some(),
+                false,
+            )),
+        }
     }
+
+    let stored = read_server_keys(db.server_info(), b"keys.example.org").unwrap();
+    let actual: Vec<_> = stored
+        .iter()
+        .map(|key| {
+            (
+                key.key_id.clone(),
+                key.key.clone(),
+                key.source.clone(),
+                key.tier == KeyTier::Permanent,
+                key.expired_ts,
+                key.promote_by_ms,
+                key.is_evicted(),
+                key.corroborated,
+            )
+        })
+        .collect();
+    expected_keys.sort();
+    assert_eq!(actual, expected_keys, "each key comes back field for field");
     assert_eq!(
-        seen.len(),
-        KeyKind::ALL.len(),
-        "the fixture has one record of each kind"
+        read_notary_payload(db.server_info(), b"keys.example.org").unwrap(),
+        expected_notary,
+        "the notary payload must come back byte for byte"
     );
+    assert!(read_server_keys(db.server_info(), b"other.example.org")
+        .unwrap()
+        .is_empty());
 }
 
 fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {
     export_import::read_marker(db).unwrap()
+}
+
+#[test]
+fn a_keys_export_is_detected_after_leading_blank_lines() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let room_path = root.join("room.jsonl");
+    let keys_path = root.join("keys.jsonl");
+    std::fs::write(&room_path, ROOM_EXPORT_FIXTURE).unwrap();
+    std::fs::write(&keys_path, format!("\n\n{KEYS_EXPORT_FIXTURE}")).unwrap();
+
+    assert!(is_server_keys_export(&keys_path));
+    assert!(!is_server_keys_export(&room_path));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -5069,6 +5209,120 @@ fn a_failed_input_means_no_marker() {
         None,
         "a run with a failed input is never marked complete"
     );
+}
+
+#[test]
+fn server_keys_are_imported_before_rooms_whatever_the_argument_order() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let write = |name: &str, content: &str| {
+        let path = root.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let room_path = write("a-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let keys_path = write("z-keys.jsonl", KEYS_EXPORT_FIXTURE);
+    let other_room_path = write("b-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let inputs = [
+        room_path.clone(),
+        keys_path.clone(),
+        other_room_path.clone(),
+    ];
+    assert_eq!(
+        keys_first(&inputs),
+        [&keys_path, &room_path, &other_room_path]
+    );
+}
+
+#[test]
+fn a_malformed_keys_only_run_clears_an_earlier_runs_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let good = import_inputs(&db, &root, &[("room.jsonl", &room_export_with_auth())]);
+    finish_import(&db, &good).unwrap();
+    assert!(marker(&db).is_some(), "the first run is marked complete");
+
+    let bad = import_inputs(
+        &db,
+        &root,
+        &[(
+            "keys.jsonl",
+            "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+        )],
+    );
+    finish_import(&db, &bad).unwrap();
+    assert_eq!(
+        marker(&db),
+        None,
+        "a failed run must not leave an earlier run's marker in place"
+    );
+}
+
+#[test]
+fn a_failed_keys_import_is_flagged_and_leaves_no_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(
+        !run.signature_keys_available,
+        "a failed key import into an empty store leaves signature keys unavailable"
+    );
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None);
+}
+
+#[test]
+fn a_failed_key_import_keeps_previously_loaded_signing_keys_available() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let first = import_inputs(&db, &root, &[("keys.jsonl", KEYS_EXPORT_FIXTURE)]);
+    assert_eq!(first.failures, 0);
+
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(
+        run.signature_keys_available,
+        "a failed new key input must not hide usable keys already stored"
+    );
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None, "the failed input keeps the run unmarked");
+}
+
+#[test]
+fn a_failed_room_import_does_not_make_signing_keys_available() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[(
+            "broken.jsonl",
+            "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\"",
+        )],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(!run.signature_keys_available);
 }
 
 #[test]

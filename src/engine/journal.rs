@@ -227,9 +227,65 @@ pub enum TxnStageState {
     Published,
 }
 
+/// Newest staged state per record for one pool, so a lookup costs the keys it
+/// asks about rather than a pass over every staged mutation.
+///
+/// The index folds in the pool's mutations lazily, from `indexed` onward, so
+/// the append paths need no bookkeeping of their own. Anything that removes or
+/// reorders staged mutations must call [`Self::reset`].
+///
+/// `NodeId` is opaque and chosen by the caller (see `storage::NodeId`), so this
+/// deliberately uses the standard randomized hasher rather than assuming the
+/// ids are content hashes.
+#[derive(Debug, Default)]
+struct StageIndex {
+    /// Number of leading mutations already folded in.
+    indexed: usize,
+    /// Position of the newest staged put or removal per `(collection, node)`.
+    newest: HashMap<([u8; 16], [u8; 16]), usize>,
+    /// Position of the newest staged delete per collection.
+    last_delete: HashMap<[u8; 16], usize>,
+}
+
+impl StageIndex {
+    fn reset(&mut self) {
+        self.indexed = 0;
+        self.newest.clear();
+        self.last_delete.clear();
+    }
+
+    /// Fold in the mutations appended since the last call.
+    fn sync(&mut self, mutations: &[Mutation]) {
+        if self.indexed > mutations.len() {
+            self.reset();
+        }
+        for (position, mutation) in mutations.iter().enumerate().skip(self.indexed) {
+            match mutation {
+                Mutation::Put {
+                    collection_id,
+                    node_id,
+                    ..
+                }
+                | Mutation::RemoveRecord {
+                    collection_id,
+                    node_id,
+                } => {
+                    self.newest.insert((*collection_id, *node_id), position);
+                }
+                Mutation::DeleteCollection { collection_id } => {
+                    self.last_delete.insert(*collection_id, position);
+                }
+            }
+        }
+        self.indexed = mutations.len();
+    }
+}
+
 #[derive(Debug)]
 struct TxnStageData {
     pools: [Vec<Mutation>; ShardType::ALL.len()],
+    /// Lookup index over `pools`; see [`StageIndex`].
+    index: [StageIndex; ShardType::ALL.len()],
     applied: [Vec<bool>; ShardType::ALL.len()],
     /// Collection-version preconditions validated at publication.
     expectations: Vec<CollectionExpectation>,
@@ -366,6 +422,7 @@ impl TxnStage {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
+                index: std::array::from_fn(|_| StageIndex::default()),
                 applied: std::array::from_fn(|_| Vec::new()),
                 expectations: Vec::new(),
                 record_expectations: Vec::new(),
@@ -406,8 +463,7 @@ impl TxnStage {
     }
 
     /// Look several records up in the mutations staged for `pool`, in the order
-    /// of `node_ids`, taking the stage lock once and scanning the staged
-    /// mutations once however many records are asked for.
+    /// of `node_ids`, taking the stage lock once.
     ///
     /// This is what lets a transaction read its own uncommitted writes. The
     /// staged mutations are in append order, so the newest one that names a
@@ -418,10 +474,11 @@ impl TxnStage {
     /// begun, every record is `Absent` and the caller reads the live store,
     /// which by then serves the group through the transaction overlay.
     ///
-    /// The single pass keeps the newest put position for each wanted record
-    /// and the position of the last delete for the collection, so the cost is
-    /// the staged mutations plus the records asked for, not their product.
-    /// Payloads are cloned only for records that resolve to a put.
+    /// The stage keeps a per-pool `StageIndex` of the newest put or removal
+    /// for each record and the last delete for each collection. A call folds in
+    /// only the mutations staged since the previous one, so a transaction that
+    /// stages and looks up records in turn costs each mutation once, not once
+    /// per lookup. Payloads are cloned only for records that resolve to a put.
     #[must_use]
     pub fn lookup_many(
         &self,
@@ -432,42 +489,30 @@ impl TxnStage {
         #[cfg(test)]
         self.lookup_many_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let data = self.data.lock();
+        let mut guard = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE || node_ids.is_empty() {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
-        let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
-        let mut last_delete: Option<usize> = None;
-        for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
-            match mutation {
-                Mutation::Put {
-                    collection_id: staged_collection,
-                    node_id,
-                    payload,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some(payload)));
-                }
-                Mutation::RemoveRecord {
-                    collection_id: staged_collection,
-                    node_id,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, None));
-                }
-                Mutation::DeleteCollection {
-                    collection_id: staged_collection,
-                } if staged_collection == collection_id => last_delete = Some(position),
-                _ => {}
-            }
-        }
+        let data = &mut *guard;
+        let pool = pool_index(pool);
+        data.index[pool].sync(&data.pools[pool]);
+        let staged = &data.index[pool];
+        let mutations = &data.pools[pool];
+        let last_delete = staged.last_delete.get(collection_id).copied();
         node_ids
             .iter()
-            .map(|node_id| match (newest_put.get(node_id), last_delete) {
-                // A put older than the delete is hidden by it.
-                (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
-                (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
-                (None, None) => StagedLookup::Absent,
+            .map(|node_id| {
+                let newest = staged.newest.get(&(*collection_id, *node_id)).copied();
+                match (newest, last_delete) {
+                    // A put older than the delete is hidden by it.
+                    (Some(position), Some(delete)) if position < delete => StagedLookup::Deleted,
+                    (Some(position), _) => match mutations.get(position) {
+                        Some(Mutation::Put { payload, .. }) => StagedLookup::Put(payload.clone()),
+                        _ => StagedLookup::Deleted,
+                    },
+                    (None, Some(_)) => StagedLookup::Deleted,
+                    (None, None) => StagedLookup::Absent,
+                }
             })
             .collect()
     }
@@ -488,6 +533,7 @@ impl TxnStage {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
+            data.index.iter_mut().for_each(StageIndex::reset);
             data.applied.iter_mut().for_each(Vec::clear);
             data.expectations.clear();
             data.record_expectations.clear();
@@ -806,6 +852,7 @@ impl TxnStage {
             collection_id,
             node_id: *node_id,
         }));
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = total;
         for (node_id, expected) in pending {
@@ -872,6 +919,7 @@ impl TxnStage {
         });
         // This helper only runs while the stage is active, before publication;
         // no mutation can have been applied yet.
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = data.bytes.saturating_sub(released);
         Ok(())
@@ -2024,8 +2072,8 @@ pub struct JournalCoordinator {
     /// at 0" observation match again. Unlike `collection_versions` it does not
     /// advance with later writes, so an absent record's token stays stable.
     version_floor: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
-    /// First LSNs of transaction groups that are published but whose writes are
-    /// not yet all in the packs. See [`Self::publish_groups`].
+    /// First LSNs of published groups, including autocommit groups, whose
+    /// writes are not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
     /// Wakes versioned reads blocked until a published group reaches the packs.
     /// A read that cannot certify its boundary waits here instead of polling;
@@ -2047,6 +2095,10 @@ pub struct JournalCoordinator {
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Why a published group could not be applied to the packs and index, once
+    /// one failed. Unlike `poisoned` this leaves the committer running, so
+    /// groups already published still reach disk and a reopen replays them.
+    apply_failure: std::sync::OnceLock<String>,
     /// Number of sync requests entering the coordinator.
     sync_calls: AtomicU64,
     /// Number of sync requests that found the journal mutex occupied.
@@ -2261,6 +2313,7 @@ impl JournalCoordinator {
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
+            apply_failure: std::sync::OnceLock::new(),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
@@ -2487,16 +2540,16 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         let committed = self.pool_committed.lock().get(&pool).copied().unwrap_or(0);
-        // A published transaction whose writes are not all in the packs yet
-        // holds coverage below its first frame.
+        // A published group, including an autocommit group, whose writes are
+        // not all in the packs yet holds coverage below its first frame.
         match self.unmaterialized.lock().first() {
             Some(first_lsn) => committed.min(first_lsn.saturating_sub(1)),
             None => committed,
         }
     }
 
-    /// Record that the transaction group whose first frame is `first_lsn` has
-    /// been fully written to the packs, so coverage may pass it.
+    /// Record that the group whose first frame is `first_lsn` has been fully
+    /// written to the packs, so coverage may pass it.
     pub fn transaction_materialized(&self, first_lsn: u64) {
         self.unmaterialized.lock().remove(&first_lsn);
         self.notify_materialized();
@@ -2518,7 +2571,7 @@ impl JournalCoordinator {
     }
 
     /// Highest LSN a reader may treat as applied by every pool's index: one
-    /// below the earliest published-but-not-yet-materialized transaction group,
+    /// below the earliest published-but-not-yet-materialized group,
     /// or `u64::MAX` when nothing is pending.
     ///
     /// A pool-wide *materialized* watermark is a maximum, so out-of-order
@@ -3301,6 +3354,33 @@ impl JournalCoordinator {
         false
     }
 
+    /// Record that a published group could not be applied to the packs and
+    /// index. The WAL holds it, so the data is not lost, but this process's
+    /// index no longer matches the journal: new publications and versioned
+    /// reads that would wait for the group fail with `cause` until the database
+    /// is reopened and the WAL replayed. Only the first cause is kept.
+    pub(crate) fn fail_apply(&self, cause: String) {
+        let _ = self.apply_failure.set(cause);
+        // Wake reads waiting for the group so they see the failure.
+        self.notify_materialized();
+    }
+
+    /// The reason a published group failed to apply, if one did.
+    pub(crate) fn apply_failure(&self) -> Option<&str> {
+        self.apply_failure.get().map(String::as_str)
+    }
+
+    /// Fail if a published group could not be applied (see [`Self::fail_apply`]).
+    fn reject_if_apply_failed(&self) -> io::Result<()> {
+        match self.apply_failure() {
+            Some(cause) => Err(io::Error::other(format!(
+                "a published group failed to apply; reopen the database to \
+                 replay the WAL: {cause}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Fail if a failed commit or append poisoned the journal.
     fn reject_if_poisoned(&self) -> io::Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -3450,13 +3530,16 @@ impl JournalCoordinator {
     /// separate: a later [`Self::sync_through`] or the background committer
     /// fsyncs every visible group at once, so many small groups still share
     /// one fsync.
+    /// A caller applying the mutations directly must call
+    /// [`Self::transaction_materialized`] with `receipt.first_lsn` after all
+    /// writes reach the packs; until then this group holds back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned, its LSN space is
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(ShardType::State, mutations)], false, &[], &[])?
+        self.publish_groups(&[(ShardType::State, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3465,6 +3548,9 @@ impl JournalCoordinator {
     /// Like [`Self::publish_group`], tagging every mutation with `pool`.
     /// Required when the coordinator's segment is pool-tagged; the pool-less
     /// form would be rejected there.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Same as [`Self::publish_group`].
@@ -3473,7 +3559,7 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, &[], &[])?
+        self.publish_groups(&[(pool, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3483,6 +3569,9 @@ impl JournalCoordinator {
     /// publication critical section. A mismatch rejects the commit with an
     /// [`io::ErrorKind::WouldBlock`] error wrapping a `StaleVersion` instead
     /// of appending, so no group is published.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
@@ -3493,7 +3582,7 @@ impl JournalCoordinator {
         mutations: &[Mutation],
         expectations: &[CollectionExpectation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, expectations, &[])?
+        self.publish_groups(&[(pool, mutations)], expectations, &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3505,6 +3594,9 @@ impl JournalCoordinator {
     /// This is the atomic publication boundary for a transaction that writes
     /// multiple pools through a shared coordinator. The caller must provide
     /// each pool at most once; empty batches are ignored.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned or the group cannot be
@@ -3518,6 +3610,9 @@ impl JournalCoordinator {
 
     /// Like [`Self::publish_tagged_groups`], validating `expectations` inside
     /// the publication critical section before the group is appended.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
@@ -3532,7 +3627,7 @@ impl JournalCoordinator {
             .iter()
             .map(|(pool, mutations)| (*pool, *mutations))
             .collect::<Vec<_>>();
-        self.publish_groups(&staged, true, expectations, record_expectations)?
+        self.publish_groups(&staged, expectations, record_expectations)?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3653,22 +3748,22 @@ impl JournalCoordinator {
     /// Single publication path. Holds `publication` for the whole append so
     /// LSN assignment, the append and the visibility advance are one step.
     ///
-    /// A transaction group (`transaction` set) is published before its writes
-    /// are materialized into the packs. Until [`Self::transaction_materialized`]
-    /// says otherwise, no pool may claim coverage at or past its first frame:
+    /// Every group is published before its writes are materialized into the
+    /// packs. Until [`Self::transaction_materialized`] says otherwise, no pool
+    /// may claim coverage at or past its first frame:
     /// the packs do not hold those frames yet, so a claim (and the reclaim it
     /// would license) could lose an acknowledged commit to a crash. It is
-    /// registered here, under the journal lock, so no sync can promote a
-    /// watermark past the group before the group is on the floor list.
+    /// registered here, under the journal lock, so neither a read nor a sync
+    /// can advance past the group before it is on the floor list.
     fn publish_groups(
         &self,
         staged: &[(ShardType, &[Mutation])],
-        transaction: bool,
         expectations: &[CollectionExpectation],
         record_expectations: &[RecordExpectation],
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         self.validate_expectations(expectations, record_expectations)?;
+        self.reject_if_apply_failed()?;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -3702,9 +3797,9 @@ impl JournalCoordinator {
                 return Err(self.explain_full_segment(error, &journal));
             }
         };
-        if transaction {
-            self.unmaterialized.lock().insert(receipt.first_lsn);
-        }
+        // Register before advancing the visible version below, so a reader
+        // cannot observe this group without also seeing the floor it holds.
+        self.unmaterialized.lock().insert(receipt.first_lsn);
         debug_assert_eq!(
             receipt.first_lsn, expected_first_lsn,
             "appended group must start at the journal tail"
