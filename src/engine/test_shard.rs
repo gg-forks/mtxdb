@@ -43,6 +43,65 @@ fn test_shard_pool_create_and_write() {
 }
 
 #[test]
+fn stale_remap_snapshot_never_moves_the_append_frontier_backwards() {
+    let dir = test_dir("remap_stale_frontier");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let first = test_record(0x31, 0x01, b"first");
+    let (_, first_offset) = pool.put_record(&first).unwrap();
+    let shard = pool.get_shard(0).unwrap();
+    let old_frontier = shard.file_len();
+
+    let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    let thread_name = "mtxdb-remap-frontier-test";
+    *TEST_REMAP_PAUSE.get_or_init(|| Mutex::new(None)).lock() =
+        Some((thread_name.to_owned(), Arc::clone(&pause)));
+    let remapping_shard = Arc::clone(&shard);
+    let remap_worker = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || ShardPool::remap_shard(&remapping_shard))
+        .unwrap();
+
+    // remap_shard has captured the old filesystem length but has not yet
+    // published it. A concurrent local append advances the real frontier.
+    pause.0.wait();
+    let second = test_record(0x31, 0x02, b"second");
+    let second_result = pool.put_record(&second);
+    let second_frontier = shard.file_len();
+    pause.1.wait();
+    let remap_result = remap_worker.join().unwrap();
+    *TEST_REMAP_PAUSE.get_or_init(|| Mutex::new(None)).lock() = None;
+
+    let (_, second_offset) = second_result.unwrap();
+    remap_result.unwrap();
+    assert_eq!(second_offset, old_frontier);
+    assert!(second_frontier > old_frontier);
+    assert_eq!(
+        shard.file_len(),
+        second_frontier,
+        "a stale remap snapshot must not regress the append frontier"
+    );
+
+    let third = test_record(0x31, 0x03, b"third");
+    let (_, third_offset) = pool.put_record(&third).unwrap();
+    assert_eq!(third_offset, second_frontier);
+    assert_eq!(
+        pool.read_at(&shard, first_offset, false).unwrap().hash,
+        first.hash
+    );
+    assert_eq!(
+        pool.read_at(&shard, second_offset, false).unwrap().hash,
+        second.hash
+    );
+    assert_eq!(
+        pool.read_at(&shard, third_offset, false).unwrap().hash,
+        third.hash
+    );
+
+    drop(pool);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn poisoned_shard_refuses_append_and_flush() {
     let dir = test_dir("poisoned_shard_refuses_writes");
     let pool = ShardPool::open(dir).unwrap();
@@ -498,6 +557,47 @@ fn test_shard_pool_rotation() {
     let record = test_record(0x01, 0xBB, b"trigger rotation");
     let (slot, _offset) = pool.put_record(&record).unwrap();
     assert_eq!(slot, 1);
+}
+
+#[test]
+fn sealed_pack_index_skips_recovery_and_corruption_falls_back() {
+    let dir = test_dir("sealed_pack_index_recovery");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let record = test_record(1, 2, b"sealed record");
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let old = pool.get_shard(slot).unwrap();
+    pool.rotate().unwrap();
+    assert!(!old.sealed.load(Ordering::Acquire));
+    pool.rotate_collection_full_home(&record.collection_id, slot)
+        .unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    pool.wait_for_seals();
+    let sidecar_path = packidx::pack_index_path(&old.path);
+    assert!(sidecar_path.exists());
+    drop(old);
+    drop(pool);
+
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
+    let old = pool.get_shard(slot).unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    assert_eq!(pool.read_at(&old, offset, true).unwrap().data, record.data);
+    drop(old);
+    drop(pool);
+
+    let mut sidecar = fs::read(&sidecar_path).unwrap();
+    let last = sidecar.len() - 1;
+    sidecar[last] ^= 0xff;
+    fs::write(&sidecar_path, sidecar).unwrap();
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 2);
+    assert!(pool.get_shard(slot).unwrap().sealed.load(Ordering::Acquire));
+    drop(pool);
+
+    // The invalid sidecar was rebuilt while opening the non-active pack.
+    // Later opens should recover-scan only the active append pack.
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
 }
 
 /// Core fix: a collection's writes must stay on its own home shard even
@@ -1288,7 +1388,7 @@ fn two_rooted_pools_open_in_one_process_without_self_blocking() {
     let state = ShardPool::open(layout.pool_path(crate::layout::ShardType::State));
     // The first standalone writer owns the root lock; a second one must fail
     // fast rather than block forever on the same file.
-    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::Edges));
+    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::ServerInfo));
     assert!(state.is_ok());
     assert_eq!(
         second.err().map(|e| e.kind()),
@@ -1506,4 +1606,34 @@ fn test_reopen_picks_most_recent_pack_not_highest_address() {
     }
     let pool = ShardPool::open(dir).unwrap();
     assert_eq!(pool.active_shard().path, newest_path);
+}
+
+#[test]
+fn test_run_merge_worker_stops_when_signalled() {
+    let dir = test_dir("run_merge_stop");
+    let pool = ShardPool::open(dir).unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = Arc::clone(&started);
+    let worker_stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped_clone = Arc::clone(&worker_stopped);
+
+    let started_ok = pool
+        .start_run_merge_worker(move |stop| {
+            started_clone.store(true, Ordering::Release);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_stopped_clone.store(true, Ordering::Release);
+            Ok(None)
+        })
+        .unwrap();
+    assert!(started_ok);
+    while !started.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    assert!(pool.run_merge_active());
+    pool.stop_run_merge();
+    assert!(pool.wait_for_run_merge());
+    assert!(!pool.run_merge_active());
+    assert!(worker_stopped.load(Ordering::Acquire));
 }

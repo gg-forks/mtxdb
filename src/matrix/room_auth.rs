@@ -21,7 +21,7 @@
 //!
 //! Redaction, rejection and soft-fail change what a *relationship* query may
 //! show, so [`RoomAuth::relation_of`](crate::room_auth::RoomAuth::relation_of) takes an
-//! [`EventVisibility`](crate::matrix_adjacency::EventVisibility). They never
+//! [`EventVisibility`](crate::csr_adjacency::EventVisibility). They never
 //! change the auth chain: a redacted event keeps its `auth_events`, and an
 //! auth chain computed against a different disposition would be wrong. So
 //! `auth_edges`, `auth_chain` and `is_in_auth_chain` take no filter, by design.
@@ -31,15 +31,14 @@
 //! The chain of an event excludes the event itself, so
 //! `is_in_auth_chain(e, e)` is `false`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::auth_closure::{AuthClosure, RebuildReport};
 use crate::bitmap_set::BitmapSet;
 use crate::closure_store::{ClosureCoverage, ClosureSnapshot};
+use crate::csr_adjacency::{EventRecord, EventVisibility, Relation, AUTH};
 use crate::database::Database;
-use crate::layout::ShardType;
-use crate::matrix_adjacency::{EventRecord, EventVisibility, Relation, AUTH};
 use crate::storage::StorageError;
 
 /// A room auth operation failed.
@@ -253,9 +252,9 @@ pub struct RoomAuth {
 impl RoomAuth {
     /// Address `room_id`'s auth data inside `pool`.
     #[must_use]
-    pub fn new(pool: ShardType, room_id: &str) -> Self {
+    pub fn new(room_id: &str) -> Self {
         Self {
-            closure: AuthClosure::new(pool, room_id),
+            closure: AuthClosure::new(room_id),
         }
     }
 
@@ -315,6 +314,16 @@ impl RoomAuth {
             .into_iter()
             .map(|short_id| RecordedEvent { short_id })
             .collect())
+    }
+
+    /// Every event id the room's `prev_events` and `auth_events` point at,
+    /// stored or not. Missing parents are this set minus the events the caller
+    /// holds; nothing records them separately.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt row.
+    pub fn referenced_event_ids(&self, db: &Database) -> Result<BTreeSet<String>, RoomAuthError> {
+        Ok(self.closure.adjacency().referenced_event_ids(db)?)
     }
 
     /// The event's `auth_events`.
@@ -444,8 +453,15 @@ impl RoomAuth {
         report.closure_problems = closure.problems;
 
         let next = events.counter(db)?;
+        // Read the AUTH family once. Asking for one row per short id replays
+        // the append-only graph store O(events) times.
+        let auth_rows: HashSet<u32> = adjacency
+            .family_rows(db, AUTH)?
+            .into_iter()
+            .map(|(owner, _)| owner)
+            .collect();
         for short_id in 1..next {
-            if events.edges(db, short_id, AUTH)?.is_none() {
+            if !auth_rows.contains(&short_id) {
                 report.missing_parents.push(self.label(db, short_id)?);
             }
         }
@@ -474,13 +490,39 @@ impl RoomAuth {
         let txn = db.begin_transaction();
         self.closure.adjacency().stage_purge(&txn)?;
         self.closure.stage_purge(&txn)?;
-        Ok(txn.commit()?)
+        txn.commit()?;
+        // Graph rows live outside the transaction layer, so the tombstone is
+        // appended after the State records are gone.
+        self.closure.adjacency().purge_graph(db)?;
+        Ok(())
     }
 
     /// The closure layer, for tests that reach below the façade.
     #[cfg(test)]
     pub(crate) const fn closure_for_test(&self) -> &AuthClosure {
         &self.closure
+    }
+
+    /// The room-local short id of `event_id`, if it was recorded or referenced.
+    ///
+    /// # Errors
+    /// Storage errors.
+    pub fn short_id(&self, db: &Database, event_id: &str) -> Result<Option<u32>, RoomAuthError> {
+        Ok(self.closure.adjacency().short_id(db, event_id)?)
+    }
+
+    /// The room-local short ids of `event_ids`, allocating one for any id not
+    /// yet seen. Records no edges.
+    ///
+    /// # Errors
+    /// Storage errors.
+    pub fn short_ids(&self, db: &Database, event_ids: &[&str]) -> Result<Vec<u32>, RoomAuthError> {
+        let keys: Vec<&[u8]> = event_ids.iter().map(|id| id.as_bytes()).collect();
+        Ok(self
+            .closure
+            .adjacency()
+            .events_index()
+            .get_or_create(db, &keys)?)
     }
 
     /// Run `query` against a fresh snapshot, retrying with a new one if a
@@ -613,7 +655,7 @@ impl AuthSnapshot<'_> {
                 event_id: event_id.to_owned(),
             });
         };
-        if adjacency.events_index().edges(db, root, AUTH)?.is_none() {
+        if adjacency.family_edges(db, root, AUTH)?.is_none() {
             return Err(RoomAuthError::EventNotRecorded {
                 event_id: event_id.to_owned(),
             });
@@ -682,7 +724,7 @@ impl AuthSnapshot<'_> {
         }
 
         let domain = self.room.closure.domain();
-        let events = self.room.closure.adjacency().events_index();
+        let adjacency = self.room.closure.adjacency();
         let mut memo: HashMap<u32, BitmapSet> = HashMap::new();
         let mut on_path: HashSet<u32> = HashSet::new();
         let mut stack: Vec<Frame> = Vec::new();
@@ -698,7 +740,7 @@ impl AuthSnapshot<'_> {
             }
             #[cfg(test)]
             tests::count_edge_read();
-            match events.edges(db, id, AUTH)? {
+            match adjacency.family_edges(db, id, AUTH)? {
                 Some(edges) => Ok(Opened::Frame(Frame {
                     id,
                     targets: edges.iter().map(|edge| edge.target).collect(),

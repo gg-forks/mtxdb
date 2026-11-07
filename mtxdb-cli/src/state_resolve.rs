@@ -211,7 +211,7 @@ fn referenced_ids(maps: &[RezzyState]) -> Vec<String> {
 /// Returns `None` when the value is not a usable event — no `type`, or not an
 /// object at all. The caller records that as a missing id rather than handing
 /// rezzy something it would unwrap.
-fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
+pub(crate) fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
     let event_type = event_string_field(value, "type")?;
     let disposition = event_disposition(value);
     Some(LeanEvent {
@@ -253,7 +253,7 @@ fn u64_field(value: &OwnedValue, field: &str) -> u64 {
 /// Read an array of event references. Matrix rooms v1/v2 encode references as
 /// `[event_id, hashes]` pairs while later room versions use plain strings;
 /// both forms name the id in the same place.
-fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
+pub(crate) fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
     let Some(OwnedValue::Array(items)) = value.get(field) else {
         return Vec::new();
     };
@@ -298,7 +298,7 @@ mod tests {
             event("$unrelated", &[]),
         ];
         let mut context = LeanEventContext::new(events.iter());
-        assert!(context.ensure(&["$child".to_owned()]).is_empty());
+        assert_eq!(context.ensure(&["$child".to_owned()]), Vec::<String>::new());
         assert!(context.map().contains_key("$child"));
         assert!(context.map().contains_key("$root"));
         assert!(!context.map().contains_key("$unrelated"));

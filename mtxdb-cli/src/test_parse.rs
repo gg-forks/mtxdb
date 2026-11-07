@@ -271,3 +271,45 @@ fn dir_expansion_drops_stray_files_from_a_glob() {
     assert_eq!(dirs, vec!["pid-1", "pid-2"]);
     assert_eq!(m.subcommand_name(), Some("collections"));
 }
+
+#[test]
+fn test_shard_type_flag_accepts_server_info() {
+    for val in ["server-info", "server_info"] {
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "-t", val, "collections"])
+            .unwrap();
+        assert_eq!(
+            m.get_one::<String>("shard_type").map(String::as_str),
+            Some(val)
+        );
+        assert_eq!(shard_type_from_arg(val), Some(ShardType::ServerInfo));
+    }
+}
+
+#[test]
+fn search_requires_a_term_and_defaults_its_limit() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "search", "0x01"])
+        .is_err());
+    let matches = build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "search",
+            "0x01",
+            "--term",
+            "hi",
+            "--template",
+            "t.json",
+        ])
+        .unwrap();
+    let sub = matches.subcommand_matches("search").unwrap();
+    assert_eq!(
+        sub.get_one::<String>("term").map(String::as_str),
+        Some("hi")
+    );
+    assert_eq!(
+        sub.get_one::<String>("template").map(String::as_str),
+        Some("t.json")
+    );
+    assert_eq!(sub.get_one::<i64>("limit"), Some(&50));
+}

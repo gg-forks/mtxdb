@@ -180,32 +180,21 @@ harness = false
 name = "big_reopen_repro"
 path = "big_reopen_repro.rs"
 harness = false
+test = false
 
-# What the short-id edge store costs on disk for a real room.
 [[bench]]
-name = "edge_layout_measure"
-path = "edge_layout_measure.rs"
+name = "edge_codec_bench"
+path = "edge_codec_bench.rs"
 harness = false
 
-# Read and write cost of the chunked edge-layout prototype against the current store.
+# Reclaim-trigger sweep with and without a held replay lease (synthetic, host-specific).
 [[bench]]
-name = "edge_layout_lookup"
-path = "edge_layout_lookup.rs"
+name = "reclaim_trigger_sweep"
+path = "reclaim_trigger_sweep.rs"
 harness = false
 
-# Write cost of the chunked prototype when events arrive in small batches.
+# CSR point reads vs first/warm whole-scope reads and post-seal reads.
 [[bench]]
-name = "edge_layout_batches"
-path = "edge_layout_batches.rs"
-harness = false
-
-# Which layer of the prototype's id -> key read costs the time: decode, fetch, compression, CRC.
-[[bench]]
-name = "edge_layout_read_split"
-path = "edge_layout_read_split.rs"
-harness = false
-
-[[bench]]
-name = "edge_layout_sithnapse"
-path = "edge_layout_sithnapse.rs"
+name = "csr_read_cache"
+path = "csr_read_cache.rs"
 harness = false

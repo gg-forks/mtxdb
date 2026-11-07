@@ -101,6 +101,24 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 /// [`JournalCoordinator::set_reclaim_trigger_len`].
 pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
+/// Segment length at which a stalled reclaim is treated as an emergency: three
+/// quarters of `cap`. Validation and stall reporting share this calculation.
+pub(crate) const fn emergency_len_for_cap(cap: u64) -> u64 {
+    cap.saturating_sub(cap / 4)
+}
+
+/// Largest threshold that ensures forced reclaim starts by the emergency-zone
+/// boundary of `cap`. The predicate fires only once `len > trigger`, hence the
+/// minus 1.
+pub(crate) const fn max_reclaim_trigger_for_cap(cap: u64) -> u64 {
+    emergency_len_for_cap(cap).saturating_sub(1)
+}
+
+/// Largest threshold accepted from runtime configuration for the default
+/// segment cap. [`JournalCoordinator::configure_reclaim_trigger_len`] further
+/// limits it by the coordinator's live cap.
+pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = max_reclaim_trigger_for_cap(MAX_SEGMENT_LEN);
+
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
@@ -227,9 +245,65 @@ pub enum TxnStageState {
     Published,
 }
 
+/// Newest staged state per record for one pool, so a lookup costs the keys it
+/// asks about rather than a pass over every staged mutation.
+///
+/// The index folds in the pool's mutations lazily, from `indexed` onward, so
+/// the append paths need no bookkeeping of their own. Anything that removes or
+/// reorders staged mutations must call [`Self::reset`].
+///
+/// `NodeId` is opaque and chosen by the caller (see `storage::NodeId`), so this
+/// deliberately uses the standard randomized hasher rather than assuming the
+/// ids are content hashes.
+#[derive(Debug, Default)]
+struct StageIndex {
+    /// Number of leading mutations already folded in.
+    indexed: usize,
+    /// Position of the newest staged put or removal per `(collection, node)`.
+    newest: HashMap<([u8; 16], [u8; 16]), usize>,
+    /// Position of the newest staged delete per collection.
+    last_delete: HashMap<[u8; 16], usize>,
+}
+
+impl StageIndex {
+    fn reset(&mut self) {
+        self.indexed = 0;
+        self.newest.clear();
+        self.last_delete.clear();
+    }
+
+    /// Fold in the mutations appended since the last call.
+    fn sync(&mut self, mutations: &[Mutation]) {
+        if self.indexed > mutations.len() {
+            self.reset();
+        }
+        for (position, mutation) in mutations.iter().enumerate().skip(self.indexed) {
+            match mutation {
+                Mutation::Put {
+                    collection_id,
+                    node_id,
+                    ..
+                }
+                | Mutation::RemoveRecord {
+                    collection_id,
+                    node_id,
+                } => {
+                    self.newest.insert((*collection_id, *node_id), position);
+                }
+                Mutation::DeleteCollection { collection_id } => {
+                    self.last_delete.insert(*collection_id, position);
+                }
+            }
+        }
+        self.indexed = mutations.len();
+    }
+}
+
 #[derive(Debug)]
 struct TxnStageData {
     pools: [Vec<Mutation>; ShardType::ALL.len()],
+    /// Lookup index over `pools`; see [`StageIndex`].
+    index: [StageIndex; ShardType::ALL.len()],
     applied: [Vec<bool>; ShardType::ALL.len()],
     /// Collection-version preconditions validated at publication.
     expectations: Vec<CollectionExpectation>,
@@ -366,6 +440,7 @@ impl TxnStage {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
+                index: std::array::from_fn(|_| StageIndex::default()),
                 applied: std::array::from_fn(|_| Vec::new()),
                 expectations: Vec::new(),
                 record_expectations: Vec::new(),
@@ -406,8 +481,7 @@ impl TxnStage {
     }
 
     /// Look several records up in the mutations staged for `pool`, in the order
-    /// of `node_ids`, taking the stage lock once and scanning the staged
-    /// mutations once however many records are asked for.
+    /// of `node_ids`, taking the stage lock once.
     ///
     /// This is what lets a transaction read its own uncommitted writes. The
     /// staged mutations are in append order, so the newest one that names a
@@ -418,10 +492,11 @@ impl TxnStage {
     /// begun, every record is `Absent` and the caller reads the live store,
     /// which by then serves the group through the transaction overlay.
     ///
-    /// The single pass keeps the newest put position for each wanted record
-    /// and the position of the last delete for the collection, so the cost is
-    /// the staged mutations plus the records asked for, not their product.
-    /// Payloads are cloned only for records that resolve to a put.
+    /// The stage keeps a per-pool `StageIndex` of the newest put or removal
+    /// for each record and the last delete for each collection. A call folds in
+    /// only the mutations staged since the previous one, so a transaction that
+    /// stages and looks up records in turn costs each mutation once, not once
+    /// per lookup. Payloads are cloned only for records that resolve to a put.
     #[must_use]
     pub fn lookup_many(
         &self,
@@ -432,42 +507,30 @@ impl TxnStage {
         #[cfg(test)]
         self.lookup_many_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let data = self.data.lock();
+        let mut guard = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE || node_ids.is_empty() {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
-        let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
-        let mut last_delete: Option<usize> = None;
-        for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
-            match mutation {
-                Mutation::Put {
-                    collection_id: staged_collection,
-                    node_id,
-                    payload,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some(payload)));
-                }
-                Mutation::RemoveRecord {
-                    collection_id: staged_collection,
-                    node_id,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, None));
-                }
-                Mutation::DeleteCollection {
-                    collection_id: staged_collection,
-                } if staged_collection == collection_id => last_delete = Some(position),
-                _ => {}
-            }
-        }
+        let data = &mut *guard;
+        let pool = pool_index(pool);
+        data.index[pool].sync(&data.pools[pool]);
+        let staged = &data.index[pool];
+        let mutations = &data.pools[pool];
+        let last_delete = staged.last_delete.get(collection_id).copied();
         node_ids
             .iter()
-            .map(|node_id| match (newest_put.get(node_id), last_delete) {
-                // A put older than the delete is hidden by it.
-                (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
-                (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
-                (None, None) => StagedLookup::Absent,
+            .map(|node_id| {
+                let newest = staged.newest.get(&(*collection_id, *node_id)).copied();
+                match (newest, last_delete) {
+                    // A put older than the delete is hidden by it.
+                    (Some(position), Some(delete)) if position < delete => StagedLookup::Deleted,
+                    (Some(position), _) => match mutations.get(position) {
+                        Some(Mutation::Put { payload, .. }) => StagedLookup::Put(payload.clone()),
+                        _ => StagedLookup::Deleted,
+                    },
+                    (None, Some(_)) => StagedLookup::Deleted,
+                    (None, None) => StagedLookup::Absent,
+                }
             })
             .collect()
     }
@@ -488,6 +551,7 @@ impl TxnStage {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
+            data.index.iter_mut().for_each(StageIndex::reset);
             data.applied.iter_mut().for_each(Vec::clear);
             data.expectations.clear();
             data.record_expectations.clear();
@@ -806,6 +870,7 @@ impl TxnStage {
             collection_id,
             node_id: *node_id,
         }));
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = total;
         for (node_id, expected) in pending {
@@ -872,6 +937,7 @@ impl TxnStage {
         });
         // This helper only runs while the stage is active, before publication;
         // no mutation can have been applied yet.
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = data.bytes.saturating_sub(released);
         Ok(())
@@ -968,11 +1034,34 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
-        data.expectations.push(CollectionExpectation {
-            pool,
-            collection_id,
-            expected,
-        });
+        if let Some(existing) = data
+            .expectations
+            .iter()
+            .find(|existing| existing.pool == pool && existing.collection_id == collection_id)
+        {
+            if existing.expected != expected && expected != 0 {
+                // Keep the first version observed before this transaction's own
+                // staged writes, but reject a second distinct real
+                // precondition: validating only the first would let the later
+                // one silently pass at commit. A synthetic zero token from a
+                // fully staged collection is not a real precondition and must
+                // not replace the original.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "conflicting collection-version expectations for collection \
+                         {collection_id:?}: already staged {}, then {}",
+                        existing.expected, expected
+                    ),
+                ));
+            }
+        } else {
+            data.expectations.push(CollectionExpectation {
+                pool,
+                collection_id,
+                expected,
+            });
+        }
         Ok(())
     }
 
@@ -1042,12 +1131,7 @@ impl TxnStage {
         // Preserve the historical per-pool append order for the existing
         // pools; ServerInfo is appended after them without changing the WAL
         // ordering of the other pools' frames.
-        let pools = [
-            ShardType::Edges,
-            ShardType::EventDag,
-            ShardType::State,
-            ShardType::ServerInfo,
-        ];
+        let pools = [ShardType::EventDag, ShardType::State, ShardType::ServerInfo];
 
         // A shared-WAL database gives every pool the same coordinator. Keep
         // the transaction as one journal group in that case, so readers never
@@ -1134,20 +1218,18 @@ const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
         ShardType::EventDag => 1,
-        ShardType::Edges => 2,
-        ShardType::ServerInfo => 3,
+        ShardType::ServerInfo => 2,
     }
 }
 
 /// Wire code for a pool tag in a mutation frame's flag byte.
 ///
-/// Every frame carries a pool tag in `1..=4`; `0` is never written.
+/// Every frame carries a pool tag in `1..=3`; `0` is never written.
 pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
         ShardType::EventDag => 2,
-        ShardType::Edges => 3,
-        ShardType::ServerInfo => 4,
+        ShardType::ServerInfo => 3,
     }
 }
 
@@ -1157,8 +1239,7 @@ pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     match tag {
         1 => Some(ShardType::State),
         2 => Some(ShardType::EventDag),
-        3 => Some(ShardType::Edges),
-        4 => Some(ShardType::ServerInfo),
+        3 => Some(ShardType::ServerInfo),
         _ => None,
     }
 }
@@ -1650,6 +1731,67 @@ pub struct Journal {
     /// is still decoded and checked before it is copied, so a damaged group
     /// there is reported instead of being carried into the new segment.
     groups: Vec<GroupMark>,
+    /// Test-only: records the intervals during which `install_rebuilt` is
+    /// replacing the segment, so a test can check whether a read's own time
+    /// interval intersected a rewrite.
+    #[cfg(test)]
+    rewrite_phase: Arc<RewritePhase>,
+}
+
+/// Test-only rewrite-window recorder: monotonic nanoseconds from one base.
+#[cfg(test)]
+pub(crate) struct RewritePhase {
+    base: std::time::Instant,
+    windows: Mutex<Vec<(u64, u64)>>,
+}
+
+#[cfg(test)]
+impl RewritePhase {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            windows: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Current time in nanoseconds on this recorder's monotonic base.
+    pub(crate) fn now_ns(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn record(&self, start: u64, end: u64) {
+        self.windows.lock().push((start, end));
+    }
+
+    /// Completed rewrite windows as `(start, end)` nanosecond intervals.
+    pub(crate) fn windows(&self) -> Vec<(u64, u64)> {
+        self.windows.lock().clone()
+    }
+}
+
+/// Marks the rewrite window for [`Journal::rewrite_phase`].
+#[cfg(test)]
+struct RewritePhaseGuard {
+    phase: Arc<RewritePhase>,
+    start: u64,
+}
+
+#[cfg(test)]
+impl RewritePhaseGuard {
+    fn enter(phase: &Arc<RewritePhase>) -> Self {
+        Self {
+            phase: Arc::clone(phase),
+            start: phase.now_ns(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RewritePhaseGuard {
+    fn drop(&mut self) {
+        let end = self.phase.now_ns();
+        self.phase.record(self.start, end);
+    }
 }
 
 /// An fsync at least this slow is reported on stderr when it happens.
@@ -1777,11 +1919,28 @@ impl JournalCursor {
 /// it pins the original cursor rather than advancing with individual pages, so
 /// an interrupted or partially applied replay can safely resume from its
 /// starting snapshot.
-#[must_use = "dropping the replay lease allows journal reclaim to expire its cursor"]
+#[must_use = "dropping the replay lease removes its pin and lets reclaim pass the cursor"]
 pub struct JournalReplayLease {
     registry: Arc<ReplayLeaseRegistry>,
     id: u64,
 }
+
+/// A replay lease was revoked because the history it pinned exceeded the
+/// configured retention cap.
+///
+/// This is a lease-state condition, not an I/O failure: the caller must discard
+/// its partial rebuild and take a fresh snapshot. Reads through the lease's
+/// cursor fail with the existing cursor-expired `InvalidData` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayLeaseRevoked;
+
+impl std::fmt::Display for ReplayLeaseRevoked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("journal replay lease was revoked by the retention cap")
+    }
+}
+
+impl std::error::Error for ReplayLeaseRevoked {}
 
 impl JournalReplayLease {
     /// Raise this lease's floor to `through_lsn`, letting reclaim pass every
@@ -1793,11 +1952,31 @@ impl JournalReplayLease {
     /// the original snapshot, so only advance past pages that are safely
     /// persisted. The floor is monotonic: a stale or out-of-order call can never
     /// lower it.
-    pub fn advance(&self, through_lsn: u64) {
+    ///
+    /// # Errors
+    /// Returns [`ReplayLeaseRevoked`] when the retention cap revoked this lease.
+    /// A revoked lease cannot be advanced; the caller must discard its partial
+    /// rebuild.
+    pub fn advance(&self, through_lsn: u64) -> Result<(), ReplayLeaseRevoked> {
         let mut pins = self.registry.pins.lock();
-        if let Some(pin) = pins.get_mut(&self.id) {
-            *pin = (*pin).max(through_lsn);
+        let Some(pin) = pins.get_mut(&self.id) else {
+            return Ok(());
+        };
+        if pin.revoked {
+            return Err(ReplayLeaseRevoked);
         }
+        pin.lsn = pin.lsn.max(through_lsn);
+        Ok(())
+    }
+
+    /// Whether the retention cap revoked this lease.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.registry
+            .pins
+            .lock()
+            .get(&self.id)
+            .is_some_and(|pin| pin.revoked)
     }
 }
 
@@ -1809,8 +1988,17 @@ impl Drop for JournalReplayLease {
 
 #[derive(Default)]
 struct ReplayLeaseRegistry {
-    /// Lease ID to the last LSN represented by its snapshot cursor.
-    pins: Mutex<HashMap<u64, u64>>,
+    /// Lease ID to its pinned LSN and whether the retention cap revoked it.
+    pins: Mutex<HashMap<u64, LeasePin>>,
+}
+
+struct LeasePin {
+    /// Last LSN represented by the lease's snapshot cursor.
+    lsn: u64,
+    /// Set by the retention cap. A revoked pin no longer constrains reclaim.
+    revoked: bool,
+    /// When the lease was created, for the oldest-lease age stat.
+    created: std::time::Instant,
 }
 
 /// One bounded page of complete journal groups after a [`JournalCursor`].
@@ -1974,6 +2162,13 @@ pub struct JournalCoordinator {
     /// Segment length above which a sync forces a reclaiming checkpoint; see
     /// [`RECLAIM_TRIGGER_LEN`].
     reclaim_trigger_len: AtomicU64,
+    /// Optional cap, in bytes, on the history one replay lease may retain.
+    /// [`u64::MAX`] means unlimited (the default). Retention is measured from
+    /// the byte after the last complete group at or below the lease's pinned
+    /// LSN through the current end of the segment; the file header is excluded.
+    replay_lease_cap: AtomicU64,
+    /// Replay leases revoked by the retention cap.
+    replay_leases_revoked: AtomicU64,
     /// Set while a reclaim over the trigger cannot shrink the segment.
     reclaim_stall: Mutex<Option<ReclaimStall>>,
     /// Set when an active replay lease, rather than pool coverage, holds the
@@ -1984,6 +2179,10 @@ pub struct JournalCoordinator {
     /// Times a reclaim over the trigger has been found unable to shrink the
     /// segment.
     reclaim_stalls: AtomicU64,
+    /// Test-only: runs inside a reclaim, after the sync and journal locks are
+    /// held and before the segment is rewritten.
+    #[cfg(test)]
+    reclaim_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// Checkpoints the pools that hold a stalled reclaim back.
     blocker_remediation: Mutex<Option<BlockerRemediation>>,
     /// `(segment length, coverage epoch)` at the last remediation attempt.
@@ -2024,8 +2223,8 @@ pub struct JournalCoordinator {
     /// at 0" observation match again. Unlike `collection_versions` it does not
     /// advance with later writes, so an absent record's token stays stable.
     version_floor: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
-    /// First LSNs of transaction groups that are published but whose writes are
-    /// not yet all in the packs. See [`Self::publish_groups`].
+    /// First LSNs of published groups, including autocommit groups, whose
+    /// writes are not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
     /// Wakes versioned reads blocked until a published group reaches the packs.
     /// A read that cannot certify its boundary waits here instead of polling;
@@ -2047,6 +2246,10 @@ pub struct JournalCoordinator {
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Why a published group could not be applied to the packs and index, once
+    /// one failed. Unlike `poisoned` this leaves the committer running, so
+    /// groups already published still reach disk and a reopen replays them.
+    apply_failure: std::sync::OnceLock<String>,
     /// Number of sync requests entering the coordinator.
     sync_calls: AtomicU64,
     /// Number of sync requests that found the journal mutex occupied.
@@ -2243,10 +2446,14 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
+            replay_lease_cap: AtomicU64::new(u64::MAX),
+            replay_leases_revoked: AtomicU64::new(0),
             reclaim_stall: Mutex::new(None),
             replay_lease_stall: Mutex::new(None),
             coverage_epoch: AtomicU64::new(0),
             reclaim_stalls: AtomicU64::new(0),
+            #[cfg(test)]
+            reclaim_hook: Mutex::new(None),
             blocker_remediation: Mutex::new(None),
             last_remediation: Mutex::new(None),
             sequence: None,
@@ -2261,6 +2468,7 @@ impl JournalCoordinator {
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
+            apply_failure: std::sync::OnceLock::new(),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
@@ -2346,6 +2554,19 @@ impl JournalCoordinator {
         self.publish_signal
             .get()
             .and_then(|result| result.as_ref().ok())
+    }
+
+    /// Run the test-only reclaim hook; a no-op outside tests.
+    #[inline]
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn run_reclaim_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.reclaim_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// Advance the publish signal so a gated reader rescans. Called on a group
@@ -2487,16 +2708,16 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         let committed = self.pool_committed.lock().get(&pool).copied().unwrap_or(0);
-        // A published transaction whose writes are not all in the packs yet
-        // holds coverage below its first frame.
+        // A published group, including an autocommit group, whose writes are
+        // not all in the packs yet holds coverage below its first frame.
         match self.unmaterialized.lock().first() {
             Some(first_lsn) => committed.min(first_lsn.saturating_sub(1)),
             None => committed,
         }
     }
 
-    /// Record that the transaction group whose first frame is `first_lsn` has
-    /// been fully written to the packs, so coverage may pass it.
+    /// Record that the group whose first frame is `first_lsn` has been fully
+    /// written to the packs, so coverage may pass it.
     pub fn transaction_materialized(&self, first_lsn: u64) {
         self.unmaterialized.lock().remove(&first_lsn);
         self.notify_materialized();
@@ -2518,7 +2739,7 @@ impl JournalCoordinator {
     }
 
     /// Highest LSN a reader may treat as applied by every pool's index: one
-    /// below the earliest published-but-not-yet-materialized transaction group,
+    /// below the earliest published-but-not-yet-materialized group,
     /// or `u64::MAX` when nothing is pending.
     ///
     /// A pool-wide *materialized* watermark is a maximum, so out-of-order
@@ -2588,6 +2809,7 @@ impl JournalCoordinator {
         {
             let _sync = self.sync_lock.lock();
             let mut journal = self.journal.lock();
+            self.revoke_over_cap_leases(&journal);
             let boundary = {
                 let coverage = self.coverage.lock();
                 journal.shared_reclaim_boundary(&coverage.covered)
@@ -2686,7 +2908,7 @@ impl JournalCoordinator {
         let epoch = self.coverage_epoch.load(Ordering::Acquire);
         let mut stall = self.reclaim_stall.lock();
         let previous = *stall;
-        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        let emergency = len >= emergency_len_for_cap(journal.segment_cap);
         // The first reclaim to leave the segment over the trigger is normal:
         // pools sync one after another, so the first to cross it cannot yet
         // reclaim what the others have not reported. It is only worth saying
@@ -2705,9 +2927,7 @@ impl JournalCoordinator {
             reported: already_reported || report,
         });
         let entered_emergency = emergency
-            && previous.is_some_and(|old| {
-                old.at_len < journal.segment_cap.saturating_sub(journal.segment_cap / 4)
-            });
+            && previous.is_some_and(|old| old.at_len < emergency_len_for_cap(journal.segment_cap));
         if report {
             self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
         }
@@ -2728,7 +2948,7 @@ impl JournalCoordinator {
             *self.replay_lease_stall.lock() = None;
             return;
         }
-        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        let emergency = len >= emergency_len_for_cap(journal.segment_cap);
         let mut stall = self.replay_lease_stall.lock();
         let previous = *stall;
         let grace_from = previous.map_or(len, |old| old.grace_from);
@@ -2907,7 +3127,14 @@ impl JournalCoordinator {
                 Err(observed) => next = observed,
             }
         };
-        self.replay_leases.pins.lock().insert(id, cursor.lsn);
+        self.replay_leases.pins.lock().insert(
+            id,
+            LeasePin {
+                lsn: cursor.lsn,
+                revoked: false,
+                created: std::time::Instant::now(),
+            },
+        );
         Ok(JournalReplayLease {
             registry: Arc::clone(&self.replay_leases),
             id,
@@ -2915,14 +3142,97 @@ impl JournalCoordinator {
     }
 
     /// Highest LSN reclaim may pass without expiring an active replay cursor.
+    /// Revoked leases no longer constrain the cut.
     fn replay_reclaim_limit(&self, covered_lsn: u64) -> u64 {
         self.replay_leases
             .pins
             .lock()
             .values()
-            .copied()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.lsn)
             .min()
             .map_or(covered_lsn, |pin| covered_lsn.min(pin))
+    }
+
+    /// Set the optional cap, in bytes, on the history one replay lease may
+    /// retain. `None` keeps retention unlimited, matching `PostgreSQL`'s default
+    /// for `max_slot_wal_keep_size`. See `retained_bytes_from` for the measured
+    /// range and `revoke_over_cap_leases` for the selection.
+    pub(crate) fn configure_replay_lease_cap(&self, cap: Option<u64>) {
+        self.replay_lease_cap
+            .store(cap.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Replay leases revoked by the retention cap.
+    #[must_use]
+    pub fn replay_leases_revoked(&self) -> u64 {
+        self.replay_leases_revoked.load(Ordering::Relaxed)
+    }
+
+    /// Number of replay leases currently pinning history.
+    #[must_use]
+    pub fn replay_lease_count(&self) -> usize {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .count()
+    }
+
+    /// Oldest pinned LSN among active replay leases, or `None` when none are
+    /// active.
+    #[must_use]
+    pub fn oldest_replay_lease_lsn(&self) -> Option<u64> {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.lsn)
+            .min()
+    }
+
+    /// Bytes an active replay lease currently prevents reclaiming, measured
+    /// from the oldest pin to the end of the segment. `None` when no lease is
+    /// active.
+    #[must_use]
+    pub fn replay_lease_lag_bytes(&self) -> Option<u64> {
+        let journal = self.journal.lock();
+        let oldest = self.oldest_replay_lease_lsn()?;
+        Some(journal.retained_bytes_from(oldest))
+    }
+
+    /// Age of the oldest active replay lease, or `None` when none are active.
+    #[must_use]
+    pub fn oldest_replay_lease_age(&self) -> Option<Duration> {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.created.elapsed())
+            .max()
+    }
+
+    /// Revoke every active lease whose retained suffix exceeds `cap`. Each
+    /// lease is measured independently from its own pin, so a newer lease can
+    /// survive while an older one is revoked. A lease retaining exactly `cap`
+    /// is kept. Runs with the journal lock held, so it sees a stable segment
+    /// length and shares the reclaim lock order `journal -> pins`.
+    fn revoke_over_cap_leases(&self, journal: &Journal) {
+        let cap = self.replay_lease_cap.load(Ordering::Relaxed);
+        if cap == u64::MAX {
+            return;
+        }
+        let mut pins = self.replay_leases.pins.lock();
+        for pin in pins.values_mut() {
+            if pin.revoked || journal.retained_bytes_from(pin.lsn) <= cap {
+                continue;
+            }
+            pin.revoked = true;
+            self.replay_leases_revoked.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Read a bounded page of complete, durable groups after `cursor`.
@@ -3301,6 +3611,35 @@ impl JournalCoordinator {
         false
     }
 
+    /// Record that a published group could not be applied to the packs and
+    /// index. The WAL holds it, so the data is not lost, but this process's
+    /// index no longer matches the journal: new publications and versioned
+    /// reads that would wait for the group fail with `cause` until the database
+    /// is reopened and the WAL replayed. Only the first cause is kept.
+    pub(crate) fn fail_apply(&self, cause: String) {
+        let publication = self.publication.lock();
+        let _ = self.apply_failure.set(cause);
+        drop(publication);
+        // Wake reads waiting for the group so they see the failure.
+        self.notify_materialized();
+    }
+
+    /// The reason a published group failed to apply, if one did.
+    pub(crate) fn apply_failure(&self) -> Option<&str> {
+        self.apply_failure.get().map(String::as_str)
+    }
+
+    /// Fail if a published group could not be applied (see [`Self::fail_apply`]).
+    fn reject_if_apply_failed(&self) -> io::Result<()> {
+        match self.apply_failure() {
+            Some(cause) => Err(io::Error::other(format!(
+                "a published group failed to apply; reopen the database to \
+                 replay the WAL: {cause}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Fail if a failed commit or append poisoned the journal.
     fn reject_if_poisoned(&self) -> io::Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -3450,13 +3789,16 @@ impl JournalCoordinator {
     /// separate: a later [`Self::sync_through`] or the background committer
     /// fsyncs every visible group at once, so many small groups still share
     /// one fsync.
+    /// A caller applying the mutations directly must call
+    /// [`Self::transaction_materialized`] with `receipt.first_lsn` after all
+    /// writes reach the packs; until then this group holds back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned, its LSN space is
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(ShardType::State, mutations)], false, &[], &[])?
+        self.publish_groups(&[(ShardType::State, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3465,6 +3807,9 @@ impl JournalCoordinator {
     /// Like [`Self::publish_group`], tagging every mutation with `pool`.
     /// Required when the coordinator's segment is pool-tagged; the pool-less
     /// form would be rejected there.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Same as [`Self::publish_group`].
@@ -3473,7 +3818,7 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, &[], &[])?
+        self.publish_groups(&[(pool, mutations)], &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3483,6 +3828,9 @@ impl JournalCoordinator {
     /// publication critical section. A mismatch rejects the commit with an
     /// [`io::ErrorKind::WouldBlock`] error wrapping a `StaleVersion` instead
     /// of appending, so no group is published.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
@@ -3493,7 +3841,7 @@ impl JournalCoordinator {
         mutations: &[Mutation],
         expectations: &[CollectionExpectation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(pool, mutations)], false, expectations, &[])?
+        self.publish_groups(&[(pool, mutations)], expectations, &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3505,6 +3853,9 @@ impl JournalCoordinator {
     /// This is the atomic publication boundary for a transaction that writes
     /// multiple pools through a shared coordinator. The caller must provide
     /// each pool at most once; empty batches are ignored.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned or the group cannot be
@@ -3518,6 +3869,9 @@ impl JournalCoordinator {
 
     /// Like [`Self::publish_tagged_groups`], validating `expectations` inside
     /// the publication critical section before the group is appended.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
@@ -3532,7 +3886,7 @@ impl JournalCoordinator {
             .iter()
             .map(|(pool, mutations)| (*pool, *mutations))
             .collect::<Vec<_>>();
-        self.publish_groups(&staged, true, expectations, record_expectations)?
+        self.publish_groups(&staged, expectations, record_expectations)?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3607,6 +3961,9 @@ impl JournalCoordinator {
         record_expectations: &[RecordExpectation],
     ) -> io::Result<()> {
         let _publication = self.publication.lock();
+        // An expectation-only commit must fail once a published group failed
+        // to apply, just like a publishing commit does.
+        self.reject_if_apply_failed()?;
         self.validate_expectations(expectations, record_expectations)
     }
 
@@ -3653,22 +4010,22 @@ impl JournalCoordinator {
     /// Single publication path. Holds `publication` for the whole append so
     /// LSN assignment, the append and the visibility advance are one step.
     ///
-    /// A transaction group (`transaction` set) is published before its writes
-    /// are materialized into the packs. Until [`Self::transaction_materialized`]
-    /// says otherwise, no pool may claim coverage at or past its first frame:
+    /// Every group is published before its writes are materialized into the
+    /// packs. Until [`Self::transaction_materialized`] says otherwise, no pool
+    /// may claim coverage at or past its first frame:
     /// the packs do not hold those frames yet, so a claim (and the reclaim it
     /// would license) could lose an acknowledged commit to a crash. It is
-    /// registered here, under the journal lock, so no sync can promote a
-    /// watermark past the group before the group is on the floor list.
+    /// registered here, under the journal lock, so neither a read nor a sync
+    /// can advance past the group before it is on the floor list.
     fn publish_groups(
         &self,
         staged: &[(ShardType, &[Mutation])],
-        transaction: bool,
         expectations: &[CollectionExpectation],
         record_expectations: &[RecordExpectation],
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         self.validate_expectations(expectations, record_expectations)?;
+        self.reject_if_apply_failed()?;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -3702,9 +4059,9 @@ impl JournalCoordinator {
                 return Err(self.explain_full_segment(error, &journal));
             }
         };
-        if transaction {
-            self.unmaterialized.lock().insert(receipt.first_lsn);
-        }
+        // Register before advancing the visible version below, so a reader
+        // cannot observe this group without also seeing the floor it holds.
+        self.unmaterialized.lock().insert(receipt.first_lsn);
         debug_assert_eq!(
             receipt.first_lsn, expected_first_lsn,
             "appended group must start at the journal tail"
@@ -3800,8 +4157,7 @@ impl JournalCoordinator {
     /// The segment length past which a stalled reclaim is treated as an
     /// emergency: three quarters of the cap.
     fn emergency_len(&self) -> u64 {
-        let cap = self.segment_cap();
-        cap.saturating_sub(cap / 4)
+        emergency_len_for_cap(self.segment_cap())
     }
 
     /// Whether the segment has reached the emergency zone, where a checkpoint
@@ -3863,20 +4219,61 @@ impl JournalCoordinator {
         self.reclaim_trigger_len.load(Ordering::Relaxed)
     }
 
+    /// Test-only handle on the rewrite-window recorder; see
+    /// `Journal::rewrite_phase`.
+    #[cfg(test)]
+    pub(crate) fn rewrite_phase(&self) -> Arc<RewritePhase> {
+        Arc::clone(&self.journal.lock().rewrite_phase)
+    }
+
+    /// Set the segment length above which a sync forces a reclaiming
+    /// checkpoint, from runtime configuration. Unlike
+    /// [`Self::set_reclaim_trigger_len`] this is always available and rejects
+    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`, further limited by this
+    /// coordinator's live segment cap so the threshold stays below its
+    /// emergency-zone boundary.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for zero or a threshold at/above the emergency
+    /// boundary.
+    pub(crate) fn configure_reclaim_trigger_len(&self, len: u64) -> io::Result<()> {
+        let max = max_reclaim_trigger_for_cap(self.segment_cap()).min(MAX_RECLAIM_TRIGGER_LEN);
+        if len == 0 || len > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "reclaim trigger must be in 1..={max} bytes (below the emergency-zone boundary), got {len}"
+                ),
+            ));
+        }
+        self.reclaim_trigger_len.store(len, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Test-only: install a hook that runs inside a reclaim while the journal
+    /// locks are held.
+    #[cfg(test)]
+    pub(crate) fn set_reclaim_hook(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        *self.reclaim_hook.lock() = hook;
+    }
+
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint. Tests use a small value to cross it without writing tens of
-    /// MiB. It is not available outside tests: a value of zero would force a
-    /// checkpoint on every sync and one above the segment cap would switch the
-    /// forced reclaim off.
-    #[cfg(test)]
-    pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
+    /// MiB. This is available only to this crate's tests and downstream tests
+    /// that enable the `test-util` feature. A value of zero forces a checkpoint
+    /// on every sync; a value above the segment cap switches forced reclaim off.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_reclaim_trigger_len(&self, len: u64) {
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);
     }
 
     /// Shrink the segment cap, and the trigger with it (a quarter of the cap),
     /// so a test can reach the hard limit with a few hundred KiB.
-    #[cfg(test)]
-    pub(crate) fn set_segment_cap(&self, cap: u64) {
+    ///
+    /// Only built for this crate's tests and the `test-util` feature; a
+    /// production caller has no reason to shrink the cap.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_segment_cap(&self, cap: u64) {
         self.journal.lock().segment_cap = cap;
         self.set_reclaim_trigger_len(cap / 4);
     }
@@ -4318,6 +4715,8 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        self.revoke_over_cap_leases(&journal);
+        self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
@@ -4337,6 +4736,8 @@ impl JournalCoordinator {
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        self.revoke_over_cap_leases(&journal);
+        self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let blocked_by = (replay_limit == covered_lsn)
             .then_some(blocked_by)
@@ -4623,6 +5024,8 @@ impl Journal {
             poisoned: false,
             segment_cap: MAX_SEGMENT_LEN,
             groups: marks_from_scan(&scan),
+            #[cfg(test)]
+            rewrite_phase: Arc::new(RewritePhase::new()),
         };
         if !scan.groups.is_empty() {
             // Recovery fsynced what it kept above, so record that in the mark.
@@ -5031,6 +5434,18 @@ impl Journal {
             .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset)
     }
 
+    /// Bytes a replay cursor pinned at `lsn` still needs: the retained suffix
+    /// beginning after the last group whose `last_lsn` is at or below `lsn`,
+    /// through the current end of the segment. The file header is excluded, and
+    /// a pin at or beyond the last group retains zero. Falls back to the whole
+    /// segment length when the directory cannot be trusted.
+    fn retained_bytes_from(&self, lsn: u64) -> u64 {
+        if !self.directory_matches_file() {
+            return self.file_len;
+        }
+        self.file_len.saturating_sub(self.resume_offset_for(lsn))
+    }
+
     /// The newest LSN through which a shared segment may be reclaimed, given
     /// each pool's reported coverage: the last group of the longest prefix in
     /// which every pool with a frame has covered the group. The directory being
@@ -5206,6 +5621,8 @@ impl Journal {
         new_base_sequence: u64,
         new_base_lsn: u64,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        let _rewriting = RewritePhaseGuard::enter(&self.rewrite_phase);
         // The rebuilt file is fsynced before it replaces the segment, so all of
         // it is durable. Put its mark inside it, first generation, so the mark
         // is durable with the data and the old segment's marks, which described

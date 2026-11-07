@@ -15,6 +15,24 @@ use clap::{Arg, ArgAction, Command};
 use mtxdb::{ReadPlanPolicy, ShardType};
 
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+/// Parsed once from `MTXDB_*` in `main`. Tests that call `cmd::run` directly
+/// fall back to the library defaults instead of reading the ambient
+/// environment.
+static RUNTIME_CONFIG: OnceLock<mtxdb::RuntimeConfig> = OnceLock::new();
+
+pub(crate) fn runtime_config() -> &'static mtxdb::RuntimeConfig {
+    RUNTIME_CONFIG.get_or_init(mtxdb::RuntimeConfig::default)
+}
+
+fn shard_type_from_arg(value: &str) -> Option<ShardType> {
+    match value {
+        "state" => Some(ShardType::State),
+        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
+        "server-info" | "server_info" => Some(ShardType::ServerInfo),
+        "all" => None,
+        _ => unreachable!("clap validates shard type"),
+    }
+}
 
 pub(crate) fn debug_enabled() -> bool {
     DEBUG_ENABLED.get().copied().unwrap_or(false)
@@ -32,9 +50,8 @@ pub(crate) struct Cli {
 impl Cli {
     /// Return the single selected shard type, or bail if `-t all` was used.
     pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
-        self.shard_type.context(
-            "this command requires a specific shard type (-t state, -t events, or -t edges)",
-        )
+        self.shard_type
+            .context("this command requires a specific shard type (-t state or -t events)")
     }
 
     /// Iterate over the selected shard types (one if specific, all three if `-t all`).
@@ -120,6 +137,20 @@ pub(crate) enum Commands {
     },
     Memory {
         evict: bool,
+        evict_pages: bool,
+    },
+    Timeline {
+        room: String,
+        limit: i64,
+        reverse: bool,
+    },
+    Flags {
+        room: String,
+        flag: Option<String>,
+        not: bool,
+        count: bool,
+        limit: usize,
+        rebuild: bool,
     },
     Meta {
         target: String,
@@ -149,11 +180,19 @@ pub(crate) enum Commands {
         raw: bool,
         sort: Option<String>,
         reverse: bool,
+        live: bool,
+    },
+    Search {
+        collection: String,
+        template: Option<PathBuf>,
+        term: String,
+        limit: i64,
     },
     Import {
         paths: Vec<PathBuf>,
         collection: Option<String>,
         template: Option<PathBuf>,
+        no_state_hamts: bool,
     },
     Export {
         collection: String,
@@ -192,6 +231,7 @@ pub(crate) enum Commands {
     Sync {
         all: bool,
     },
+    ReclaimWal,
     Init,
     /// Internal: write a test record and sync (for subprocess tests).
     SubprocessWriter {
@@ -263,13 +303,17 @@ fn build_cli() -> Command {
         .subcommand(sub_collections())
         .subcommand(sub_stats())
         .subcommand(sub_memory())
+        .subcommand(sub_timeline())
+        .subcommand(sub_flags())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
+        .subcommand(sub_reclaim_wal())
         .subcommand(sub_completions())
         .subcommand(sub_import())
         .subcommand(sub_export())
         .subcommand(sub_packs())
         .subcommand(sub_repack())
+        .subcommand(sub_search())
         .subcommand(sub_scan())
         .subcommand(sub_info())
         .subcommand(sub_delete())
@@ -313,7 +357,15 @@ fn global_args(cmd: Command) -> Command {
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
             .default_value("events")
-            .value_parser(["state", "event", "events", "event-dag", "edges", "all"])
+            .value_parser([
+                "state",
+                "event",
+                "events",
+                "event-dag",
+                "server-info",
+                "server_info",
+                "all",
+            ])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
@@ -365,20 +417,100 @@ fn sub_stats() -> Command {
 
 fn sub_memory() -> Command {
     Command::new("memory")
-        .about("Inspect or evict mtxdb's in-process decoded-node caches")
+        .about("Inspect or evict in-process caches and filesystem pages")
         .long_about(
-            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n".to_owned()
+            "Inspect or evict mtxdb's in-process decoded-node caches, or request eviction of the selected database's filesystem pages.\n\n".to_owned()
                 + "This reports heap objects decoded by the current mtxdb process only. "
                 + "It does not include durable records, indexes, memory-mapped files, or "
                 + "the operating system's filesystem page cache. A one-shot CLI process "
                 + "starts with an empty decoded-node cache; this is primarily useful to "
-                + "long-lived embedders.",
+                + "long-lived embedders. --evict-pages is a Linux-only, best-effort request "
+                + "to discard clean page-cache pages for files under the database directory; "
+                + "the kernel may retain dirty or actively mapped pages.",
         )
         .arg(
             Arg::new("evict")
                 .long("evict")
                 .action(ArgAction::SetTrue)
                 .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
+        )
+        .arg(
+            Arg::new("evict-pages")
+                .long("evict-pages")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("evict")
+                .help("Request eviction of clean filesystem pages for database files (Linux; best effort)"),
+        )
+}
+
+fn sub_timeline() -> Command {
+    Command::new("timeline")
+        .about("Page events in a room's timeline in topological and stream order")
+        .arg(
+            Arg::new("room")
+                .help("The room id (e.g. !room:example.org)")
+                .required(true)
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .short('l')
+                .help("Maximum number of events to show")
+                .default_value("20")
+                .value_parser(clap::value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("reverse")
+                .long("reverse")
+                .short('r')
+                .action(ArgAction::SetTrue)
+                .help("Page timeline backwards from newest to oldest"),
+        )
+}
+
+fn sub_flags() -> Command {
+    Command::new("flags")
+        .about("Query or count room events by disposition or property flags")
+        .arg(
+            Arg::new("room")
+                .help("The room id (e.g. !room:example.org)")
+                .required(true)
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("flag")
+                .long("flag")
+                .short('f')
+                .help("Flag name to filter by (present, timeline, outlier, rejected, soft-failed, redacted)")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("not")
+                .long("not")
+                .action(ArgAction::SetTrue)
+                .requires("flag")
+                .help("Invert the flag query (events without this flag)"),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .action(ArgAction::SetTrue)
+                .help("Print only the count of matching events"),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .short('l')
+                .help("Maximum number of events to select")
+                .default_value("50")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("rebuild")
+                .long("rebuild")
+                .action(ArgAction::SetTrue)
+                .help("Rebuild the room flag index from authoritative records"),
         )
 }
 
@@ -532,6 +664,11 @@ fn sub_sync() -> Command {
         )
 }
 
+fn sub_reclaim_wal() -> Command {
+    Command::new("reclaim-wal")
+        .about("Checkpoint every pool and reclaim the shared write-ahead log")
+}
+
 fn sub_completions() -> Command {
     Command::new("completions")
         .about("Print shell completion script")
@@ -599,6 +736,17 @@ fn sub_scan() -> Command {
                      matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
+        .arg(
+            Arg::new("live")
+                .long("live")
+                .alias("indexed")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Read the live collection index instead of scanning physical frames. \
+                     Superseded frames and tombstones are omitted; valid only for a collection \
+                     selector. Use plain `scan` for the physical view.",
+                ),
+        )
         .arg(sort_arg("payload, offset"))
         .arg(
             Arg::new("reverse")
@@ -606,6 +754,36 @@ fn sub_scan() -> Command {
                 .long("reverse")
                 .action(ArgAction::SetTrue)
                 .help("Reverse the sort order (descending) when used with -s"),
+        )
+        .arg(limit_arg())
+}
+
+fn sub_search() -> Command {
+    Command::new("search")
+        .about("Search template-declared string fields in a collection")
+        .long_about(
+            "Stream the collection's JSON event records and match a case-insensitive substring \
+             against the RFC 6901 pointers in the template's `search.fields` array. This reads \
+             the primary collection directly; query time grows with collection size.",
+        )
+        .arg(
+            Arg::new("collection")
+                .required(true)
+                .value_name("COLLECTION")
+                .help("Collection ID (0x-prefixed) or canonical Matrix room ID"),
+        )
+        .arg(
+            Arg::new("term")
+                .long("term")
+                .required(true)
+                .value_name("TEXT")
+                .help("Case-insensitive substring to find in searchable fields"),
+        )
+        .arg(
+            Arg::new("template")
+                .long("template")
+                .value_name("FILE")
+                .help("Collection template declaring searchable JSON pointers"),
         )
         .arg(limit_arg())
 }
@@ -697,6 +875,16 @@ fn sub_import() -> Command {
                 .long("template")
                 .value_name("FILE")
                 .help("JSON collection template; currently supports matrix-event-v1"),
+        )
+        .arg(
+            Arg::new("no-state-hamts")
+                .long("no-state-hamts")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Do not reconstruct state groups or Synapse-format state HAMTs during a room \
+                     import. Use this when the target server builds its own state, for example \
+                     congruent's v20 migration.",
+                ),
         )
 }
 
@@ -1154,17 +1342,12 @@ fn parse_cli() -> Cli {
             .map(String::as_str)
             .expect("clap supplies the default read-plan mode"),
     );
-    let shard_type = match matches
-        .get_one::<String>("shard_type")
-        .map(String::as_str)
-        .expect("clap supplies the default shard type")
-    {
-        "state" => Some(ShardType::State),
-        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
-        "edges" => Some(ShardType::Edges),
-        "all" => None,
-        _ => unreachable!("clap validates shard type"),
-    };
+    let shard_type = shard_type_from_arg(
+        matches
+            .get_one::<String>("shard_type")
+            .map(String::as_str)
+            .expect("clap supplies the default shard type"),
+    );
 
     let command = match matches.subcommand() {
         Some(("put", m)) => Commands::Put {
@@ -1204,6 +1387,24 @@ fn parse_cli() -> Cli {
         },
         Some(("memory", m)) => Commands::Memory {
             evict: m.get_flag("evict"),
+            evict_pages: m.get_flag("evict-pages"),
+        },
+        Some(("timeline", m)) => Commands::Timeline {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            reverse: m.get_flag("reverse"),
+        },
+        Some(("flags", m)) => Commands::Flags {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            flag: m.get_one::<String>("flag").cloned(),
+            not: m.get_flag("not"),
+            count: m.get_flag("count"),
+            limit: *m
+                .get_one::<usize>("limit")
+                .expect("clap supplies a default limit"),
+            rebuild: m.get_flag("rebuild"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
@@ -1232,6 +1433,15 @@ fn parse_cli() -> Cli {
             raw: m.get_flag("raw"),
             sort: m.get_one::<String>("sort").cloned(),
             reverse: m.get_flag("reverse"),
+            live: m.get_flag("live"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+        },
+        Some(("search", m)) => Commands::Search {
+            collection: m.get_one::<String>("collection").unwrap().clone(),
+            template: m.get_one::<String>("template").map(PathBuf::from),
+            term: m.get_one::<String>("term").unwrap().clone(),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),
@@ -1244,6 +1454,7 @@ fn parse_cli() -> Cli {
                 .collect(),
             collection: m.get_one::<String>("collection").cloned(),
             template: m.get_one::<String>("template").map(PathBuf::from),
+            no_state_hamts: m.get_flag("no-state-hamts"),
         },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),
@@ -1317,6 +1528,7 @@ fn parse_cli() -> Cli {
         Some(("sync", m)) => Commands::Sync {
             all: m.get_flag("all"),
         },
+        Some(("reclaim-wal", _)) => Commands::ReclaimWal,
         Some(("init", _)) => Commands::Init,
         Some(("subprocess-writer", m)) => Commands::SubprocessWriter {
             path: m.get_one::<String>("path").unwrap().clone(),
@@ -1391,6 +1603,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
+    let runtime_config = match mtxdb::RuntimeConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let _ = RUNTIME_CONFIG.set(runtime_config);
+
     match cmd::run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

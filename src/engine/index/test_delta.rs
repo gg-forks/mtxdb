@@ -51,6 +51,270 @@ fn v1_log(operations: &[DeltaOperation], tail_fingerprint: u64) -> Vec<u8> {
     log
 }
 
+fn redo_set(collection_id: [u8; 16], full_hash: [u8; 16], delta_seq: u64) -> DeltaOperation {
+    DeltaOperation::Redo(RedoRecord {
+        collection_id,
+        op: RedoOp::Set {
+            full_hash,
+            pack_id: crate::packfile::PackId([1; 16]),
+            offset: 4096,
+            record_len: 128,
+            removed: false,
+        },
+        delta_seq,
+        base_generation: 1,
+    })
+}
+
+fn replay_incremental_snapshot_model(
+    operations: &[DeltaOperation],
+) -> HashMap<[u8; 16], Vec<DeltaOperation>> {
+    let mut state = HashMap::<[u8; 16], Vec<DeltaOperation>>::new();
+    for operation in operations {
+        match operation {
+            DeltaOperation::Incremental(frame) => {
+                let entries = state.entry(frame.collection_id).or_default();
+                entries.retain(|existing| {
+                    !matches!(existing, DeltaOperation::Incremental(old) if old.bucket == frame.bucket)
+                });
+                entries.push(operation.clone());
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. } => {
+                state.insert(*collection_id, vec![operation.clone()]);
+            }
+            DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                state.remove(collection_id);
+            }
+            DeltaOperation::Coverage { .. } | DeltaOperation::Redo(_) => {}
+        }
+    }
+    state
+}
+
+#[test]
+fn compaction_keeps_the_newest_redo_and_the_final_coverage() {
+    let collection = [3; 16];
+    let redo_a = redo_set(collection, [1; 16], 1);
+    let redo_b = redo_set(collection, [2; 16], 2);
+    let redo_a_newer = redo_set(collection, [1; 16], 3);
+    let coverage = DeltaOperation::Coverage { covered_lsn: 42 };
+    let operations = vec![redo_a, redo_b, redo_a_newer, coverage.clone()];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(compacted.len(), 3);
+    assert_eq!(compacted[2], coverage);
+    match &compacted[1] {
+        DeltaOperation::Redo(record) => {
+            assert_eq!(
+                record.delta_seq, 3,
+                "only the newest set for a hash survives"
+            );
+            let RedoOp::Set { full_hash, .. } = record.op else {
+                panic!("expected a set");
+            };
+            assert_eq!(full_hash, [1; 16]);
+        }
+        other => panic!("expected redo, got {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_drops_everything_before_a_collection_cut() {
+    let collection = [4; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        DeltaOperation::CollectionTombstone {
+            collection_id: collection,
+            generation: 2,
+        },
+        redo_set(collection, [2; 16], 2),
+        DeltaOperation::Coverage { covered_lsn: 9 },
+    ];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(compacted.len(), 3);
+    assert!(matches!(
+        compacted[0],
+        DeltaOperation::CollectionTombstone { .. }
+    ));
+    assert!(matches!(compacted[1], DeltaOperation::Redo(_)));
+    assert!(matches!(compacted[2], DeltaOperation::Coverage { .. }));
+}
+
+#[test]
+fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
+    let dir = std::env::temp_dir().join(format!("mtxdb_delta_compact_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+
+    let collection = [5; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        redo_set(collection, [2; 16], 2),
+        redo_set(collection, [1; 16], 3),
+        DeltaOperation::Coverage { covered_lsn: 77 },
+    ];
+    std::fs::write(&path, v1_log(&operations, 0x5151)).unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let after = compact_delta_log(&path)
+        .expect("compaction succeeds")
+        .expect("operations were redundant");
+    assert!(after < before, "compaction must shorten the log");
+
+    let decoded = read_delta_log(&path).expect("compacted log reads");
+    assert_eq!(decoded.base_fingerprint, 0xABC);
+    assert_eq!(decoded.tail_fingerprint, 0x5151);
+    assert_eq!(decoded.coverage, Some(77));
+    assert_eq!(decoded.operations.len(), 3);
+    assert!(matches!(
+        decoded.operations.last(),
+        Some(DeltaOperation::Coverage { covered_lsn: 77 })
+    ));
+
+    // A second pass has nothing left to remove.
+    assert_eq!(compact_delta_log(&path).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_delta_log_skips_a_log_with_marginal_savings() {
+    let dir = std::env::temp_dir().join(format!(
+        "mtxdb_delta_compact_marginal_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+
+    let collection = [6; 16];
+    let mut operations = Vec::new();
+    for index in 0..8u8 {
+        operations.push(redo_set(collection, [index; 16], u64::from(index)));
+    }
+    operations.push(redo_set(collection, [0; 16], 99));
+    operations.push(DeltaOperation::Coverage { covered_lsn: 100 });
+    std::fs::write(&path, v1_log(&operations, 0x6161)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    assert_eq!(
+        compact_delta_log(&path).unwrap(),
+        None,
+        "a rewrite that frees less than the minimum margin is not published"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the log is unchanged"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_delta_log_reaps_a_crash_leftover_temp() {
+    let dir =
+        std::env::temp_dir().join(format!("mtxdb_delta_compact_stale_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+    let stale = dir.join(format!(".{INDEX_DELTA_FILE}.compact"));
+    let collection = [0x61; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        redo_set(collection, [2; 16], 2),
+        redo_set(collection, [1; 16], 3),
+        DeltaOperation::Coverage { covered_lsn: 77 },
+    ];
+    std::fs::write(&path, v1_log(&operations, 0x7171)).unwrap();
+    std::fs::write(&stale, b"leftover").unwrap();
+
+    compact_delta_log(&path)
+        .expect("compaction succeeds")
+        .expect("operations were redundant");
+
+    let compacted = read_delta_log(&path).expect("live log remains readable");
+    assert_eq!(compacted.coverage, Some(77));
+    assert_eq!(compacted.operations.len(), 3);
+    assert!(!stale.exists(), "a crash leftover is removed before reuse");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_operations_preserve_incremental_and_snapshot_replay_result() {
+    let collection_a = [0x71; 16];
+    let collection_b = [0x72; 16];
+    let operations = vec![
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 1,
+            generation: 1,
+            slot: 11,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_b,
+            bucket: 9,
+            generation: 1,
+            slot: 19,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_b,
+            bucket: 9,
+            generation: 1,
+            slot: 29,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 1,
+            generation: 1,
+            slot: 12,
+        }),
+        DeltaOperation::CollectionSnapshot {
+            collection_id: collection_a,
+            generation: 3,
+            order_key: 4,
+            index_blob: vec![3, 3, 3],
+        },
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 7,
+            generation: 3,
+            slot: 17,
+        }),
+        DeltaOperation::Coverage { covered_lsn: 88 },
+    ];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(
+        replay_incremental_snapshot_model(&operations),
+        replay_incremental_snapshot_model(&compacted)
+    );
+    assert_eq!(
+        compacted
+            .iter()
+            .filter(|operation| matches!(operation, DeltaOperation::Incremental(frame) if frame.collection_id == collection_b && frame.bucket == 9))
+            .count(),
+        1,
+        "only the latest incremental frame for a bucket survives"
+    );
+    assert!(
+        compacted.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::CollectionSnapshot { collection_id, generation: 3, .. }
+                if *collection_id == collection_a
+        )),
+        "the latest snapshot must survive the cut"
+    );
+    assert!(
+        !compacted.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::Incremental(frame)
+                if frame.collection_id == collection_a && frame.generation == 1
+        )),
+        "the snapshot must cut earlier incrementals"
+    );
+}
+
 #[test]
 fn v1_log_round_trips_operations() {
     let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_round_{}", std::process::id()));

@@ -1,7 +1,7 @@
 use super::{
     changes_since_full_scans, set_changes_since_before_read_hook,
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation,
+    Journal, JournalCoordinator, Mutation, MAX_RECLAIM_TRIGGER_LEN,
 };
 use super::{TxnStage, TxnStageState};
 use std::fs;
@@ -102,7 +102,7 @@ fn shared_segment_round_trips_pool_tags() {
     let tagged = [
         (ShardType::State, put(1, 1, b"state")),
         (ShardType::EventDag, put(2, 2, b"event")),
-        (ShardType::Edges, put(3, 3, b"edges")),
+        (ShardType::ServerInfo, put(3, 3, b"edges")),
     ];
     journal
         .append_group_tagged_with_sequence(&tagged, None)
@@ -118,7 +118,7 @@ fn shared_segment_round_trips_pool_tags() {
         .collect();
     assert_eq!(
         pools,
-        vec![ShardType::State, ShardType::EventDag, ShardType::Edges,]
+        vec![ShardType::State, ShardType::EventDag, ShardType::ServerInfo,]
     );
 
     // Recovery must preserve the tags so each frame can be routed.
@@ -153,10 +153,10 @@ fn shared_committed_watermark_is_per_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // Group one: state only. Only state's watermark may advance past zero.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_only = coordinator.committed_lsn();
     assert_eq!(
@@ -169,13 +169,13 @@ fn shared_committed_watermark_is_per_pool() {
         0,
         "another pool's group must not advance event-DAG's watermark"
     );
-    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
+    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::ServerInfo), 0);
 
     // Group two: event-DAG only. State's watermark must stay put.
-    coordinator
+    let event_receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(event_receipt.first_lsn);
     coordinator.sync().unwrap();
     assert_eq!(
         coordinator.committed_lsn_for_pool(ShardType::State),
@@ -215,13 +215,14 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
 
     // A transaction stages an event-DAG frame without going through
     // `publish`; it must still block reclaim until event-DAG checkpoints.
-    coordinator
+    let receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
         .unwrap();
-    coordinator
+    coordinator.transaction_materialized(receipt.first_lsn);
+    let receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(receipt.first_lsn);
     coordinator.sync().unwrap();
     let committed = coordinator.committed_lsn();
     assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);
@@ -249,20 +250,20 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // State contributes only the first group, then goes idle.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
 
     // Event-DAG writes several later groups that never carry a state frame.
     let mut event_lsn = 0;
     for id in 0..4u8 {
-        coordinator
+        let receipt = coordinator
             .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
-            .map(|receipt| receipt.last_lsn)
             .unwrap();
+        coordinator.transaction_materialized(receipt.first_lsn);
         coordinator.sync().unwrap();
         event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
     }
@@ -330,7 +331,7 @@ fn coordinator_publishes_tagged_frames() {
     coordinator
         .publish_tagged_groups(&[
             (ShardType::State, &[put(1, 1, b"a")]),
-            (ShardType::Edges, &[put(3, 3, b"c")]),
+            (ShardType::ServerInfo, &[put(3, 3, b"c")]),
         ])
         .unwrap();
     coordinator.sync().unwrap();
@@ -341,7 +342,7 @@ fn coordinator_publishes_tagged_frames() {
         .iter()
         .map(|entry| entry.pool)
         .collect();
-    assert_eq!(pools, vec![ShardType::State, ShardType::Edges]);
+    assert_eq!(pools, vec![ShardType::State, ShardType::ServerInfo]);
     fs::remove_file(path).unwrap();
 }
 
@@ -401,7 +402,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
         .stage_put(ShardType::EventDag, [2; 16], [2; 16], b"event".to_vec())
         .unwrap();
     stage
-        .stage_put(ShardType::Edges, [3; 16], [3; 16], b"edge".to_vec())
+        .stage_put(ShardType::ServerInfo, [3; 16], [3; 16], b"edge".to_vec())
         .unwrap();
 
     stage
@@ -420,7 +421,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
             .iter()
             .map(|entry| entry.pool)
             .collect::<Vec<_>>(),
-        vec![ShardType::Edges, ShardType::EventDag, ShardType::State]
+        vec![ShardType::EventDag, ShardType::State, ShardType::ServerInfo]
     );
     assert_eq!(stage.state(), TxnStageState::JournalPublished);
     fs::remove_file(path).unwrap();
@@ -546,6 +547,8 @@ fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
 
     // One sync makes both groups durable and promotes each pool.
     coordinator.sync_through(2).unwrap();
+    coordinator.transaction_materialized(first.first_lsn);
+    coordinator.transaction_materialized(second.first_lsn);
     assert_eq!(coordinator.committed_lsn(), 2);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
@@ -1114,6 +1117,43 @@ fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
     let _ = fs::remove_file(&path);
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     Arc::new(JournalCoordinator::new(journal, &scan))
+}
+
+#[test]
+fn configured_reclaim_trigger_stays_below_the_live_emergency_boundary() {
+    let coordinator = open_shared_arc("configured_reclaim_trigger_boundary");
+
+    coordinator
+        .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), MAX_RECLAIM_TRIGGER_LEN);
+
+    let over = MAX_RECLAIM_TRIGGER_LEN.saturating_add(1);
+    let error = coordinator.configure_reclaim_trigger_len(over).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        coordinator.reclaim_trigger_len(),
+        MAX_RECLAIM_TRIGGER_LEN,
+        "a rejected value must not change the trigger"
+    );
+
+    // A shrunk cap lowers the boundary even for a value below the
+    // compile-time ceiling.
+    coordinator.set_segment_cap(1024);
+    let shrunk_max = super::max_reclaim_trigger_for_cap(1024);
+    coordinator
+        .configure_reclaim_trigger_len(shrunk_max)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), shrunk_max);
+    assert!(coordinator
+        .configure_reclaim_trigger_len(shrunk_max.saturating_add(1))
+        .is_err());
+    assert!(
+        coordinator
+            .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+            .is_err(),
+        "the compile-time ceiling must not override a shrunk live cap"
+    );
 }
 
 fn publish(coordinator: &JournalCoordinator, node: u8, payload: &[u8]) -> super::CommitReceipt {
@@ -2220,7 +2260,7 @@ fn replay_lease_advance_lets_reclaim_pass_consumed_pages() {
     assert_eq!(page.groups[0].last_lsn, second.last_lsn);
 
     // Once the page is applied, advancing the floor releases the snapshot.
-    lease.advance(page.through_lsn);
+    lease.advance(page.through_lsn).unwrap();
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2239,8 +2279,8 @@ fn replay_lease_advance_is_monotonic() {
     let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
     let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
 
-    lease.advance(second.last_lsn);
-    lease.advance(first.last_lsn);
+    lease.advance(second.last_lsn).unwrap();
+    lease.advance(first.last_lsn).unwrap();
 
     // The floor stays at `second`, so reclaim may drop the snapshot and expire
     // the cursor. A lowered floor would clamp the cut to `first` and keep the
@@ -2248,6 +2288,184 @@ fn replay_lease_advance_is_monotonic() {
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The retention cap is opt-in: with no cap configured, a lease pins its
+/// original cursor however far the segment grows.
+#[test]
+fn replay_lease_cap_is_off_by_default() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_off");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(None);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    lease.advance(second.last_lsn).unwrap();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+}
+
+/// A lease pinning more history than the cap allows is revoked by the next
+/// reclaim, which then passes it; reads fall through to the cursor-expired
+/// error and `advance` reports the revocation.
+#[test]
+fn replay_lease_cap_revokes_a_lease_that_retains_too_much() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_breach");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    assert_eq!(coordinator.replay_lease_count(), 1);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+    assert_eq!(
+        lease.advance(second.last_lsn),
+        Err(crate::journal::ReplayLeaseRevoked)
+    );
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The cap is per lease: at the next reclaim, an older lease over the limit is
+/// revoked while a newer lease retaining exactly the cap is kept.
+#[test]
+fn replay_lease_cap_revokes_only_leases_over_the_limit() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_selective");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let newer_cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let newer = coordinator.pin_replay_cursor(&newer_cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let retained_by_newer = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(
+        retained_by_newer > 0,
+        "the newer lease retains the new group"
+    );
+
+    // Exactly at the cap: kept. The older lease retains more than that.
+    coordinator.configure_replay_lease_cap(Some(retained_by_newer));
+    let older_cursor = coordinator.replay_cursor(0).unwrap();
+    let older = coordinator.pin_replay_cursor(&older_cursor).unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(older.is_revoked());
+    assert!(!newer.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 1);
+    let error = coordinator.changes_since(&older_cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    // The surviving lease still reads the retained group and can advance.
+    let page = coordinator.changes_since(&newer_cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+    newer.advance(second.last_lsn).unwrap();
+}
+
+/// Dropping a lease releases its pin without revoking it; the revoked counter
+/// only tracks cap-driven invalidations.
+#[test]
+fn dropping_a_replay_lease_is_not_a_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_drop");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    drop(lease);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+}
+
+/// A lease that fits under the cap is left active, and its lag is reported so
+/// a stuck lease is visible before it matters.
+#[test]
+fn replay_lease_lag_reports_retained_bytes_within_the_cap() {
+    let dir = ReplayTestDir::new("changes_since_lease_lag");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    coordinator.configure_replay_lease_cap(Some(u64::MAX / 2));
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let lag = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(lag > 0, "the second group is retained by the lease");
+    assert!(coordinator.oldest_replay_lease_age().is_some());
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    lease.advance(second.last_lsn).unwrap();
+}
+
+/// Concurrent `advance` and cap revocation share the pin registry: after the
+/// reclaim revokes the lease, every later `advance` reports it.
+#[test]
+fn replay_lease_advance_observes_concurrent_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_race");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+
+    let revoked = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| loop {
+            if lease.is_revoked() {
+                return lease.advance(first.last_lsn).err();
+            }
+            if let Err(error) = lease.advance(first.last_lsn) {
+                return Some(error);
+            }
+            std::thread::yield_now();
+        });
+        coordinator.reclaim_through(second.last_lsn).unwrap();
+        worker.join().unwrap()
+    });
+
+    assert_eq!(revoked, Some(crate::journal::ReplayLeaseRevoked));
+    assert!(lease.is_revoked());
 }
 
 #[test]
@@ -2281,6 +2499,37 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 
     drop(lease);
     coordinator.reclaim_shared().unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn shared_reclaim_revokes_a_lease_over_the_cap() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("shared_replay_lease_cap");
+    let path = dir.journal_path();
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    coordinator.configure_replay_lease_cap(Some(1));
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 2, b"replay")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.reclaim_shared().unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -3198,7 +3447,7 @@ fn directory_boundary_equals_the_scan_boundary() {
                 for (pool, level) in [
                     (ShardType::State, state),
                     (ShardType::EventDag, event_dag),
-                    (ShardType::Edges, edges),
+                    (ShardType::ServerInfo, edges),
                 ] {
                     if let Some(lsn) = level {
                         covered.insert(pool, lsn);
@@ -3347,7 +3596,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
     let receipt = coordinator
-        .publish_group_tagged(ShardType::Edges, &[put(9, 1, b"edge")])
+        .publish_group_tagged(ShardType::ServerInfo, &[put(9, 1, b"edge")])
         .unwrap();
     coordinator.sync().unwrap();
     drop(coordinator);
@@ -3355,7 +3604,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     let recovered = JournalCoordinator::new(journal, &scan);
     assert_eq!(
-        recovered.collection_version(ShardType::Edges, &[9; 16]),
+        recovered.collection_version(ShardType::ServerInfo, &[9; 16]),
         receipt.last_lsn,
         "a retained group's collection version survives a reopen"
     );
@@ -3387,6 +3636,30 @@ fn expectations_are_staged_and_discarded_with_the_transaction() {
         stage.expectations().is_empty(),
         "discard drops staged expectations"
     );
+}
+
+#[test]
+fn conflicting_collection_expectations_are_rejected_but_synthetic_zero_is_ignored() {
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 42)
+        .unwrap();
+    // A later staged-view read can report a synthetic zero; it must not
+    // replace the original precondition.
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 0)
+        .unwrap();
+    assert_eq!(stage.expectations().len(), 1);
+    assert_eq!(stage.expectations()[0].expected, 42);
+
+    // A second real token is a conflict, not something to silently drop.
+    let error = stage
+        .stage_expectation(ShardType::State, [4; 16], 43)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(stage.expectations()[0].expected, 42);
 }
 
 #[test]
@@ -3603,4 +3876,101 @@ fn either_segment_a_rewrite_crash_leaves_opens_and_numbers_consistently() {
         "numbering continues identically"
     );
     assert_eq!(next_lsns[0], second.last_lsn.saturating_add(1));
+}
+
+/// The original lookup: one pass over every staged mutation. Kept as the
+/// reference the incremental index must agree with.
+fn scan_lookup(
+    mutations: &[Mutation],
+    collection_id: &[u8; 16],
+    node_ids: &[[u8; 16]],
+) -> Vec<super::StagedLookup> {
+    use super::StagedLookup;
+    use std::collections::{HashMap, HashSet};
+
+    let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+    let mut newest: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
+    let mut last_delete: Option<usize> = None;
+    for (position, mutation) in mutations.iter().enumerate() {
+        match mutation {
+            Mutation::Put {
+                collection_id: staged,
+                node_id,
+                payload,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, Some(payload)));
+            }
+            Mutation::RemoveRecord {
+                collection_id: staged,
+                node_id,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, None));
+            }
+            Mutation::DeleteCollection {
+                collection_id: staged,
+            } if staged == collection_id => last_delete = Some(position),
+            _ => {}
+        }
+    }
+    node_ids
+        .iter()
+        .map(|node_id| match (newest.get(node_id), last_delete) {
+            (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+            (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+            (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
+            (None, None) => StagedLookup::Absent,
+        })
+        .collect()
+}
+
+#[test]
+fn staged_lookup_index_matches_a_full_scan() {
+    use crate::layout::ShardType;
+    use std::collections::HashSet;
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % u64::try_from(bound).unwrap()).unwrap()
+    };
+    let pool = ShardType::EventDag;
+    let pool_position = pool.index();
+    let ids: Vec<[u8; 16]> = (0..12_u8).map(|n| [n; 16]).collect();
+    let collections = [[0xa0_u8; 16], [0xb0_u8; 16]];
+    let stage = TxnStage::new();
+
+    for step in 0..600_u32 {
+        let collection = collections[next(2)];
+        let id = ids[next(12)];
+        match next(8) {
+            0..=2 => stage
+                .stage_put(pool, collection, id, step.to_le_bytes().to_vec())
+                .unwrap(),
+            3 => stage.stage_remove_record(pool, collection, id).unwrap(),
+            4 => stage.stage_delete_collection(pool, collection).unwrap(),
+            5 => stage
+                .stage_puts(pool, collection, &[(id, vec![1]), (ids[next(12)], vec![2])])
+                .unwrap(),
+            // These two rewrite the staged vector and must invalidate the index.
+            6 => stage
+                .forget_staged_records(pool, collection, &HashSet::from([id]))
+                .unwrap(),
+            _ => stage
+                .stage_removals_normalized(pool, collection, &[(id, 0)], &[id])
+                .unwrap(),
+        }
+        let mutations = stage.snapshot_mutations()[pool_position].clone();
+        for collection in &collections {
+            assert_eq!(
+                stage.lookup_many(pool, collection, &ids),
+                scan_lookup(&mutations, collection, &ids),
+                "step {step}"
+            );
+        }
+    }
+
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
 }

@@ -1,19 +1,24 @@
 use super::{
-    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    base_is_incomplete, build_event_dag, canonical_column_width, cmd_collections, cmd_flags,
+    cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
+    cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
+    collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
+    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, keys_first,
+    listing_shard_types, load_collection_events, load_state_groups, matrix_batch_has_create,
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
-    meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
+    meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
+    parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
+    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
     MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
@@ -22,7 +27,7 @@ use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
-use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
@@ -40,6 +45,118 @@ use base64::Engine;
 fn owned_value(json: &str) -> OwnedValue {
     let bytes = json.as_bytes().to_vec();
     OwnedValue::parse_bytes(&bytes).expect("valid JSON fixture")
+}
+
+fn raw_event(
+    room: &str,
+    id: &str,
+    kind: &str,
+    state_key: &str,
+    content: &str,
+    prev: &str,
+    auth: &str,
+) -> OwnedValue {
+    owned_value(&format!(
+        r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"{room}","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+    ))
+}
+
+fn with_content_hash(mut event: OwnedValue, room_version: &str) -> OwnedValue {
+    let hash =
+        rezzy::compute_content_hash(&event, room_version).expect("content hash is computable");
+    if let OwnedValue::Object(fields) = &mut event {
+        let mut hashes = rezzy::json::Object::new();
+        hashes.insert("sha256".to_owned(), OwnedValue::String(hash));
+        fields.insert("hashes".to_owned(), OwnedValue::Object(hashes));
+    }
+    event
+}
+
+/// A power-levels event whose content says `invite: 50` but whose hash belongs
+/// to an honest `invite: 0` event. The hash must fail, so this content may not
+/// seed an auth projection.
+fn forged_power_levels_with_stale_hash(room: &str) -> OwnedValue {
+    let mut event = raw_event(
+        room,
+        "$pl",
+        "m.room.power_levels",
+        "",
+        r#"{"users":{"@alice:test":100},"invite":50}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let honest_hash = rezzy::compute_content_hash(
+        &raw_event(
+            room,
+            "$pl",
+            "m.room.power_levels",
+            "",
+            r#"{"users":{"@alice:test":100},"invite":0}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "10",
+    )
+    .expect("content hash is computable");
+    if let OwnedValue::Object(fields) = &mut event {
+        let mut hashes = rezzy::json::Object::new();
+        hashes.insert("sha256".to_owned(), OwnedValue::String(honest_hash));
+        fields.insert("hashes".to_owned(), OwnedValue::Object(hashes));
+    }
+    event
+}
+
+fn raw_v10_invite_fixture() -> [OwnedValue; 6] {
+    [
+        raw_event(
+            "!room5",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"10"}"#,
+            "[]",
+            "[]",
+        ),
+        raw_event(
+            "!room5",
+            "$join_alice",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        ),
+        // The stored form redacts `invite`, so its content hash will not match
+        // on the next file. The projection must survive that check.
+        with_content_hash(
+            raw_event(
+                "!room5",
+                "$pl",
+                "m.room.power_levels",
+                "",
+                r#"{"users":{"@alice:test":100},"invite":50}"#,
+                r#"["$join_alice"]"#,
+                r#"["$create","$join_alice"]"#,
+            ),
+            "10",
+        ),
+        raw_event(
+            "!room5",
+            "$rules",
+            "m.room.join_rules",
+            "",
+            r#"{"join_rule":"public"}"#,
+            r#"["$pl"]"#,
+            r#"["$create","$join_alice","$pl"]"#,
+        ),
+        owned_value(
+            r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room5","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+        ),
+        // Bob is level 0 and the room's invite level is 50.
+        owned_value(
+            r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room5","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+        ),
+    ]
 }
 
 /// A string field of a JSON object, or `None` if the key is absent or not
@@ -1470,6 +1587,7 @@ fn get_and_scan_with_header_and_decode() {
         false,
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1485,6 +1603,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         None,
+        false,
         false,
     )
     .unwrap();
@@ -1551,14 +1670,250 @@ fn scan_dash_t_all_finds_collection_across_pools() {
             raw: false,
             sort: None,
             reverse: false,
+            live: false,
         },
     };
 
     cmd_scan(
-        &cli, &col_hex, false, false, None, -1, None, None, false, None, false,
+        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false,
     )
     .unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn live_collection_scan_excludes_superseded_versions() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::EventDag).unwrap()).unwrap();
+    let collection = [0x41; 16];
+    let node = [0x42; 16];
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+    assert_eq!(
+        store
+            .collection_live_locations(&collection)
+            .unwrap()
+            .unwrap()
+            .len(),
+        1,
+        "the superseded version must not appear in the live index"
+    );
+    drop(store);
+
+    let collection_hex = format_id(&collection);
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Scan {
+            selector: collection_hex.clone(),
+            verbose: false,
+            header: false,
+            decode: None,
+            limit: 10,
+            id: None,
+            collection: None,
+            raw: false,
+            sort: None,
+            reverse: false,
+            live: true,
+        },
+    };
+    let opts = ScanOptions {
+        verbose: false,
+        header: false,
+        decode: None,
+        limit: 10,
+        node_id: None,
+        raw: true,
+        sort: None,
+        reverse: false,
+    };
+    let (scanned_collection, rows, _) =
+        cmd_scan_collection_live_rows(&cli, &collection_hex, &opts).unwrap();
+    assert_eq!(scanned_collection, collection);
+    let payloads: Vec<_> = rows
+        .iter()
+        .map(|(_, _, _, record)| record.as_ref().unwrap().data.as_ref())
+        .collect();
+    assert_eq!(payloads, [b"second".as_slice()]);
+    cmd_scan(
+        &cli,
+        &collection_hex,
+        false,
+        false,
+        None,
+        10,
+        None,
+        None,
+        false,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn state_collection_without_genesis_metadata_is_preserved_and_rejected() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::State).unwrap()).unwrap();
+
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let node = [0x51; 16];
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"old root")),
+        )
+        .unwrap();
+    assert!(store
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert!(store.collection_exists(&collection));
+
+    let metadata = CollectionMetadata {
+        member_namespace: Some(*b"STAT"),
+        collection_canonical_id: canonical_id.to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    };
+    let error = prepare_state_collection(&store, &collection, &metadata).unwrap_err();
+    assert!(error.to_string().contains("refusing to reset"));
+    assert!(store
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.get(&collection, &node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"old root"),
+        "unreferenced status cannot be established, so preserve the records"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn state_test_metadata(canonical_id: &[u8]) -> CollectionMetadata {
+    CollectionMetadata {
+        member_namespace: Some(*b"STAT"),
+        collection_canonical_id: canonical_id.to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    }
+}
+
+/// A server migration wrote HAMT roots with no genesis metadata, the server
+/// stopped, and the import reopens the shared database. The reset must still
+/// establish the collection, and the records written after it must be readable.
+#[test]
+fn state_collection_without_genesis_is_preserved_after_a_reopen() {
+    let root = unique_temp_dir().join("state-reopen");
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let old_node = [0x51; 16];
+
+    {
+        let db = Database::open(root.clone()).unwrap();
+        let state = db.pool(ShardType::State);
+        state
+            .put(
+                &collection,
+                &old_node,
+                &NodeData::new(Bytes::from_static(b"old root")),
+            )
+            .unwrap();
+        state.sync().unwrap();
+    }
+
+    let db = Database::open(root.clone()).unwrap();
+    let state = db.pool(ShardType::State);
+    assert!(state
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert!(state.collection_exists(&collection));
+
+    let metadata = state_test_metadata(canonical_id);
+    let error = prepare_state_collection(state, &collection, &metadata).unwrap_err();
+    assert!(error.to_string().contains("refusing to reset"));
+    assert!(state
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        state.get(&collection, &old_node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"old root")
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}
+
+/// A room import prepares the collection, writes it, and a later import of the
+/// same room prepares it again. The second prepare must leave the records alone.
+#[test]
+fn preparing_an_established_state_collection_again_keeps_its_records() {
+    let root = unique_temp_dir().join("state-prepare-twice");
+    let db = Database::open(root.clone()).unwrap();
+    let state = db.pool(ShardType::State);
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let node = [0x53; 16];
+    let metadata = state_test_metadata(canonical_id);
+
+    prepare_state_collection(state, &collection, &metadata).unwrap();
+    state
+        .put_many(
+            &collection,
+            &[(node, NodeData::new(Bytes::from_static(b"root")))],
+        )
+        .unwrap();
+    prepare_state_collection(state, &collection, &metadata).unwrap();
+
+    assert_eq!(
+        state.get(&collection, &node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"root")
+    );
+    assert_eq!(
+        state.get_collection_metadata(&collection).unwrap(),
+        Some(metadata)
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
 }
 
 /// Template whose record identity derives from `sender` rather than the
@@ -1914,6 +2269,1472 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     assert!(valid_state_group_id(&state_group));
 }
 
+#[test]
+fn template_node_id_matches_event_id_derivation() {
+    let template = default_matrix_import_template();
+    let event = raw_event(
+        "!room_match",
+        "$test_event:server.name",
+        "m.room.message",
+        "",
+        "{}",
+        "[]",
+        "[]",
+    );
+    let from_event = template_node_id(&template, &event).unwrap().unwrap();
+    let from_id = template_event_id_node_id(&template, "$test_event:server.name").unwrap();
+    assert_eq!(
+        from_event, from_id,
+        "node ID derived from event ID string must match event node ID"
+    );
+
+    // Unsupported policy errors rather than silently returning None
+    let mut custom = template.clone();
+    custom.record_id_rule.policy = FrameIdPolicy::Payload;
+    assert!(template_event_id_node_id(&custom, "$test_event:server.name").is_err());
+    assert!(template_node_id(&custom, &event).is_err());
+}
+
+#[test]
+fn search_reads_only_template_declared_fields() {
+    let path = unique_temp_dir().join("search-template.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"search":{"fields":["/content/body"]},"record":{"identity":{"extract":{"path":"/event_id"}}}}"#,
+    )
+    .unwrap();
+    let spec = search_template(Some(&path)).unwrap();
+    let event = owned_value(
+        r#"{"event_id":"$one","type":"m.room.message","content":{"body":"Hello, World"}}"#,
+    );
+
+    assert!(search_record_matches(&event, &spec.fields, "world"));
+    assert!(!search_record_matches(
+        &event,
+        &spec.fields,
+        "m.room.message"
+    ));
+    assert_eq!(spec.identity.as_deref(), Some("/event_id"));
+    assert!(!valid_json_pointer("/content/~2body"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// The room's missing parents, derived the way a consumer would: every event
+/// id its CSR rows reference whose body is stored nowhere. A body is stored in
+/// the room's event collection, in the State pool's auth-chain collection, or
+/// (for raw auth-chain events) as an auth projection.
+fn missing_parents(
+    db: &Database,
+    template: &CollectionTemplate,
+    room_id: &str,
+) -> std::collections::BTreeSet<NodeId> {
+    let nodes: Vec<NodeId> = RoomAuth::new(room_id)
+        .referenced_event_ids(db)
+        .unwrap()
+        .iter()
+        .map(|event_id| template_event_id_node_id(template, event_id).unwrap())
+        .collect();
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let places = [
+        (db.event_dag(), template_collection_id(template, room_id)),
+        (db.state(), auth_collection),
+        (db.event_dag(), raw_auth_projection_collection_id(room_id)),
+    ];
+    let mut present = std::collections::HashSet::new();
+    for (store, collection) in places {
+        let found = store.get_many(&collection, &nodes).unwrap();
+        present.extend(nodes.iter().zip(found).filter_map(|(n, f)| f.map(|_| *n)));
+    }
+    nodes.into_iter().filter(|n| !present.contains(n)).collect()
+}
+
+fn import_raw_events(
+    db: &Database,
+    template: &CollectionTemplate,
+    room_id: &str,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) {
+    let path = unique_temp_dir().join("room.jsonl");
+    let mut established = HashSet::new();
+    established.insert(template_collection_id(template, room_id));
+    RawFixtureImporter {
+        db,
+        store: db.event_dag(),
+        state_store: db.state().as_ref(),
+        path: &path,
+        template,
+        established: &mut established,
+    }
+    .import(events, auth_chain);
+}
+
+#[test]
+fn raw_import_marks_only_missing_parents_as_missing() {
+    let db = Database::open(unique_temp_dir().join("raw_file_and_missing")).unwrap();
+    let template = default_matrix_import_template();
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let child = raw_event(
+        FIXTURE_ROOM,
+        "$child",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$missing-prev"]"#,
+        r#"["$same-file-auth"]"#,
+    );
+    let same_file_auth = raw_event(
+        FIXTURE_ROOM,
+        "$same-file-auth",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        "[]",
+        "[]",
+    );
+
+    import_raw_events(
+        &db,
+        &template,
+        FIXTURE_ROOM,
+        &[create, child, same_file_auth],
+        &[],
+    );
+
+    let missing_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
+    assert_eq!(
+        missing_parents(&db, &template, FIXTURE_ROOM),
+        [missing_node].into(),
+        "only the parent no file supplied is missing"
+    );
+    assert!(
+        db.server_info().collection_ids().is_empty(),
+        "missing parents are derived from the CSR, not stored"
+    );
+}
+
+#[test]
+fn raw_import_missing_parent_leaves_the_set_when_it_arrives() {
+    let db = Database::open(unique_temp_dir().join("raw_waiting_arrival")).unwrap();
+    let template = default_matrix_import_template();
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let child = raw_event(
+        FIXTURE_ROOM,
+        "$child",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$missing-prev"]"#,
+        "[]",
+    );
+    let parent = raw_event(
+        FIXTURE_ROOM,
+        "$missing-prev",
+        "m.room.message",
+        "",
+        "{}",
+        "[]",
+        "[]",
+    );
+    let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
+
+    import_raw_events(&db, &template, FIXTURE_ROOM, &[create, child], &[]);
+    assert!(missing_parents(&db, &template, FIXTURE_ROOM).contains(&parent_node));
+
+    import_raw_events(&db, &template, FIXTURE_ROOM, &[parent], &[]);
+    assert!(missing_parents(&db, &template, FIXTURE_ROOM).is_empty());
+}
+
+#[test]
+fn raw_import_reimport_leaves_the_missing_set_unchanged() {
+    let db = Database::open(unique_temp_dir().join("raw_idempotent")).unwrap();
+    let template = default_matrix_import_template();
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let child = raw_event(
+        FIXTURE_ROOM,
+        "$child",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$missing-prev"]"#,
+        "[]",
+    );
+    let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
+
+    for _ in 0..3 {
+        import_raw_events(
+            &db,
+            &template,
+            FIXTURE_ROOM,
+            &[create.clone(), child.clone()],
+            &[],
+        );
+        assert_eq!(
+            missing_parents(&db, &template, FIXTURE_ROOM),
+            [parent_node].into()
+        );
+    }
+}
+
+#[test]
+fn raw_import_derives_rejections_and_writes_flags() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_auth");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        owned_value(&format!(
+            r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"!room","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+        ))
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = event(
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let leave = event(
+        "$leave",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"leave"}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    // Cites the stale join after Alice left, so check 5 rejects it.
+    let stale = event(
+        "$stale",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$leave"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[create, join, leave],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+    // The second file has to recover the earlier state from the store for
+    // check 5 to see that Alice has left.
+    import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[stale],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+
+    let flags = RoomFlagIndex::new(b"!room");
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1
+    );
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    let loaded = load_state_groups(&aux, &["$leave".to_owned(), "$stale".to_owned()]).unwrap();
+    let StateGroupLoad::Complete(groups) = loaded else {
+        panic!("state groups should be cached");
+    };
+    assert_eq!(
+        groups["$stale"], groups["$leave"],
+        "rejected state event must not change later state"
+    );
+}
+
+fn raw_late_parent_fixture() -> [OwnedValue; 4] {
+    [
+        raw_event(
+            "!room3",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"11"}"#,
+            "[]",
+            "[]",
+        ),
+        raw_event(
+            "!room3",
+            "$join",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        ),
+        // Its parent is in the next file, so the first import cannot check it.
+        raw_event(
+            "!room3",
+            "$stale",
+            "m.room.join_rules",
+            "",
+            r#"{"join_rule":"public"}"#,
+            r#"["$leave"]"#,
+            r#"["$create","$join"]"#,
+        ),
+        raw_event(
+            "!room3",
+            "$leave",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"leave"}"#,
+            r#"["$join"]"#,
+            r#"["$create","$join"]"#,
+        ),
+    ]
+}
+
+struct RawFixtureImporter<'a> {
+    db: &'a Database,
+    store: &'a PackfileStorage,
+    state_store: &'a PackfileStorage,
+    path: &'a Path,
+    template: &'a CollectionTemplate,
+    established: &'a mut HashSet<[u8; 16]>,
+}
+
+impl RawFixtureImporter<'_> {
+    fn import(&mut self, events: &[OwnedValue], auth_chain: &[OwnedValue]) {
+        import_pdu_events_with_raw(
+            self.db,
+            self.store,
+            self.state_store,
+            self.path,
+            events,
+            auth_chain,
+            Some(&[]),
+            None,
+            None,
+            self.template,
+            self.established,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_late_parent");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room3");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let [create, join, stale, leave] = raw_late_parent_fixture();
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join, stale]);
+
+    let flags = RoomFlagIndex::new(b"!room3");
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0,
+        "an event with a missing parent is left unchecked"
+    );
+
+    let record = mtxdb::interop::event_record_id(b"$stale");
+    let verdict_collection = mtxdb::interop::event_verdict_collection_id(&record);
+    let stale_verdict = || {
+        stored(&db, mtxdb::ShardType::EventDag, verdict_collection, record)
+            .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.rejection)
+    };
+    assert_eq!(
+        stale_verdict().flatten(),
+        None,
+        "the first file stores no rejection for the unchecked event"
+    );
+
+    import(&[leave]);
+
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1,
+        "the late parent makes the earlier event fail check 5"
+    );
+    assert_eq!(
+        flags.select(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        vec![b"$stale".to_vec()],
+        "the flag index must map the short id back to the event"
+    );
+    assert!(
+        stale_verdict().is_some(),
+        "the earlier event's stored verdict must be updated, not just its state group"
+    );
+}
+
+#[test]
+fn raw_import_tracks_missing_parents_across_files() {
+    let db = Database::open(unique_temp_dir().join("raw_waiting_parents")).unwrap();
+    let template = default_matrix_import_template();
+    let [create, join, stale, leave] = raw_late_parent_fixture();
+    let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
+    assert_eq!(
+        template_event_id_node_id(&template, "$stale").unwrap(),
+        template_node_id(&template, &stale).unwrap().unwrap(),
+        "string and event node-id helpers must agree"
+    );
+
+    // $stale cites $leave as prev, and $leave is not supplied yet.
+    let initial = [create, join, stale];
+    import_raw_events(&db, &template, "!room3", &initial, &[]);
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into()
+    );
+
+    // Re-importing the same file changes nothing.
+    import_raw_events(&db, &template, "!room3", &initial, &[]);
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into()
+    );
+
+    // The parent arriving clears it.
+    import_raw_events(&db, &template, "!room3", &[leave], &[]);
+    assert!(missing_parents(&db, &template, "!room3").is_empty());
+
+    // A later child of a parent stored by an earlier file does not re-add it.
+    let late = raw_event(
+        "!room3",
+        "$late",
+        "m.room.message",
+        "@alice:test",
+        "{}",
+        r#"["$leave"]"#,
+        r#"["$create","$join"]"#,
+    );
+    import_raw_events(&db, &template, "!room3", &[late], &[]);
+    assert!(missing_parents(&db, &template, "!room3").is_empty());
+    assert!(db.server_info().collection_ids().is_empty());
+}
+
+const FEDERATION_FIRST_DOC: &str = r#"{
+    "pdus": [
+        {"event_id":"$create","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.create","state_key":"",
+         "content":{"creator":"@alice:test","room_version":"11"},
+         "prev_events":[],"auth_events":[]},
+        {"event_id":"$join","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.member","state_key":"@alice:test",
+         "content":{"membership":"join"},
+         "prev_events":["$create"],"auth_events":["$create"]},
+        {"event_id":"$stale","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.join_rules","state_key":"",
+         "content":{"join_rule":"public"},
+         "prev_events":["$leave"],"auth_events":["$create","$join"]}
+    ]
+}"#;
+
+const FEDERATION_SECOND_DOC: &str = r#"{
+    "pdus": [
+        {"event_id":"$late","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.message","state_key":"",
+         "content":{},"prev_events":["$leave"],
+         "auth_events":["$create","$join"]}
+    ],
+    "auth_chain": [
+        {"event_id":"$leave","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.member","state_key":"@alice:test",
+         "content":{"membership":"leave"},
+         "prev_events":["$join"],"auth_events":["$create","$join"]}
+    ]
+}"#;
+
+#[test]
+fn raw_import_derives_missing_parents_for_federation_documents() {
+    let dir = unique_temp_dir().join("raw_federation_dependencies");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let mut established = HashSet::new();
+
+    let first = dir.join("first.json");
+    std::fs::write(&first, FEDERATION_FIRST_DOC).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &first,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+
+    let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into(),
+        "federation PDUs must leave their missing parent derivable from the CSR"
+    );
+
+    let second = dir.join("second.json");
+    std::fs::write(&second, FEDERATION_SECOND_DOC).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &second,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        missing_parents(&db, &template, "!room3").is_empty(),
+        "an auth-chain parent in a federation document must not be missing"
+    );
+}
+
+#[test]
+fn raw_import_keeps_pre_v11_power_level_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_v10_invite");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room5");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let [create, join_alice, power_levels, join_rules, join_bob, invite] = raw_v10_invite_fixture();
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[
+        create,
+        join_alice,
+        power_levels,
+        join_rules,
+        join_bob,
+        invite,
+    ]);
+
+    let flags = RoomFlagIndex::new(b"!room5");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(flags.count(&db, &rejected).unwrap(), 1);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room5",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join_bob"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.count(&db, &rejected).unwrap(),
+        1,
+        "a later file must not clear the pre-v11 invite rejection"
+    );
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()],
+        "the rejected invite must still be selectable"
+    );
+}
+
+#[test]
+fn raw_import_does_not_project_hash_failing_content() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_forged_projection");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room_forged");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let room = "!room_forged";
+
+    let create = raw_event(
+        room,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"10"}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        room,
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let power_levels = forged_power_levels_with_stale_hash(room);
+    let rules = raw_event(
+        room,
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$pl"]"#,
+        r#"["$create","$join_alice","$pl"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room_forged","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, power_levels.clone(), rules, join_bob]);
+
+    let node = template_node_id(&template, &power_levels).unwrap().unwrap();
+    assert!(
+        store
+            .get(&raw_auth_projection_collection_id(room), &node)
+            .unwrap()
+            .is_none(),
+        "a hash-failing event must not write an auth projection"
+    );
+    let loaded = load_collection_events(store, &collection_id, room).unwrap();
+    let stored_pl = loaded
+        .iter()
+        .find(|event| event_id(event) == Some("$pl"))
+        .expect("the power levels event is stored");
+    assert!(
+        stored_pl
+            .get("content")
+            .and_then(|content| content.get("invite"))
+            .is_none(),
+        "the forged invite field must not be overlaid from a projection"
+    );
+
+    let invite = owned_value(
+        r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room_forged","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+    );
+    import(&[invite]);
+
+    let flags = RoomFlagIndex::new(room.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0,
+        "the redacted power levels invite level is 0, so Bob's invite must not be rejected"
+    );
+}
+
+#[test]
+fn raw_import_keeps_msc3389_power_level_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_msc3389_invite");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room8");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room8",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"org.matrix.msc3389.10"}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        "!room8",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let power_levels = with_content_hash(
+        raw_event(
+            "!room8",
+            "$pl",
+            "m.room.power_levels",
+            "",
+            r#"{"users":{"@alice:test":100},"invite":50}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "org.matrix.msc3389.10",
+    );
+    let join_rules = raw_event(
+        "!room8",
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$pl"]"#,
+        r#"["$create","$join_alice","$pl"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room8","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+    );
+    let invite = owned_value(
+        r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room8","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[
+        create,
+        join_alice,
+        power_levels,
+        join_rules,
+        join_bob,
+        invite,
+    ]);
+
+    let flags = RoomFlagIndex::new(b"!room8");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room8",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join_bob"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()],
+        "MSC3389 uses v10 redaction and must keep the invite rejection"
+    );
+}
+
+#[test]
+fn raw_import_keeps_pre_v11_m_federate_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_v10_federate");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room6");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = with_content_hash(
+        raw_event(
+            "!room6",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"10","m.federate":false}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
+    );
+    let join_alice = raw_event(
+        "!room6",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let rules = raw_event(
+        "!room6",
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:other","room_id":"!room6","type":"m.room.member","state_key":"@bob:other","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$rules"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, rules]);
+    import(&[join_bob]);
+
+    let flags = RoomFlagIndex::new(b"!room6");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$join_bob".to_vec()],
+        "the redacted create event must keep m.federate=false for later files"
+    );
+}
+
+#[test]
+fn raw_auth_projection_keeps_v8_restricted_join_fields() {
+    let member = owned_value(
+        r#"{"event_id":"$join","sender":"@bob:test","room_id":"!room","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join","join_authorised_via_users_server":"@alice:test"},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&member, "8")
+            .unwrap()
+            .get("join_authorised_via_users_server")
+            .and_then(OwnedValue::as_str),
+        Some("@alice:test")
+    );
+    assert!(raw_auth_projection(&member, "10")
+        .and_then(|projection| projection.get("join_authorised_via_users_server").cloned())
+        .is_none());
+
+    let rules = owned_value(
+        r#"{"event_id":"$rules","sender":"@alice:test","room_id":"!room","type":"m.room.join_rules","state_key":"","content":{"join_rule":"restricted","allow":[{"type":"m.room.member","room_id":"!other","state_key":"@alice:test"}]},"prev_events":[],"auth_events":[]}"#,
+    );
+    // `allow` is not read by the auth rules; the v8 redaction bug belongs
+    // in rezzy, not in this projection.
+    assert!(raw_auth_projection(&rules, "8").is_none());
+    assert!(raw_auth_projection(&rules, "9").is_none());
+    assert!(raw_auth_projection(&member, "11").is_none());
+
+    // v11 redaction still strips all of m.room.third_party_invite.
+    let third_party = owned_value(
+        r#"{"event_id":"$tpi","sender":"@alice:test","room_id":"!room","type":"m.room.third_party_invite","state_key":"token","content":{"public_key":"key","public_keys":[{"public_key":"key"}]},"prev_events":[],"auth_events":[]}"#,
+    );
+    let projection = raw_auth_projection(&third_party, "11").unwrap();
+    assert_eq!(
+        projection.get("public_key").and_then(OwnedValue::as_str),
+        Some("key")
+    );
+    assert!(projection.get("public_keys").is_some());
+
+    let third_party_member = owned_value(
+        r#"{"event_id":"$member","sender":"@bob:test","room_id":"!room","type":"m.room.member","state_key":"@bob:test","content":{"membership":"invite","third_party_invite":{"display_name":"Bob","signed":{"mxid":"@bob:test","token":"token"}}},"prev_events":[],"auth_events":[]}"#,
+    );
+    let projection = raw_auth_projection(&third_party_member, "10").unwrap();
+    let token = projection.get("third_party_invite").unwrap();
+    assert!(token.get("signed").is_some());
+    assert!(token.get("display_name").is_none());
+
+    let create = owned_value(
+        r#"{"event_id":"$create","sender":"@alice:test","room_id":"!room","type":"m.room.create","state_key":"","content":{"room_version":"10","m.federate":false},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&create, "10")
+            .unwrap()
+            .get("m.federate")
+            .and_then(OwnedValue::as_bool),
+        Some(false)
+    );
+
+    // Version classification must come from rezzy's redaction rules, not a
+    // numeric parse here. MSC3389 uses v10 redaction; MSC4242 and NutraCdo
+    // use v11 redaction.
+    let levels = owned_value(
+        r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room","type":"m.room.power_levels","state_key":"","content":{"invite":50},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&levels, "org.matrix.msc3389.10")
+            .unwrap()
+            .get("invite")
+            .and_then(OwnedValue::as_i64),
+        Some(50)
+    );
+    assert_eq!(
+        raw_auth_projection(&create, "org.matrix.msc3389.10")
+            .unwrap()
+            .get("m.federate")
+            .and_then(OwnedValue::as_bool),
+        Some(false)
+    );
+    assert!(raw_auth_projection(&create, "org.matrix.msc4242.12").is_none());
+    assert!(raw_auth_projection(&create, "tk.nutra.cdo.12").is_none());
+
+    // v11 redaction strips m.room.third_party_invite entirely; the projection
+    // is what restores its public keys when a stored event is loaded back.
+    let redacted = redacted_event_bytes(&third_party, "11").unwrap();
+    let mut redacted = OwnedValue::parse_bytes(&redacted).unwrap();
+    assert!(
+        redacted
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .is_none(),
+        "v11 redaction must strip the public key"
+    );
+    let projection = raw_auth_projection(&third_party, "11").unwrap();
+    overlay_auth_projection(&mut redacted, projection);
+    assert_eq!(
+        redacted
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .and_then(OwnedValue::as_str),
+        Some("key")
+    );
+}
+
+#[test]
+fn raw_auth_projection_rejects_conflicting_exports() {
+    let dir = unique_temp_dir().join("projection_collision");
+    let db = Database::open(dir).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let room = "!projection_collision";
+    let first = with_content_hash(
+        raw_event(
+            room,
+            "$same",
+            "m.room.power_levels",
+            "",
+            r#"{"invite":50}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
+    );
+    let second = with_content_hash(
+        raw_event(
+            room,
+            "$same",
+            "m.room.power_levels",
+            "",
+            r#"{"invite":0}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
+    );
+    write_raw_auth_projections(
+        store,
+        room,
+        &template,
+        "10",
+        std::slice::from_ref(&first),
+        &[],
+    )
+    .unwrap();
+    let error =
+        write_raw_auth_projections(store, room, &template, "10", &[second], &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("$same")
+            && error
+                .to_string()
+                .contains("conflicts with the stored projection"),
+        "a verified projection conflict is corrupted data: {error}"
+    );
+
+    let node = template_node_id(&template, &first).unwrap().unwrap();
+    let collection = raw_auth_projection_collection_id(room);
+    let record = store.get(&collection, &node).unwrap().unwrap();
+    let projection = OwnedValue::parse_bytes(&record.bytes).unwrap();
+    assert_eq!(
+        projection.get("invite").and_then(OwnedValue::as_i64),
+        Some(50),
+        "the first verified projection must survive a rejected conflict"
+    );
+}
+
+#[test]
+fn raw_import_keeps_v11_third_party_invite_public_keys_across_files() {
+    let dir = unique_temp_dir().join("raw_v11_third_party_invite");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room7");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room7",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        "!room7",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let third_party = with_content_hash(
+        raw_event(
+            "!room7",
+            "$tpi",
+            "m.room.third_party_invite",
+            "token",
+            r#"{"public_key":"key","public_keys":[{"public_key":"key"}]}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "11",
+    );
+    let message = raw_event(
+        "!room7",
+        "$message",
+        "m.room.message",
+        "",
+        r#"{"body":"after"}"#,
+        r#"["$tpi"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, third_party.clone()]);
+    import(&[message]);
+
+    let node = template_node_id(&template, &third_party).unwrap().unwrap();
+    let stored = store.get(&collection_id, &node).unwrap().unwrap();
+    let stored = OwnedValue::parse_bytes(&stored.bytes).unwrap();
+    assert!(
+        stored
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .is_none(),
+        "v11 redaction still strips m.room.third_party_invite content"
+    );
+
+    let loaded = load_collection_events(store, &collection_id, "!room7").unwrap();
+    let loaded_third_party = loaded
+        .iter()
+        .find(|event| event_id(event) == Some("$tpi"))
+        .unwrap();
+    assert_eq!(
+        loaded_third_party
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .and_then(OwnedValue::as_str),
+        Some("key"),
+        "a later file must load the v11 third-party invite public key"
+    );
+    assert!(loaded_third_party
+        .get("content")
+        .and_then(|content| content.get("public_keys"))
+        .is_some());
+}
+
+#[test]
+fn raw_auth_projection_rejects_unknown_room_versions() {
+    let dir = unique_temp_dir().join("projection_unknown_version");
+    let db = Database::open(dir).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let room = "!projection_unknown_version";
+    let event = raw_event(
+        room,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"not-a-version","m.federate":false}"#,
+        "[]",
+        "[]",
+    );
+
+    let error = write_raw_auth_projections(store, room, &template, "not-a-version", &[event], &[])
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not supported for auth projection"),
+        "an unknown room version must be an error, got: {error}"
+    );
+}
+
+#[test]
+fn raw_import_rejects_unknown_room_version() {
+    let dir = unique_temp_dir().join("raw_unknown_version");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room9");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let create = raw_event(
+        "!room9",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"not-a-version"}"#,
+        "[]",
+        "[]",
+    );
+    let mut established = HashSet::new();
+
+    let error = import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[create],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("requires v4") || text.contains("not supported"),
+        "an unknown room version must fail the import: {text}"
+    );
+    assert!(
+        !established.contains(&collection_id),
+        "a rejected room version must not establish the collection"
+    );
+}
+
+#[test]
+fn raw_import_keeps_soft_failed_flag_from_earlier_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_soft_fail");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room4");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room4",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = raw_event(
+        "!room4",
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let mut soft = raw_event(
+        "!room4",
+        "$soft",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    if let OwnedValue::Object(fields) = &mut soft {
+        fields.insert("soft_failed".to_owned(), OwnedValue::Bool(true));
+    }
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join, soft]);
+
+    let flags = RoomFlagIndex::new(b"!room4");
+    let soft_query = FlagQuery::has(Flag::SoftFailed);
+    assert_eq!(flags.count(&db, &soft_query).unwrap(), 1);
+    assert_eq!(
+        flags.select(&db, &soft_query).unwrap(),
+        vec![b"$soft".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room4",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$soft"]"#,
+        r#"["$create","$join"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.count(&db, &soft_query).unwrap(),
+        1,
+        "a later file must not clear an earlier file's soft-fail flag"
+    );
+    assert_eq!(
+        flags.select(&db, &soft_query).unwrap(),
+        vec![b"$soft".to_vec()],
+        "the soft-failed event must still be selectable"
+    );
+}
+
+#[test]
+fn raw_import_ignores_incoming_rejected_flags_on_valid_events() {
+    let dir = unique_temp_dir().join("raw_unflagged");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room2");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        owned_value(&format!(
+            r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"!room2","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+        ))
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = event(
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    // Valid join_rules event sent while Alice is joined, but carrying a false
+    // incoming "rejected": true flag from an untrusted source.
+    let mut valid_rules = event(
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    if let OwnedValue::Object(fields) = &mut valid_rules {
+        fields.insert("rejected".to_owned(), OwnedValue::Bool(true));
+        fields.insert("__rejected".to_owned(), OwnedValue::Bool(true));
+    }
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[create, join, valid_rules],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    let loaded = load_state_groups(&aux, &["$join".to_owned(), "$rules".to_owned()]).unwrap();
+    let StateGroupLoad::Complete(groups) = loaded else {
+        panic!("state groups should be cached");
+    };
+    assert_ne!(
+        groups["$rules"], groups["$join"],
+        "valid event must not be excluded from state just because incoming JSON claimed rejected"
+    );
+
+    let flags = mtxdb::room_flag::RoomFlagIndex::new(b"!room2");
+    assert_eq!(
+        flags
+            .count(
+                &db,
+                &mtxdb::room_flag::FlagQuery::has(mtxdb::room_flag::Flag::Rejected)
+            )
+            .unwrap(),
+        0,
+        "valid event must not be marked rejected"
+    );
+}
+
 /// Open every pack in a pool and total the records it physically holds.
 fn count_pack_records(pool_dir: &Path) -> u64 {
     let mut total = 0;
@@ -1961,18 +3782,48 @@ fn auth_chain_reimport_writes_nothing_new() {
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
-    let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+    let auth_dir = pool_dir.parent().unwrap().join("mtpl-state");
     let first_import_records = count_pack_records(&auth_dir);
+    let first_event_records = count_pack_records(&pool_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
 
     assert_eq!(
         count_pack_records(&auth_dir),
         first_import_records,
         "reimport must not append duplicate edge or auth-chain records"
     );
-    let auth_store = db.edges().as_ref();
+    assert_eq!(
+        count_pack_records(&pool_dir),
+        first_event_records,
+        "reimport must not append duplicate verdicts or flag chunks"
+    );
+    let auth_store = db.state().as_ref();
     let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
     let meta = auth_store
         .get_collection_metadata(&auth_col)
@@ -2010,7 +3861,19 @@ fn import_establishment_persists_the_matrix_extension() {
     .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
 
     let collection_id = template_collection_id(&template, "!room");
     let metadata = store
@@ -2376,6 +4239,9 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        false,
+        None,
+        true,
     )
     .unwrap();
 
@@ -2410,6 +4276,9 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        false,
+        None,
+        true,
     )
     .unwrap();
 
@@ -2446,6 +4315,9 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         None,
         &template,
         &mut established,
+        false,
+        None,
+        true,
     )
     .unwrap();
 
@@ -3007,18 +4879,18 @@ fn adjacency_db(name: &str) -> (Database, PathBuf) {
     (Database::open(root.clone()).unwrap(), root)
 }
 
-fn room_adjacency(room: &str) -> mtxdb::matrix_adjacency::MatrixAdjacency {
-    mtxdb::matrix_adjacency::MatrixAdjacency::new(ShardType::Edges, room)
+fn room_adjacency(room: &str) -> mtxdb::csr_adjacency::CsrAdjacency {
+    mtxdb::csr_adjacency::CsrAdjacency::new(room)
 }
 
 #[test]
-fn matrix_adjacency_records_prev_auth_and_relation() {
+fn csr_adjacency_records_prev_auth_and_relation() {
     let (db, root) = adjacency_db("adjacency_basic");
     let template = default_matrix_import_template();
     let event = owned_value(
         r#"{"event_id":"$source","room_id":"!r:x","type":"m.room.message","prev_events":["$prev1",["$prev2",{}]],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$related"}}}"#,
     );
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
 
     let adjacency = room_adjacency("!r:x");
     assert_eq!(
@@ -3031,7 +4903,7 @@ fn matrix_adjacency_records_prev_auth_and_relation() {
         Some(vec!["$auth".to_owned()])
     );
     let relation = adjacency
-        .relation_of(&db, "$source", &mtxdb::matrix_adjacency::AlwaysVisible)
+        .relation_of(&db, "$source", &mtxdb::csr_adjacency::AlwaysVisible)
         .unwrap()
         .expect("the relation is recorded");
     assert_eq!(
@@ -3040,14 +4912,14 @@ fn matrix_adjacency_records_prev_auth_and_relation() {
     );
 
     // Recording again is a no-op.
-    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    record_csr_adjacency(&db, &template, &[event]).unwrap();
     assert!(adjacency.verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
+fn csr_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
     let (db, root) = adjacency_db("adjacency_leaf");
     let template = default_matrix_import_template();
     let leaf = owned_value(
@@ -3056,7 +4928,7 @@ fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
     let child = owned_value(
         r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$ghost"],"auth_events":["$leaf"]}"#,
     );
-    record_matrix_adjacency(&db, &template, &[leaf, child]).unwrap();
+    record_csr_adjacency(&db, &template, &[leaf, child]).unwrap();
 
     let adjacency = room_adjacency("!r:x");
     assert_eq!(adjacency.auth_of(&db, "$leaf").unwrap(), Some(Vec::new()));
@@ -3071,14 +4943,14 @@ fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
 }
 
 #[test]
-fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
+fn csr_adjacency_groups_duplicates_and_separates_rooms() {
     let (db, root) = adjacency_db("adjacency_rooms");
     let template = default_matrix_import_template();
     let event_a = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_a_duplicate =
         owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_b = owned_value(r#"{"event_id":"$same","room_id":"!b:x","prev_events":["$q"]}"#);
-    record_matrix_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
+    record_csr_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
 
     assert_eq!(
         room_adjacency("!a:x").prev_of(&db, "$same").unwrap(),
@@ -3093,14 +4965,14 @@ fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
 }
 
 #[test]
-fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
+fn csr_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     let (db, root) = adjacency_db("adjacency_conflict");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
     let original = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"]}"#,
     );
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
 
     // A later import whose event differs from the recorded one fails as a unit:
     // the good event before it is not recorded either.
@@ -3108,7 +4980,7 @@ fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     let conflicting = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"]}"#,
     );
-    let error = record_matrix_adjacency(&db, &template, &[fine, conflicting])
+    let error = record_csr_adjacency(&db, &template, &[fine, conflicting])
         .expect_err("a differing prev edge must be rejected");
     assert!(
         format!("{error:#}").contains("recording auth adjacency for room !a:x"),
@@ -3124,18 +4996,18 @@ fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     // Two conflicting copies inside one batch fail the same way.
     let first = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$p"]}"#);
     let second = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$q"]}"#);
-    assert!(record_matrix_adjacency(&db, &template, &[first, second]).is_err());
+    assert!(record_csr_adjacency(&db, &template, &[first, second]).is_err());
     assert_eq!(adjacency.short_id(&db, "$dup").unwrap(), None);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
+fn csr_adjacency_keeps_a_relation_across_redacted_copies() {
     let (db, root) = adjacency_db("adjacency_redaction");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
-    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    let visible = mtxdb::csr_adjacency::AlwaysVisible;
     // Redaction keeps event_id, prev_events and auth_events but empties content.
     let unredacted = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
@@ -3150,8 +5022,8 @@ fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
             .map(|relation| relation.target)
     };
 
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&redacted))
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&redacted))
         .expect("a redacted re-import must not be rejected");
     assert_eq!(
         target(&db).as_deref(),
@@ -3163,18 +5035,18 @@ fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
 
     // Seen redacted first, then unredacted in the same input: the relation is added.
     let (db, root) = adjacency_db("adjacency_redaction_order");
-    record_matrix_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
+    record_csr_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
     assert_eq!(target(&db).as_deref(), Some("$target"));
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
+fn csr_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
     let (db, root) = adjacency_db("adjacency_relation_edges");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
-    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    let visible = mtxdb::csr_adjacency::AlwaysVisible;
     // A rich-reply fallback has no `rel_type`, so it is not a relation.
     let reply = owned_value(
         r#"{"event_id":"$reply","room_id":"!a:x","prev_events":["$p"],"content":{"m.relates_to":{"m.in_reply_to":{"event_id":"$target"}}}}"#,
@@ -3184,7 +5056,7 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
     let long = owned_value(&format!(
         r#"{{"event_id":"$long","room_id":"!a:x","prev_events":["$p"],"content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
     ));
-    record_matrix_adjacency(&db, &template, &[reply, long])
+    record_csr_adjacency(&db, &template, &[reply, long])
         .expect("an unrepresentable relation must not fail the import");
 
     for event in ["$reply", "$long"] {
@@ -3203,26 +5075,26 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
 }
 
 #[test]
-fn matrix_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
+fn csr_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
     let (db, root) = adjacency_db("adjacency_other_identity");
     // A record identity other than /event_id cannot name a referenced event.
     let template = sender_identity_template();
     let event =
         owned_value(r#"{"event_id":"$e","room_id":"!r:x","sender":"@alice","prev_events":["$p"]}"#);
-    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    record_csr_adjacency(&db, &template, &[event]).unwrap();
     assert_eq!(room_adjacency("!r:x").short_id(&db, "$e").unwrap(), None);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
+fn csr_adjacency_skips_events_without_a_room_or_event_id() {
     let (db, root) = adjacency_db("adjacency_skips");
     let template = default_matrix_import_template();
     let no_room = owned_value(r#"{"event_id":"$orphan","prev_events":["$p"]}"#);
     let no_id = owned_value(r#"{"room_id":"!r:x","prev_events":["$p"]}"#);
     let fine = owned_value(r#"{"event_id":"$fine","room_id":"!r:x"}"#);
-    record_matrix_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
+    record_csr_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
     let adjacency = room_adjacency("!r:x");
     assert!(adjacency.short_id(&db, "$fine").unwrap().is_some());
     assert_eq!(adjacency.short_id(&db, "$orphan").unwrap(), None);
@@ -3231,7 +5103,7 @@ fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
 }
 
 #[test]
-fn matrix_adjacency_splits_a_large_room_into_batches() {
+fn csr_adjacency_splits_a_large_room_into_batches() {
     let (db, root) = adjacency_db("adjacency_large");
     let template = default_matrix_import_template();
     // One more than a batch holds, so the room is recorded in two transactions.
@@ -3248,9 +5120,9 @@ fn matrix_adjacency_splits_a_large_room_into_batches() {
             ))
         })
         .collect();
-    record_matrix_adjacency(&db, &template, &events).unwrap();
+    record_csr_adjacency(&db, &template, &events).unwrap();
 
-    let auth = RoomAuth::new(ShardType::Edges, "!big:x");
+    let auth = RoomAuth::new("!big:x");
     let last = format!("$e{}", count - 1);
     assert_eq!(
         auth.auth_chain(&db, &last).unwrap().len(),
@@ -3299,13 +5171,16 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         None,
         &template,
         &mut established,
+        false,
+        None,
+        true,
     )
     .unwrap();
-    db.edges().sync_all().unwrap();
+    db.state().sync_all().unwrap();
     drop(db);
 
     let db = Database::open(root.clone()).unwrap();
-    let auth = RoomAuth::new(ShardType::Edges, "!room");
+    let auth = RoomAuth::new("!room");
     let mut edges = auth.auth_edges(&db, "$x").unwrap();
     edges.sort();
     assert_eq!(
@@ -3318,7 +5193,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
     assert_eq!(chain, vec!["$c", "$m", "$member"]);
     // The auth-chain event was recorded through the same path as the PDUs.
     assert_eq!(auth.auth_edges(&db, "$member").unwrap(), vec!["$c"]);
-    assert!(auth.auth_edges(&db, "$c").unwrap().is_empty());
+    assert_eq!(auth.auth_edges(&db, "$c").unwrap(), Vec::<String>::new());
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -3534,7 +5409,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
-    assert!(!first.unresolved.is_empty());
+    assert_ne!(first.unresolved, Vec::<String>::new());
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
     let parent = owned_value(
@@ -3542,7 +5417,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let repaired = compute_state_groups_partial(&[parent, incomplete], &[], "!r:x");
     assert!(repaired.groups.contains_key("$child"));
-    assert!(repaired.unresolved.is_empty());
+    assert_eq!(repaired.unresolved, Vec::<String>::new());
     let entries: Vec<(&[u8], &[u8])> = repaired
         .groups
         .iter()
@@ -4146,6 +6021,7 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             paths: vec![],
             collection: None,
             template: None,
+            no_state_hamts: false,
         },
         Commands::Export {
             collection: "0x00000000000000000000000000000000".to_owned(),
@@ -4361,6 +6237,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
             raw: false,
             sort: None,
             reverse: false,
+            live: false,
         },
     };
     cmd_scan(
@@ -4375,14 +6252,15 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         false,
         None,
         false,
+        false,
     )
     .unwrap();
 
     let missing = format_id(&[0x99; 16]);
-    assert!(
-        cmd_scan(&cli_scan, &missing, false, false, None, 10, None, None, false, None, false)
-            .is_err()
-    );
+    assert!(cmd_scan(
+        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
+    )
+    .is_err());
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
@@ -4425,10 +6303,11 @@ fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
             paths: vec![input.clone()],
             collection: None,
             template: None,
+            no_state_hamts: false,
         },
     };
 
-    cmd_import(&cli, &[input], None, None).expect("import into a fresh root");
+    cmd_import(&cli, &[input], None, None, false).expect("import into a fresh root");
 
     assert!(
         layout.pool_path(ShardType::EventDag).is_dir(),
@@ -4517,23 +6396,27 @@ fn real_resolution_decides_a_fork_by_power_level_not_prev_order() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10","creator":"@admin:x"}}"#,
     );
+    let member = owned_value(
+        r#"{"event_id":"$admin-member","room_id":"!r:x","type":"m.room.member","state_key":"@admin:x","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"membership":"join"}}"#,
+    );
     let power_levels = owned_value(
-        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$admin-member"],"auth_events":["$create","$admin-member"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
     );
     let admin_topic = owned_value(
-        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"kept"}}"#,
+        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$admin-member","$pl"],"content":{"topic":"kept"}}"#,
     );
     let nobody_topic = owned_value(
-        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
+        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
     );
     let merge = |first: &str, second: &str, id: &str| {
         owned_value(&format!(
-            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["{first}","{second}"],"auth_events":["$create","$pl"],"content":{{}}}}"#
+            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":5,"prev_events":["{first}","{second}"],"auth_events":["$create","$admin-member","$pl"],"content":{{}}}}"#
         ))
     };
     let batch = |first: &str, second: &str, id: &str| {
         vec![
             create.clone(),
+            member.clone(),
             power_levels.clone(),
             admin_topic.clone(),
             nobody_topic.clone(),
@@ -4758,6 +6641,81 @@ const KEYS_EXPORT_FIXTURE: &str =
 
 const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 
+/// Replace the fixture's placeholder content hashes with the hashes its PDUs
+/// actually have. The exporter fixture uses `"sha256":"dummy"` because its
+/// byte-for-byte test does not run the hash check; the importer does, and a
+/// mismatch now stores the redacted form. The layout test wants the unchanged
+/// body, so make the hashes valid. The mismatch path has its own test.
+fn with_valid_content_hashes(content: &str) -> String {
+    let room_version = content
+        .lines()
+        .filter_map(|line| OwnedValue::parse_bytes(line.as_bytes()).ok())
+        .find_map(|value| {
+            let pdu = value.get("pdu")?;
+            (pdu.get("type")?.as_str()? == "m.room.create")
+                .then(|| {
+                    pdu.get("content")?
+                        .get("room_version")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .expect("layout fixture create event has a room version");
+
+    content
+        .lines()
+        .map(|line| {
+            if !line.contains("\"t\":\"event\"") {
+                return line.to_owned();
+            }
+            let value = OwnedValue::parse_bytes(line.as_bytes()).expect("valid fixture line");
+            let pdu = value.get("pdu").expect("fixture event has a pdu");
+            let hash = rezzy::compute_content_hash(pdu, &room_version)
+                .expect("fixture content hash is computable");
+            line.replacen("\"sha256\":\"dummy\"", &format!("\"sha256\":\"{hash}\""), 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The exporter fixture with the auth chain a real export carries: a member
+/// event for the creator, cited alongside the create event by every other
+/// event. The exporter's own fixture has empty auth lists, which is right for
+/// its byte-for-byte test but describes a room the auth rules refuse.
+///
+/// Every event passes the first auth check, so `$rejected` is a deliberate
+/// disagreement: the exporter rejected it, but the first check does not.
+fn room_export_with_auth() -> String {
+    const CREATE: &str = "$create:test.conduwuit.local";
+    const JOIN: &str = "$join:test.conduwuit.local";
+
+    let join = format!(
+        r#"{{"auth_events":["{CREATE}"],"event_id":"{JOIN}","outlier":false,"prev_events":["{CREATE}"],"pdu":{{"auth_events":["{CREATE}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{JOIN}","origin_server_ts":123456789,"prev_events":["{CREATE}"],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"#,
+    );
+
+    let mut lines = Vec::new();
+    for line in ROOM_EXPORT_FIXTURE.lines() {
+        if line.starts_with("{\"events\":") {
+            lines.push(join.clone());
+            lines.push(line.replace("\"events\":5", "\"events\":6"));
+            continue;
+        }
+        if !line.contains("\"t\":\"event\"") || line.contains(CREATE) {
+            lines.push(line.to_owned());
+            continue;
+        }
+        let auth = format!("[\"{JOIN}\",\"{CREATE}\"]");
+        let line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
+        let line = line.replace(
+            "\"prev_events\":[]",
+            &format!("\"prev_events\":[\"{JOIN}\"]"),
+        );
+        lines.push(line);
+    }
+    with_valid_content_hashes(&lines.join("\n"))
+}
+
 /// Import `inputs` the way `mtxdb import` does, minus the final phase.
 fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)]) -> ImportRun {
     let paths: Vec<PathBuf> = inputs
@@ -4778,6 +6736,7 @@ fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)])
         None,
         &template,
         &mut HashSet::new(),
+        true,
     )
 }
 
@@ -4801,25 +6760,29 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    let content = room_export_with_auth();
+    let run = import_inputs(&db, &root, &[("room.jsonl", &content)]);
     assert_eq!(
         (run.failures, run.all_exports, run.exported_events),
-        (0, true, 5)
+        (0, true, 6)
     );
     finish_import(&db, &run).unwrap();
 
-    // The exporter's fixture: `$soft` is soft-failed with code 2 (Manual),
-    // `$rejected` is rejected with code 7 (AuthCheckFailed), `$redacted` was
-    // redacted by `$redaction`, and `$ok` carries no verdict.
-    let parsed = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    // The fixture with a creator membership: the export marks `$soft`
+    // soft-failed and `$rejected` rejected. Rejection is derived and not
+    // migrated, but the soft-fail is kept as a source fact. `$redacted` was
+    // redacted by `$redaction`, which is a fact about the stored event, and
+    // `$ok` carries no verdict.
+    let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
-    assert_eq!(parsed.events.len(), 5);
+    assert_eq!(parsed.events.len(), 6);
     let room_bytes = FIXTURE_ROOM.as_bytes();
     for event in &parsed.events {
         let id = event.event_id.as_bytes();
         let record = event_record_id(id);
 
-        // The body is the export's PDU, byte for byte.
+        // The body is the export's PDU, byte for byte. The fixture's hashes are
+        // valid (or absent), so no event here takes the redaction path.
         let body = stored(
             &db,
             EVENT_POOL,
@@ -4843,27 +6806,6 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         )
         .expect("locator");
         assert_eq!(decode_event_locator(&locator).unwrap(), (id, room_bytes));
-
-        // Edges come from the record's own lists.
-        let edges = |collection| {
-            decode_edges(&stored(&db, EDGE_POOL, collection, record).expect("edge record")).unwrap()
-        };
-        let listed = |value: &OwnedValue| -> Vec<Vec<u8>> {
-            value
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|id| id.as_str().unwrap().as_bytes().to_vec())
-                .collect()
-        };
-        assert_eq!(
-            edges(room_prev_collection_id(room_bytes)),
-            listed(&event.prev_events)
-        );
-        assert_eq!(
-            edges(room_auth_collection_id(room_bytes)),
-            listed(&event.auth_events)
-        );
     }
 
     let verdict = |name: &str| {
@@ -4882,19 +6824,13 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         })
     };
     assert_eq!(
-        verdict("soft").unwrap(),
-        Verdict {
-            soft_fail: Some(2),
-            ..Verdict::default()
-        }
+        verdict("soft").unwrap().soft_fail,
+        Some(2),
+        "an exported soft-fail is kept with its reason"
     );
-    assert_eq!(
-        verdict("rejected").unwrap(),
-        Verdict {
-            rejection: Some(7),
-            outlier: true,
-            ..Verdict::default()
-        }
+    assert!(
+        verdict("rejected").is_none(),
+        "an exported rejection is not migrated; it passes the derived check"
     );
     assert_eq!(
         verdict("redacted").unwrap(),
@@ -4910,16 +6846,36 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
 }
 
 #[test]
-fn outlier_is_independent_of_soft_fail_and_redaction_status() {
+fn an_imported_soft_fail_sets_the_soft_failed_flag() {
+    use mtxdb::room_flag::*;
+
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    // The exporter marks `$ok` an outlier; `$redacted` stays on the timeline.
-    let content = ROOM_EXPORT_FIXTURE.replace(
+    let content = room_export_with_auth();
+    let run = import_inputs(&db, &root, &[("room.jsonl", &content)]);
+    assert_eq!((run.failures, run.all_exports), (0, true));
+
+    let flags = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        1,
+        "a kept soft-fail is indexed as soft-failed"
+    );
+}
+
+#[test]
+fn an_exported_outlier_flag_is_not_migrated() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    // The exporter marks `$ok` an outlier; the stored verdict omits the
+    // annotation, while the rebuild must recover the derived flag from it.
+    let content = room_export_with_auth().replace(
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
     );
     assert_ne!(
-        content, ROOM_EXPORT_FIXTURE,
+        content,
+        room_export_with_auth(),
         "the fixture line this test edits moved"
     );
     import_inputs(&db, &root, &[("room.jsonl", &content)]);
@@ -4937,19 +6893,15 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
     };
     assert_eq!(
         outlier("ok"),
-        Some(true),
-        "an exported outlier stays visible"
+        Some(false),
+        "an exported outlier is not migrated"
     );
     assert_eq!(
         outlier("soft"),
         Some(false),
-        "soft-failed does not imply outlier"
+        "a soft-failed event has a verdict but is not a derived outlier"
     );
-    assert_eq!(
-        outlier("rejected"),
-        Some(true),
-        "a rejected event is not on the timeline"
-    );
+    assert_eq!(outlier("rejected"), None);
     assert_eq!(
         outlier("redacted"),
         Some(false),
@@ -4959,8 +6911,7 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
 
 #[test]
 fn imported_keys_export_is_readable_in_the_servers_layout() {
-    use crate::interchange::KeyKind;
-    use mtxdb::interop::*;
+    use mtxdb::server_keys::{read_notary_payload, read_server_keys, KeyTier};
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
@@ -4970,39 +6921,78 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
         (0, true, 0)
     );
 
-    let mut seen = Vec::new();
+    let mut expected_keys = Vec::new();
+    let mut expected_notary = None;
     for line in KEYS_EXPORT_FIXTURE.lines() {
         let record = owned_value(line);
-        let kind = KeyKind::parse(&json_str(&record, "kind").unwrap())
-            .expect("the exporter writes only kinds the importer knows");
-        let origin = json_str(&record, "origin").unwrap();
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(json_str(&record, "payload").unwrap())
-            .unwrap();
-        let bytes = stored(
-            &db,
-            SERVER_INFO_POOL,
-            server_keys_collection_id(),
-            server_key_record_id(kind, origin.as_bytes()),
-        )
-        .expect("key record");
-        assert_eq!(
-            decode_server_key(&bytes).unwrap(),
-            (origin.as_bytes(), payload.as_slice()),
-            "{} payload must come back byte for byte",
-            kind.as_str()
-        );
-        seen.push(kind);
+        let decode = |field: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(json_str(&record, field).unwrap())
+                .unwrap()
+        };
+        match json_str(&record, "kind").unwrap().as_str() {
+            "notary" => expected_notary = Some(decode("payload")),
+            kind => expected_keys.push((
+                json_str(&record, "key_id").unwrap().into_bytes(),
+                record.get("key").map_or_else(Vec::new, |_| decode("key")),
+                json_str(&record, "source").unwrap().into_bytes(),
+                kind == "permanent",
+                record.get("expired_ts").and_then(OwnedValue::as_u64),
+                record
+                    .get("promote_by_ms")
+                    .and_then(OwnedValue::as_u64)
+                    .unwrap_or(0),
+                record.get("digest").is_some(),
+                false,
+            )),
+        }
     }
+
+    let stored = read_server_keys(db.server_info(), b"keys.example.org").unwrap();
+    let actual: Vec<_> = stored
+        .iter()
+        .map(|key| {
+            (
+                key.key_id.clone(),
+                key.key.clone(),
+                key.source.clone(),
+                key.tier == KeyTier::Permanent,
+                key.expired_ts,
+                key.promote_by_ms,
+                key.is_evicted(),
+                key.corroborated,
+            )
+        })
+        .collect();
+    expected_keys.sort();
+    assert_eq!(actual, expected_keys, "each key comes back field for field");
     assert_eq!(
-        seen.len(),
-        KeyKind::ALL.len(),
-        "the fixture has one record of each kind"
+        read_notary_payload(db.server_info(), b"keys.example.org").unwrap(),
+        expected_notary,
+        "the notary payload must come back byte for byte"
+    );
+    assert_eq!(
+        read_server_keys(db.server_info(), b"other.example.org").unwrap(),
+        Vec::<mtxdb::server_keys::ServerKey>::new()
     );
 }
 
 fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {
     export_import::read_marker(db).unwrap()
+}
+
+#[test]
+fn a_keys_export_is_detected_after_leading_blank_lines() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let room_path = root.join("room.jsonl");
+    let keys_path = root.join("keys.jsonl");
+    std::fs::write(&room_path, ROOM_EXPORT_FIXTURE).unwrap();
+    std::fs::write(&keys_path, format!("\n\n{KEYS_EXPORT_FIXTURE}")).unwrap();
+
+    assert!(is_server_keys_export(&keys_path));
+    assert!(!is_server_keys_export(&room_path));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -5072,6 +7062,120 @@ fn a_failed_input_means_no_marker() {
 }
 
 #[test]
+fn server_keys_are_imported_before_rooms_whatever_the_argument_order() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let write = |name: &str, content: &str| {
+        let path = root.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let room_path = write("a-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let keys_path = write("z-keys.jsonl", KEYS_EXPORT_FIXTURE);
+    let other_room_path = write("b-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let inputs = [
+        room_path.clone(),
+        keys_path.clone(),
+        other_room_path.clone(),
+    ];
+    assert_eq!(
+        keys_first(&inputs),
+        [&keys_path, &room_path, &other_room_path]
+    );
+}
+
+#[test]
+fn a_malformed_keys_only_run_clears_an_earlier_runs_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let good = import_inputs(&db, &root, &[("room.jsonl", &room_export_with_auth())]);
+    finish_import(&db, &good).unwrap();
+    assert!(marker(&db).is_some(), "the first run is marked complete");
+
+    let bad = import_inputs(
+        &db,
+        &root,
+        &[(
+            "keys.jsonl",
+            "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+        )],
+    );
+    finish_import(&db, &bad).unwrap();
+    assert_eq!(
+        marker(&db),
+        None,
+        "a failed run must not leave an earlier run's marker in place"
+    );
+}
+
+#[test]
+fn a_failed_keys_import_is_flagged_and_leaves_no_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(
+        !run.signature_keys_available,
+        "a failed key import into an empty store leaves signature keys unavailable"
+    );
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None);
+}
+
+#[test]
+fn a_failed_key_import_keeps_previously_loaded_signing_keys_available() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let first = import_inputs(&db, &root, &[("keys.jsonl", KEYS_EXPORT_FIXTURE)]);
+    assert_eq!(first.failures, 0);
+
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(
+        run.signature_keys_available,
+        "a failed new key input must not hide usable keys already stored"
+    );
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None, "the failed input keeps the run unmarked");
+}
+
+#[test]
+fn a_malformed_room_import_is_flagged_and_leaves_no_signing_keys() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[(
+            "broken.jsonl",
+            "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\"",
+        )],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(!run.signature_keys_available);
+}
+
+#[test]
 fn a_room_import_in_capped_batches_writes_every_event() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
@@ -5124,4 +7228,1027 @@ fn a_room_export_without_a_create_event_is_refused() {
     let run = import_inputs(&db, &root, &[("room.jsonl", &without_create)]);
     assert_eq!(run.failures, 1, "{run:?}");
     assert_eq!(run.exported_events, 0);
+}
+
+#[test]
+fn a_room_import_populates_timeline_index() {
+    use crate::interchange::parse_room;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let content = room_export_with_auth();
+    let export = parse_room(content.as_bytes()).unwrap();
+
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 6);
+
+    let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
+    let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
+    assert_eq!(page.entries.len(), 6);
+
+    for pair in page.entries.windows(2) {
+        assert!(pair[0] < pair[1]);
+    }
+}
+
+#[test]
+fn a_room_import_populates_flag_index() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let content = room_export_with_auth();
+    let export = parse_room(content.as_bytes()).unwrap();
+
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 6);
+
+    let flag_index = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Present))
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Timeline))
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Outlier))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Rejected))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::SoftFailed))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Redacted))
+            .unwrap(),
+        1
+    );
+
+    let selected = flag_index
+        .select(&db, &FlagQuery::has(Flag::Present))
+        .unwrap();
+    assert_eq!(selected.len(), 6);
+}
+
+#[test]
+fn flags_cli_command_works() {
+    use crate::interchange::parse_room;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let _ = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    drop(db);
+
+    let cli = Cli {
+        dirs: vec![root.clone()],
+        shard_type: None,
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Flags {
+            room: FIXTURE_ROOM.to_owned(),
+            flag: Some("timeline".to_owned()),
+            not: false,
+            count: true,
+            limit: 10,
+            rebuild: false,
+        },
+    };
+
+    cmd_flags(&cli, FIXTURE_ROOM, Some("timeline"), false, true, 10, false).unwrap();
+    cmd_flags(
+        &cli,
+        FIXTURE_ROOM,
+        Some("timeline"),
+        false,
+        false,
+        10,
+        false,
+    )
+    .unwrap();
+    cmd_flags(&cli, FIXTURE_ROOM, None, false, false, 10, false).unwrap();
+    cmd_flags(&cli, FIXTURE_ROOM, None, false, false, 10, true).unwrap();
+}
+
+#[test]
+fn forced_rejection_import_sets_flags_and_not_excludes_it() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!rejection_test:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"10"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bad:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test","$missing:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test","$missing:test"],"content":{{}},"depth":3,"event_id":"$bad:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":3,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    let (written, findings) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 3);
+    assert_eq!(findings.rejection_counts.values().sum::<usize>(), 1);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::not(Flag::Rejected)).unwrap(),
+        2
+    );
+
+    let rejected_shorts = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Rejected))
+        .unwrap();
+    let non_rejected_shorts = flags
+        .select_shorts(&db, &FlagQuery::not(Flag::Rejected))
+        .unwrap();
+    assert_eq!(rejected_shorts.len(), 1);
+    assert_eq!(non_rejected_shorts.len(), 2);
+    assert!(!non_rejected_shorts.contains(&rejected_shorts[0]));
+}
+
+#[test]
+fn stale_auth_events_are_rejected_against_state_before() {
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!staleauth:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$stale:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$stale:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(run.rejection_counts.values().sum::<usize>(), 1);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1,
+        "the event is rejected against the state before it, not its cited auth events"
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(
+        streams,
+        vec![1, 2, 3],
+        "the rejected timeline event has no timeline slot"
+    );
+}
+
+#[test]
+fn rejected_state_event_does_not_change_later_state() {
+    use mtxdb::export_schema::RejectionCode;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!staterollback:test.conduwuit.local";
+    // $rules_ok makes the room public while Alice is joined. $rules_bad is
+    // the same value but cites the stale join after Alice left, so only
+    // check 5 rejects it. Bob's join passes checks 4 and 5 against the public
+    // state, but cites $rules_bad, so only the rejected-auth cascade rejects
+    // him.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$rules_ok:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":3,"event_id":"$rules_ok:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$rules_ok:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":4,"event_id":"$leave:test","origin_server_ts":4000,"prev_events":["$rules_ok:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$rules_bad:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":5,"event_id":"$rules_bad:test","origin_server_ts":5000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bob:test","depth":6,"stream_ordering":6,"auth_events":["$create:test","$rules_bad:test"],"prev_events":["$rules_bad:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules_bad:test"],"content":{{"membership":"join"}},"depth":6,"event_id":"$bob:test","origin_server_ts":6000,"prev_events":["$rules_bad:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":6,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 6)
+    );
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::AuthCheckFailed.to_u8())
+            .copied(),
+        Some(1),
+        "$rules_bad fails check 5"
+    );
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::DependsOnRejectedAuthEvent.to_u8())
+            .copied(),
+        Some(1),
+        "bob passes checks 4 and 5 but cites a rejected auth event"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 6);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        2
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn partial_base_state_is_left_unchecked() {
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!partialstate:test.conduwuit.local";
+    // $partial's second parent is missing, so its base state is only the
+    // leave. Checking against that partial state would reject Alice; with an
+    // incomplete base the event must stay unchecked instead.
+    // $child descends from $partial. Its own parents are all present, but
+    // because it inherits an incomplete base it must also stay unchecked.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$partial:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test","$missing:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$partial:test","origin_server_ts":4000,"prev_events":["$leave:test","$missing:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$child:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$join:test"],"prev_events":["$partial:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":5,"event_id":"$child:test","origin_server_ts":5000,"prev_events":["$partial:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 5)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "a missing parent and its descendants stay unchecked"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        5
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn base_is_incomplete_inherits_from_parents() {
+    let instance = [0_u8; STATE_GROUP_ID_LENGTH];
+    let complete = SharedState::new(StateSet::new(), instance, true);
+    let incomplete = SharedState::new(StateSet::new(), instance, false);
+
+    assert!(!base_is_incomplete(false, std::slice::from_ref(&complete)));
+    assert!(base_is_incomplete(true, std::slice::from_ref(&complete)));
+    assert!(base_is_incomplete(false, std::slice::from_ref(&incomplete)));
+}
+
+#[test]
+fn incomplete_base_is_inherited_by_descendants() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!inheritedgap:test.conduwuit.local";
+    // $orphan_leave has no prev_events, so its own base is incomplete even
+    // though it is walked. Its leave state is non-empty, so a child judged
+    // against it would reject Alice. The child inherits the gap instead.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$orphan_leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":[],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$orphan_leave:test","origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$child:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$orphan_leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$child:test","origin_server_ts":4000,"prev_events":["$orphan_leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "the child inherits $orphan_leave's incomplete base"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
+}
+
+#[test]
+fn duplicate_cited_auth_events_are_still_rejected() {
+    use mtxdb::export_schema::RejectionCode;
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!dupauth:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join2:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"join"}},"depth":3,"event_id":"$join2:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$dup:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test","$join2:test"],"prev_events":["$join2:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test","$join2:test"],"content":{{}},"depth":4,"event_id":"$dup:test","origin_server_ts":4000,"prev_events":["$join2:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::DuplicateAuthEventKey.to_u8())
+            .copied(),
+        Some(1),
+        "check 4 still rejects duplicate cited auth events"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn exported_rejected_flag_is_not_trusted_for_state() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!exporterflag:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$rules:test","depth":3,"stream_ordering":3,"rejected":true,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":3,"event_id":"$rules:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bob:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$rules:test"],"prev_events":["$rules:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules:test"],"content":{{"membership":"join"}},"depth":4,"event_id":"$bob:test","origin_server_ts":4000,"prev_events":["$rules:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "the export's rejected flag does not reject a valid event"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
+}
+
+#[test]
+fn flag_index_timeline_count_matches_timeline_index() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!timeline_match:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    let timeline_count = flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap();
+    assert_eq!(timeline_count, page.entries.len() as u64);
+    assert_eq!(timeline_count, 1);
+}
+
+#[test]
+fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!legacy:test.conduwuit.local";
+    // Exactly what the exporter wrote before stream orderings: no `timeline`
+    // header, no `stream_ordering` or `arrival_ordering`, and only the
+    // outlier/soft-failed flags. Timeline entries therefore come from the
+    // legacy origin_server_ts fallback.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","auth_events":[],"prev_events":[],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1500,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$live:test","auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":true,"soft_failed":true,"soft_fail_code":1,"rejected":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert!(
+        !export.timeline,
+        "legacy exports carry no timeline contract"
+    );
+    assert_eq!(export.events[3].stream_ordering, None);
+    assert_eq!(export.events[3].arrival_ordering, None);
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 4);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
+
+    // The two non-outliers make it in; the soft-failed outlier stays out even
+    // though its PDU carries a depth and timestamp.
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(streams, vec![1000, 1500, 2000]);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+    let non_timeline = flags
+        .select_shorts(
+            &db,
+            &FlagQuery::and([
+                FlagQuery::has(Flag::Present),
+                FlagQuery::not(Flag::Timeline),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        non_timeline.len(),
+        1,
+        "only the soft-failed event is hidden"
+    );
+}
+
+#[test]
+fn stream_and_arrival_order_survive_import() {
+    use crate::interchange::parse_room;
+    use mtxdb::interop::*;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!nostream:test.conduwuit.local";
+    // origin_server_ts values are deliberately unrelated to the orderings, so
+    // any fallback to them would be visible in the timeline.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":900000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":850000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$live:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":800000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$backfilled:test","depth":5,"stream_ordering":-5,"auth_events":["$create:test","$join:test"],"prev_events":["$live:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":5,"event_id":"$backfilled:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":700000,"prev_events":["$live:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","depth":9,"arrival_ordering":7,"auth_events":["$create:test","$join:test"],"prev_events":["$backfilled:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":9,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":600000,"prev_events":["$backfilled:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert_eq!(export.events[4].arrival_ordering, Some(7));
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
+
+    // Live and backfilled positions are preserved exactly; the soft-failed
+    // event has no timeline position and stays out.
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(streams, vec![1, 2, 3, -5]);
+    let depths: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|e| e.topological_ordering)
+        .collect();
+    assert_eq!(depths, vec![1, 2, 3, 5]);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
+
+    // Events with Present AND NOT Timeline (kept out of timeline)
+    let non_timeline_shorts = flags
+        .select_shorts(
+            &db,
+            &FlagQuery::and([
+                FlagQuery::has(Flag::Present),
+                FlagQuery::not(Flag::Timeline),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(non_timeline_shorts.len(), 1);
+
+    // The arrival ordering is a source-recorded fact and is kept in the
+    // verdict. This export does not mark the event soft-failed.
+    let record = event_record_id(b"$soft:test");
+    let bytes = stored(
+        &db,
+        EVENT_POOL,
+        event_verdict_collection_id(&record),
+        record,
+    )
+    .expect("soft-failed event has a verdict record");
+    let (_, verdict) = decode_verdict(&bytes).unwrap();
+    assert_eq!(verdict.arrival_ordering, Some(7));
+    assert_eq!(
+        verdict.soft_fail, None,
+        "this export does not mark it soft-failed"
+    );
+}
+
+#[test]
+fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
+    use crate::interchange::parse_room;
+    use mtxdb::interop::*;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!importedsoft:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$live:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","depth":4,"arrival_ordering":7,"soft_failed":true,"soft_fail_code":2,"auth_events":["$create:test","$join:test"],"prev_events":["$live:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":["$live:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    let (written, findings) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 4);
+    assert_eq!(findings.rejection_counts.values().sum::<usize>(), 0);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::SoftFailed))
+            .unwrap()
+            .len(),
+        1,
+        "--flag soft-failed selects the imported event"
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(
+        streams,
+        vec![1, 2, 3],
+        "the soft-failed event has no timeline slot"
+    );
+
+    let record = event_record_id(b"$soft:test");
+    let bytes = stored(
+        &db,
+        EVENT_POOL,
+        event_verdict_collection_id(&record),
+        record,
+    )
+    .expect("soft-failed event has a verdict record");
+    let (_, verdict) = decode_verdict(&bytes).unwrap();
+    assert_eq!(verdict.soft_fail, Some(2), "the exported reason survives");
+    assert_eq!(verdict.arrival_ordering, Some(7));
+}
+
+#[test]
+fn negative_arrival_ordering_is_rejected_on_import() {
+    use crate::interchange::parse_room;
+
+    let room_id = "!badarrival:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","arrival_ordering":-1,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":2,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let error = parse_room(jsonl.as_bytes()).unwrap_err().to_string();
+    assert!(error.contains("arrival_ordering"), "{error}");
+    assert!(error.contains("non-negative"), "{error}");
+}
+
+#[test]
+fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+
+    let flags = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
+    let present_before = flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap();
+    let timeline_before = flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap();
+    let outlier_before = flags.count(&db, &FlagQuery::has(Flag::Outlier)).unwrap();
+    let rejected_before = flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap();
+    let soft_failed_before = flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap();
+    let redacted_before = flags.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap();
+
+    let shorts_present_before = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Present))
+        .unwrap();
+    let shorts_timeline_before = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
+        .unwrap();
+
+    // Wipe the index: remove both its metadata collection and the active
+    // chunk generation, so the rebuild below starts from nothing.
+    let generation = flags.meta(&db).unwrap().generation;
+    let wipe = db.begin_transaction();
+    wipe.delete_collection(flags.pool(), *flags.collection())
+        .unwrap();
+    wipe.delete_collection(flags.pool(), flags.chunk_collection(generation))
+        .unwrap();
+    wipe.commit().unwrap();
+
+    // Run rebuild
+    let count = flags.rebuild(&db).unwrap();
+    assert_eq!(count, 5);
+
+    // Assert exact equality
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(),
+        present_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        timeline_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Outlier)).unwrap(),
+        outlier_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        rejected_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        soft_failed_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap(),
+        redacted_before
+    );
+
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::Present))
+            .unwrap(),
+        shorts_present_before
+    );
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
+            .unwrap(),
+        shorts_timeline_before
+    );
+}
+
+#[test]
+fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
+    use crate::interchange::parse_room;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!test_ordering:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":10,"stream_ordering":0,"auth_events":["$backfill:test"],"prev_events":["$backfill:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test"],"content":{{"membership":"join"}},"depth":10,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1500,"prev_events":["$backfill:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":["$backfill:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":["$backfill:test","$join:test"],"prev_events":["$normal:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$normal:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":["$backfill:test","$join:test"],"prev_events":["$later:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":["$later:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":["$backfill:test","$join:test"],"prev_events":["$notimeline:test"],"outlier":true,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":["$notimeline:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":6,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert!(export.timeline);
+    assert_eq!(export.events.len(), 6);
+
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 6);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
+
+    // Only the 4 timeline events should be present ($notimeline and $outlier excluded)
+    assert_eq!(page.entries.len(), 4);
+
+    // Verify ordering:
+    // 1. $backfill (depth: 10, stream: -5)
+    assert_eq!(page.entries[0].topological_ordering, 10);
+    assert_eq!(page.entries[0].stream_ordering, -5);
+
+    // 2. $join (depth: 10, stream: 0)
+    assert_eq!(page.entries[1].topological_ordering, 10);
+    assert_eq!(page.entries[1].stream_ordering, 0);
+
+    // 3. $normal (depth: 10, stream: 100)
+    assert_eq!(page.entries[2].topological_ordering, 10);
+    assert_eq!(page.entries[2].stream_ordering, 100);
+
+    // 4. $later (depth: 11, stream: 101)
+    assert_eq!(page.entries[3].topological_ordering, 11);
+    assert_eq!(page.entries[3].stream_ordering, 101);
+
+    // Verify re-import idempotence: re-importing the same export does not duplicate entries
+    let (written_again, _) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written_again.events, 6);
+    let page_after = timeline_index.page(&room_scope, None, true, 10).unwrap();
+    assert_eq!(page_after.entries.len(), 4);
+    assert_eq!(page.entries, page_after.entries);
+}
+
+#[test]
+fn evict_database_pages_succeeds_on_valid_store() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = crate::interchange::parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+    drop(db);
+
+    let (files, bytes) = crate::cmd::evict_database_pages(&root).unwrap();
+    assert!(files > 0);
+    assert!(bytes > 0);
 }

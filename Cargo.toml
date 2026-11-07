@@ -2,8 +2,7 @@
 name = "mtxdb"
 version.workspace = true
 edition = "2021"
-rust-version = "1.88"
-publish = false
+rust-version = "1.89"
 # Without this, Cargo auto-discovers benches/*.rs as this package's own bench
 # targets purely by their being physically under benches/ (which is now
 # mtxdb-benches's directory, not this package's) -- explicit [[bench]] entries
@@ -15,13 +14,20 @@ description = "mtxdb: write-once, content-addressed packfile storage engine for 
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
-categories = ["database-implementations", "storage"]
+categories = ["database-implementations", "filesystem"]
 # Test code is not part of the published surface. Extracted unit-test modules
 # live beside their sources as `src/**/test_*.rs`, and integration tests under
 # `tests/`; exclude both from the packaged archive. Local `cargo test` still
 # compiles them through the out-of-line `mod tests;` declarations.
+#
+# The examples are internal measurement harnesses (fixture-driven, several
+# rewrite store metadata), not usage documentation, so they are excluded too.
+# `benches/` is already a nested package and cannot be packaged from here;
+# keep it explicit in case that changes.
 exclude = [
     "tests/",
+    "examples/",
+    "benches/",
     "src/test_*.rs",
     "src/**/test_*.rs",
     "scripts/",
@@ -52,12 +58,12 @@ resolver = "2"
 # parses every member's graph plus the shared lock for every command -- so a
 # member there would drag the whole workspace's floor up to 1.85. Keeping it
 # out (like benches/, which has its own `[workspace]` table)
-# preserves the library's 1.88 MSRV. Build/lint/test it with
+# preserves the library's 1.89 MSRV. Build/lint/test it with
 # `--manifest-path mtxdb-cli/Cargo.toml`.
 members = []
 
 [workspace.package]
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 
 # LINTS
 
@@ -106,6 +112,10 @@ default = ["zstd", "bitmaps"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
+# Exposes `JournalCoordinator::set_segment_cap` so downstream tests can reach the
+# journal's hard limit without writing hundreds of MiB. Not for production use.
+test-util = []
+
 # Cross-process read-committed workers. Always available: `Database`, the
 # shared WAL, transactions, record-version compare-and-set and recovery, the
 # in-process read journal and `open_read_committed` for read-only use, and the
@@ -138,9 +148,11 @@ fs2 = "0.4"
 memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
 sha2 = "0.11"
 zstd = { version = "0.14", default-features = false, optional = true }
+
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
 # own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
@@ -152,6 +164,12 @@ zstd = { version = "0.14", default-features = false, optional = true }
 # the crate, so the choice is made here with two cfg tables.
 [target.'cfg(not(windows))'.dependencies]
 zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
+
+# rezzy-recon's accelerated GF64 implementation currently imports an x86_64-only
+# intrinsic from `core::arch::x86`. Keep 32-bit x86 on its portable backend;
+# other targets retain the dependency's default `std` acceleration.
+[target.'cfg(target_arch = "x86")'.dependencies]
+rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
