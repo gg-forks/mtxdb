@@ -1,6 +1,5 @@
-use super::matrix_adjacency::*;
+use super::csr_adjacency::*;
 use crate::database::Database;
-use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
 
@@ -12,8 +11,8 @@ fn test_root(name: &str) -> PathBuf {
     path
 }
 
-fn adjacency() -> MatrixAdjacency {
-    MatrixAdjacency::new(ShardType::Edges, ROOM)
+fn adjacency() -> CsrAdjacency {
+    CsrAdjacency::new(ROOM)
 }
 
 #[test]
@@ -59,6 +58,77 @@ fn records_and_reads_prev_auth_and_relation() {
     );
     assert_eq!(adj.relation_of(&db, "$msg", &AlwaysVisible).unwrap(), None);
     assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_event_ids_round_trips_short_ids_and_reports_absent_ones() {
+    let root = test_root("resolve_ids");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let absent = u32::MAX;
+
+    assert_eq!(
+        adj.resolve_event_ids(&db, &[msg, absent, create]).unwrap(),
+        vec![Some("$msg".to_owned()), None, Some("$create".to_owned()),],
+        "order is preserved and an unassigned id resolves to None"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reverse_family_transposes_persisted_rows() {
+    let root = test_root("reverse-family");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    adj.record_event(
+        &db,
+        "$react",
+        &["$msg"],
+        &["$create"],
+        Some(RelationRef {
+            target: "$msg",
+            rel_type: "m.annotation",
+        }),
+    )
+    .unwrap();
+
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let react = adj.short_id(&db, "$react").unwrap().unwrap();
+    let prev = adj.reverse_family(&db, PREV).unwrap();
+    let auth = adj.reverse_family(&db, AUTH).unwrap();
+    let relations = adj.reverse_family(&db, RELATIONS).unwrap();
+
+    assert_eq!(prev.child_count(create), Some(1));
+    assert_eq!(prev.children_of(create).unwrap()[0].target, msg);
+    assert_eq!(prev.children_of(msg).unwrap()[0].target, react);
+    assert_eq!(auth.child_count(create), Some(2));
+    assert_eq!(
+        auth.children_of(create)
+            .unwrap()
+            .iter()
+            .map(|edge| edge.target)
+            .collect::<Vec<_>>(),
+        vec![msg, react]
+    );
+    assert_eq!(relations.child_count(msg), Some(1));
+    assert_eq!(relations.children_of(msg).unwrap()[0].target, react);
+    assert_eq!(
+        relations.children_of(msg).unwrap()[0].kind,
+        adj.kind_id(&db, "m.annotation").unwrap()
+    );
+
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -283,7 +353,7 @@ fn purge_removes_events_and_the_kind_dictionary_together() {
         }),
     )
     .unwrap();
-    let other_room = MatrixAdjacency::new(ShardType::Edges, "!other:example.org");
+    let other_room = CsrAdjacency::new("!other:example.org");
     other_room.record_event(&db, "$x", &[], &[], None).unwrap();
 
     adj.purge(&db).unwrap();
@@ -473,6 +543,36 @@ fn a_relation_can_be_added_later_but_never_changed_or_removed() {
     assert_eq!(
         relation(&db),
         Some(("$msg".to_owned(), "m.annotation".to_owned()))
+    );
+    assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn concurrent_recordings_of_one_event_cannot_both_succeed() {
+    let root = test_root("concurrent-same-owner");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let (first, second) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| adj.record_event(&db, "$e", &["$a"], &[], None));
+        let two = scope.spawn(|| adj.record_event(&db, "$e", &["$b"], &[], None));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "two different prev sets for one event must not both win"
+    );
+    let error = first
+        .err()
+        .or_else(|| second.err())
+        .expect("exactly one recording failed");
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    let stored = adj.prev_of(&db, "$e").unwrap().unwrap();
+    assert!(
+        stored == ["$a".to_owned()] || stored == ["$b".to_owned()],
+        "the winner's edges must survive intact: {stored:?}"
     );
     assert!(adj.verify(&db).unwrap().is_consistent());
     drop(db);
