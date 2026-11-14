@@ -11332,7 +11332,7 @@ fn a_hole_punched_room_publishes_only_oracle_groups_and_repairs_to_them() {
             let without: Vec<&str> = all.iter().copied().filter(|id| *id != hole).collect();
             {
                 let db = Database::open(dir.clone()).unwrap();
-                import(&db, &dir, "without.jsonl", &without, false);
+                import(&db, &dir, "without.jsonl", &without, direct);
                 let stage_one = mappings(&db);
                 for (id, mapped) in &stage_one {
                     if gapped.contains(&id.as_str()) {
