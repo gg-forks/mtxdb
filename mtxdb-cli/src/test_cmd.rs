@@ -2957,6 +2957,7 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
         let store = db.event_dag();
         let state_store = db.state().as_ref();
         let mut established = HashSet::new();
+        established.insert(template_collection_id(&template, room));
         let mut cache = ImportRunCache {
             direct,
             ..ImportRunCache::default()
@@ -3546,26 +3547,33 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             std::fs::write(&path, text).unwrap();
             path
         };
-        for path in [
-            write("first.jsonl", &[&create, &join, &base]),
-            write("second.jsonl", &[&early, &later, &child, &grandchild]),
-            write("third.jsonl", &[&late_auth, &late_prev]),
-        ] {
-            cmd_import_file(
-                &db,
-                store,
-                state_store,
-                &path,
-                None,
-                &template,
-                &mut established,
-                false,
-                None,
-                true,
-                Some(&mut cache),
-            )
-            .unwrap();
-        }
+        let import_file =
+            |path: &Path, established: &mut HashSet<[u8; 16]>, cache: &mut ImportRunCache| {
+                cmd_import_file(
+                    &db,
+                    store,
+                    state_store,
+                    path,
+                    None,
+                    &template,
+                    established,
+                    false,
+                    None,
+                    true,
+                    Some(cache),
+                )
+                .unwrap();
+            };
+        import_file(
+            &write("first.jsonl", &[&create, &join, &base]),
+            &mut established,
+            &mut cache,
+        );
+        import_file(
+            &write("second.jsonl", &[&early, &later, &child, &grandchild]),
+            &mut established,
+            &mut cache,
+        );
 
         let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
         let mapped = |id: &str| {
@@ -3583,6 +3591,16 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
                 .unwrap()
                 .map(|data| decode_verdict(&data.bytes).unwrap().1.rejection)
         };
+        assert!(
+            !mapped("$child") && !mapped("$grandchild"),
+            "the gap and its descendants have no complete mappings before the late prev arrives"
+        );
+
+        import_file(
+            &write("third.jsonl", &[&late_auth, &late_prev]),
+            &mut established,
+            &mut cache,
+        );
         let mut rows = Vec::new();
         for id in ["$early", "$later", "$child", "$grandchild"] {
             rows.push((id.to_owned(), code(id), mapped(id)));
@@ -11125,4 +11143,219 @@ fn seeded_gap_root_skips_a_rejected_citation() {
             .contains_key(&("m.room.power_levels".to_owned(), String::new())),
         "the rejected citation must not reach the state"
     );
+}
+
+/// Hole-punch a complete room: the full whole-room walk is the oracle. With
+/// one event removed, every mapping that is published must equal the oracle's
+/// and every event whose ancestry crosses the hole must stay unmapped. After
+/// the database is reopened and only the missing event is imported, every
+/// mapping must equal the oracle's, on both import paths.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture, the oracle, and both stages are one scenario"
+)]
+fn a_hole_punched_room_publishes_only_oracle_groups_and_repairs_to_them() {
+    use mtxdb::auxiliary::AuxiliaryIndex;
+
+    let room = "!holes:test";
+    let template = default_matrix_import_template();
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        raw_event(room, id, kind, state_key, content, prev, auth)
+    };
+    // (id, event) in causal order. `$topic` is a state event on the prev
+    // chain; `$a` and `$b` are the two branches of the merge `$merge`.
+    let room_events: Vec<(&str, OwnedValue)> = vec![
+        (
+            "$create",
+            event(
+                "$create",
+                "m.room.create",
+                "",
+                r#"{"room_version":"11"}"#,
+                "[]",
+                "[]",
+            ),
+        ),
+        (
+            "$join",
+            event(
+                "$join",
+                "m.room.member",
+                "@alice:test",
+                r#"{"membership":"join"}"#,
+                r#"["$create"]"#,
+                r#"["$create"]"#,
+            ),
+        ),
+        (
+            "$pl",
+            event(
+                "$pl",
+                "m.room.power_levels",
+                "",
+                r#"{"users":{"@alice:test":100}}"#,
+                r#"["$join"]"#,
+                r#"["$create","$join"]"#,
+            ),
+        ),
+        (
+            "$topic",
+            event(
+                "$topic",
+                "m.room.topic",
+                "",
+                r#"{"topic":"t"}"#,
+                r#"["$pl"]"#,
+                r#"["$create","$join","$pl"]"#,
+            ),
+        ),
+        (
+            "$m1",
+            event(
+                "$m1",
+                "m.room.message",
+                "",
+                r#"{"body":"m1"}"#,
+                r#"["$topic"]"#,
+                r#"["$create","$join","$pl"]"#,
+            ),
+        ),
+        (
+            "$a",
+            event(
+                "$a",
+                "m.room.message",
+                "",
+                r#"{"body":"a"}"#,
+                r#"["$m1"]"#,
+                r#"["$create","$join","$pl"]"#,
+            ),
+        ),
+        (
+            "$b",
+            event(
+                "$b",
+                "m.room.message",
+                "",
+                r#"{"body":"b"}"#,
+                r#"["$m1"]"#,
+                r#"["$create","$join","$pl"]"#,
+            ),
+        ),
+        (
+            "$merge",
+            event(
+                "$merge",
+                "m.room.message",
+                "",
+                r#"{"body":"merge"}"#,
+                r#"["$a","$b"]"#,
+                r#"["$create","$join","$pl"]"#,
+            ),
+        ),
+    ];
+
+    let import = |db: &Database, dir: &std::path::Path, name: &str, ids: &[&str], direct: bool| {
+        let mut text = String::new();
+        for (id, event) in &room_events {
+            if ids.contains(id) {
+                text.push_str(&event.encode());
+                text.push('\n');
+            }
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        // The create event is already on disk for the repair stage, exactly
+        // as the other append tests establish the collection.
+        let mut established = HashSet::new();
+        established.insert(template_collection_id(&template, room));
+        let mut cache = ImportRunCache {
+            direct,
+            ..ImportRunCache::default()
+        };
+        cmd_import_file(
+            db,
+            db.event_dag(),
+            db.state().as_ref(),
+            &path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+    };
+    let mappings = |db: &Database| -> std::collections::BTreeMap<String, Option<String>> {
+        let aux = AuxiliaryIndex::open(db.state().as_ref(), STATE_GROUP_NAMESPACE);
+        room_events
+            .iter()
+            .map(|(id, _)| {
+                let mapped = aux
+                    .get_many(&[id.as_bytes()])
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .map(hex::encode);
+                ((*id).to_owned(), mapped)
+            })
+            .collect()
+    };
+    let all: Vec<&str> = room_events.iter().map(|(id, _)| *id).collect();
+
+    // The oracle: the complete room in one file through the whole-room path.
+    let oracle_dir = unique_temp_dir().join("hole_oracle");
+    std::fs::create_dir_all(&oracle_dir).unwrap();
+    let oracle_db = Database::open(oracle_dir.clone()).unwrap();
+    import(&oracle_db, &oracle_dir, "all.jsonl", &all, false);
+    let oracle = mappings(&oracle_db);
+    assert!(
+        oracle.values().all(Option::is_some),
+        "the complete room must map every event: {oracle:?}"
+    );
+    drop(oracle_db);
+
+    // (hole, events that must stay unmapped while it is open)
+    let cases: [(&str, &[&str]); 3] = [
+        ("$topic", &["$m1", "$a", "$b", "$merge"]),
+        ("$m1", &["$a", "$b", "$merge"]),
+        ("$b", &["$merge"]),
+    ];
+    for (hole, gapped) in cases {
+        for direct in [false, true] {
+            let dir = unique_temp_dir().join(format!("hole_{}_{direct}", &hole[1..]));
+            std::fs::create_dir_all(&dir).unwrap();
+            let without: Vec<&str> = all.iter().copied().filter(|id| *id != hole).collect();
+            {
+                let db = Database::open(dir.clone()).unwrap();
+                import(&db, &dir, "without.jsonl", &without, false);
+                let stage_one = mappings(&db);
+                for (id, mapped) in &stage_one {
+                    if gapped.contains(&id.as_str()) {
+                        assert!(
+                            mapped.is_none(),
+                            "hole {hole}: {id} crosses the gap and must stay unmapped"
+                        );
+                    } else if *id != hole {
+                        assert_eq!(
+                            mapped, &oracle[id],
+                            "hole {hole}: {id} is published, so it must equal the oracle"
+                        );
+                    }
+                }
+            }
+            // Fresh handle: nothing may survive in memory between the stages.
+            let db = Database::open(dir.clone()).unwrap();
+            import(&db, &dir, "hole.jsonl", &[hole], direct);
+            assert_eq!(
+                mappings(&db),
+                oracle,
+                "hole {hole} direct={direct}: importing the missing event must repair to the oracle"
+            );
+        }
+    }
 }
