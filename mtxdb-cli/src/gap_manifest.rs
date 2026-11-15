@@ -474,6 +474,43 @@ fn unaccepted(manifest: &GapManifest, gate: PrevGate) -> Vec<(&str, GapStatus)> 
         .collect()
 }
 
+/// One line saying whether a room's manifest holds unresolved prevs, and how
+/// each is currently classified.
+///
+/// "No unresolved prevs" is about prevs only: it is what this manifest knows,
+/// not a claim that every other part of the room is verified.
+pub(crate) fn summarize(manifest: &GapManifest) -> String {
+    if manifest.gaps.is_empty() {
+        return "no unresolved prevs".to_owned();
+    }
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for record in manifest.gaps.values() {
+        let count = counts.entry(record.status().name()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(name, count)| format!("{count} {name}"))
+        .collect();
+    format!(
+        "{} unresolved prev(s): {}",
+        manifest.gaps.len(),
+        parts.join(", ")
+    )
+}
+
+/// Print one line per touched room, so an import always says whether it left
+/// gaps, with or without `--require-complete-prevs`.
+///
+/// # Errors
+/// Returns a storage error from reading a manifest.
+pub(crate) fn report_rooms(db: &Database, rooms: &BTreeSet<String>) -> Result<()> {
+    for room in rooms {
+        eprintln!("  {room}: {}", summarize(&read(db, room)?));
+    }
+    Ok(())
+}
+
 /// Fail an import that leaves a touched room with an unaccepted gap.
 ///
 /// Every room in `rooms` is checked, and every failure is reported, not just
@@ -1585,5 +1622,19 @@ mod tests {
         assert_eq!(ids(PrevGate::RequireAllowWaived), ["$absent", "$open"]);
         assert!(unaccepted(&GapManifest::default(), PrevGate::Require).is_empty());
         assert_eq!(PrevGate::from_flags(false, true), PrevGate::Off);
+    }
+
+    #[test]
+    fn a_room_summary_says_whether_prevs_are_unresolved_and_how_they_stand() {
+        assert_eq!(summarize(&GapManifest::default()), "no unresolved prevs");
+        let mut manifest = tracked(&["$a", "$b", "$c"]);
+        manifest.waive("$b", "me", "ok", 1).unwrap();
+        manifest
+            .anchor("$c", "$e", AnchorBoundary::After, "src", 1)
+            .unwrap();
+        assert_eq!(
+            summarize(&manifest),
+            "3 unresolved prev(s): 1 anchored, 1 open, 1 waived"
+        );
     }
 }

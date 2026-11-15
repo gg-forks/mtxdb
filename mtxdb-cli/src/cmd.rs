@@ -9173,6 +9173,10 @@ fn cmd_import(
     }
     // After this import has recorded its gaps and before the marker is
     // committed: a failure leaves the database visibly unmarked, not complete.
+    if !run.gap_rooms.is_empty() {
+        eprintln!("unresolved prevs by room:");
+        crate::gap_manifest::report_rooms(&db, &run.gap_rooms)?;
+    }
     crate::gap_manifest::check_complete_prevs(&db, &run.gap_rooms, prev_gate)?;
     let finish_started = Instant::now();
     finish_import(&db, &run)?;
