@@ -316,13 +316,17 @@ pub(crate) fn record_import_gaps(
             }
         }
     }
-    manifest
-        .gaps
-        .retain(|id, _| !known.contains(id) && !room_holds(db, room_id, id));
+    let mut resolved = BTreeSet::new();
+    for id in manifest.gaps.keys() {
+        if known.contains(id) || room_holds(db, room_id, id)? {
+            resolved.insert(id.clone());
+        }
+    }
+    manifest.gaps.retain(|id, _| !resolved.contains(id));
     for id in missing {
         // A prev absent from this batch may already be stored in the room
         // (an export re-import); that is not a gap.
-        if room_holds(db, room_id, &id) {
+        if room_holds(db, room_id, &id)? {
             continue;
         }
         manifest.gaps.entry(id).or_insert_with(GapRecord::open);
@@ -345,14 +349,16 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Whether the room's event collection already holds `event_id`.
-fn room_holds(db: &Database, room_id: &str, event_id: &str) -> bool {
-    db.pool(EVENT_POOL)
+fn room_holds(db: &Database, room_id: &str, event_id: &str) -> Result<bool> {
+    // A failed lookup must not read as "not held": that would record a false
+    // gap, or keep a resolved one.
+    Ok(db
+        .pool(EVENT_POOL)
         .get(
             &room_event_collection_id(room_id.as_bytes()),
             &event_record_id(event_id.as_bytes()),
-        )
-        .map(|record| record.is_some())
-        .unwrap_or(false)
+        )?
+        .is_some())
 }
 
 fn event_id(event: &OwnedValue) -> Option<&str> {
