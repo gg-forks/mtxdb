@@ -11394,8 +11394,9 @@ fn importing_a_gap_records_it_open_and_clears_it_when_the_event_arrives() {
         manifest.gaps.contains_key("$missing"),
         "a prev with no event is a recorded gap: {manifest:?}"
     );
-    assert!(
-        !manifest.gaps["$missing"].availability.is_absent(),
+    assert_eq!(
+        manifest.gaps["$missing"].status(),
+        crate::gap_manifest::GapStatus::Open,
         "nothing was asked, so the gap is open"
     );
 

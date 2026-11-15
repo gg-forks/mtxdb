@@ -11,11 +11,14 @@
 //! supplies the state before or after its event, because `/state_ids` for an
 //! event returns the state *before* it.
 //!
-//! Availability answers are scoped to a run and to the servers actually asked:
-//! `not_found` means "not found on these named servers in this run", never
-//! "nobody has it". A gap-fill report that omits an id because it found the
-//! event is not evidence of anything here. Only the event arriving (in the
-//! import batch or already stored in the room) closes a gap.
+//! Availability answers are scoped to one assessment and to the servers it
+//! asked: `not_found` means "not found on these named servers in that
+//! assessment", never "nobody has it". Older assessments are kept as history,
+//! but the current status reads only the newest one, so a later all-404
+//! assessment can supersede an earlier timeout. A gap-fill report that omits
+//! an id because it found the event is not evidence of anything here. Only the
+//! event arriving (in the import batch or already stored in the room) closes a
+//! gap.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,17 +81,20 @@ impl AnswerKind {
 /// One server's answer about one gap, kept with the request outcome so a
 /// refusal is not mistaken for absence.
 ///
-/// Answers are evidence from a named server in a named run. They are kept
-/// across runs rather than overwritten: a later run that says `404` does not
-/// erase an earlier timeout, so nothing can silently turn an open gap into
-/// absence.
+/// Answers are evidence from a named server in a named assessment. They are
+/// kept across assessments as history rather than overwritten, but the
+/// *current* status reads only the latest assessment: what a server said last
+/// year does not overrule what it said in the run being judged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ServerAnswer {
     pub(crate) server: String,
     /// Label for the gap-fill run that produced this answer. Re-reading the
-    /// same report replaces that run's answer for the server; a new run adds
-    /// another record.
+    /// same report replaces that assessment's answer for the server; a new
+    /// assessment adds another record.
     pub(crate) run: String,
+    /// When this answer was recorded, so the newest assessment and the
+    /// status's `as_of` can be named without trusting vector order.
+    pub(crate) recorded_at_ms: u64,
     pub(crate) kind: AnswerKind,
     pub(crate) status: Option<u16>,
     pub(crate) errcode: Option<String>,
@@ -96,23 +102,43 @@ pub(crate) struct ServerAnswer {
 
 /// What the queried servers said about a gap.
 ///
-/// `Absent` is derived, never stored as an independent claim: it requires at
-/// least one answer and a definite 404 for every recorded answer. Any refusal,
-/// transient failure or unanswered query — including one from an earlier run —
-/// leaves the gap open.
+/// Absence is derived from the latest assessment, never stored as an
+/// independent claim: it requires a definite 404 from every server that
+/// assessment covered. A refusal, transient failure or unanswered query in
+/// that assessment leaves the gap open. Earlier assessments stay here as
+/// history and do not block a later all-404 assessment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Availability {
     pub(crate) answers: Vec<ServerAnswer>,
 }
 
 impl Availability {
-    #[must_use]
-    pub(crate) fn is_absent(&self) -> bool {
-        !self.answers.is_empty()
-            && self
-                .answers
-                .iter()
-                .all(|answer| answer.kind.is_definite_absence())
+    /// The run label of the newest answer. Ties go to the answer recorded
+    /// later, which is the one `record_answer` appended last.
+    fn latest_run(&self) -> Option<&str> {
+        let mut newest: Option<&ServerAnswer> = None;
+        for answer in &self.answers {
+            if newest.is_none_or(|current| answer.recorded_at_ms >= current.recorded_at_ms) {
+                newest = Some(answer);
+            }
+        }
+        newest.map(|answer| answer.run.as_str())
+    }
+
+    /// The servers this assessment covered, taken from its answers.
+    fn servers_in_run(&self, run: &str) -> BTreeSet<String> {
+        self.answers
+            .iter()
+            .filter(|answer| answer.run == run)
+            .map(|answer| answer.server.clone())
+            .collect()
+    }
+
+    /// One server's answer in one assessment.
+    fn answer_in_run(&self, server: &str, run: &str) -> Option<&ServerAnswer> {
+        self.answers
+            .iter()
+            .find(|answer| answer.server == server && answer.run == run)
     }
 }
 
@@ -170,17 +196,23 @@ pub(crate) struct GapRecord {
 ///
 /// Order matters. An anchor is the only fact that can complete state past a
 /// gap, so it outranks everything. A waiver is an operator decision, so it
-/// outranks mere evidence. `AbsentAmong` says every recorded attempt, in every
-/// run, answered `404`; it is still a gap and never closes one.
+/// outranks mere evidence. `AbsentAmong` reads the latest assessment only; it
+/// is still a gap and never closes one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GapStatus {
     Anchored,
     Waived,
-    /// Every recorded attempt — not just the latest run — is a definite 404.
-    /// The set names the servers those attempts covered. It is not a claim
-    /// that nobody holds the event, and one historical refusal or timeout
-    /// keeps the gap `Open`.
-    AbsentAmong(BTreeSet<String>),
+    /// Every server in this one assessment answered a definite 404.
+    ///
+    /// The set names exactly the servers that assessment covered, and
+    /// `as_of_ms` is the newest answer in it. It is not a claim that nobody
+    /// holds the event, and it does not speak for servers the assessment did
+    /// not ask. A later assessment replaces it; an earlier timeout in another
+    /// assessment is history.
+    AbsentAmong {
+        servers: BTreeSet<String>,
+        as_of_ms: u64,
+    },
     Open,
 }
 
@@ -189,26 +221,61 @@ impl GapRecord {
         Self::default()
     }
 
-    /// Derive the gap's status. See [`GapStatus`].
+    /// Derive the status from the latest assessment.
+    ///
+    /// See [`GapStatus`]. Use [`Self::status_for`] to judge a named
+    /// assessment and server set instead.
     #[allow(
         dead_code,
         reason = "read by the strict-import gap check, which is not wired yet"
     )]
     pub(crate) fn status(&self) -> GapStatus {
         if self.anchor.is_some() {
-            GapStatus::Anchored
-        } else if self.waiver.is_some() {
-            GapStatus::Waived
-        } else if self.availability.is_absent() {
-            GapStatus::AbsentAmong(
-                self.availability
-                    .answers
-                    .iter()
-                    .map(|answer| answer.server.clone())
-                    .collect(),
-            )
-        } else {
-            GapStatus::Open
+            return GapStatus::Anchored;
+        }
+        if self.waiver.is_some() {
+            return GapStatus::Waived;
+        }
+        let Some(run) = self.availability.latest_run() else {
+            return GapStatus::Open;
+        };
+        let servers = self.availability.servers_in_run(run);
+        self.status_for(run, &servers)
+    }
+
+    /// Derive the status from one assessment over an explicit server set.
+    ///
+    /// A server in the set with no answer in this assessment, or with any
+    /// answer other than a definite 404, leaves the gap open. The set is
+    /// explicit because "not found" is only meaningful for the sources that
+    /// were actually asked.
+    #[allow(
+        dead_code,
+        reason = "read by the strict-import gap check, which is not wired yet"
+    )]
+    pub(crate) fn status_for(&self, run: &str, servers: &BTreeSet<String>) -> GapStatus {
+        if self.anchor.is_some() {
+            return GapStatus::Anchored;
+        }
+        if self.waiver.is_some() {
+            return GapStatus::Waived;
+        }
+        if servers.is_empty() {
+            return GapStatus::Open;
+        }
+        let mut as_of_ms = 0;
+        for server in servers {
+            let Some(answer) = self.availability.answer_in_run(server, run) else {
+                return GapStatus::Open;
+            };
+            if !answer.kind.is_definite_absence() {
+                return GapStatus::Open;
+            }
+            as_of_ms = as_of_ms.max(answer.recorded_at_ms);
+        }
+        GapStatus::AbsentAmong {
+            servers: servers.clone(),
+            as_of_ms,
         }
     }
 }
@@ -227,10 +294,10 @@ impl GapManifest {
 
     /// Record a server answer. Evidence is kept per `(server, run)`.
     ///
-    /// Re-reading the same run's report replaces that run's answer for the
-    /// server, so duplicate ingestion does not pile up. A different run is
-    /// appended, never substituted: an earlier refusal or timeout still counts
-    /// when absence is derived.
+    /// Re-reading the same assessment's report replaces that assessment's
+    /// answer for the server, so duplicate ingestion does not pile up. A
+    /// different assessment is appended: older answers stay as history, while
+    /// the status reads only the newest assessment.
     #[allow(
         dead_code,
         reason = "used by the gap-evidence command, which is not wired yet"
@@ -409,6 +476,7 @@ pub(crate) fn encode(manifest: &GapManifest) -> Result<Vec<u8>> {
         for answer in &record.availability.answers {
             put_str(&mut out, &answer.server)?;
             put_str(&mut out, &answer.run)?;
+            out.extend_from_slice(&answer.recorded_at_ms.to_le_bytes());
             out.push(answer.kind.code());
             match answer.status {
                 Some(status) => {
@@ -461,6 +529,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
         for _ in 0..answers {
             let server = reader.string()?;
             let run = reader.string()?;
+            let recorded_at_ms = reader.u64()?;
             let kind = AnswerKind::from_code(reader.u8()?)
                 .ok_or_else(|| anyhow::anyhow!("unknown gap answer code"))?;
             let status = match reader.u8()? {
@@ -472,6 +541,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
             record.availability.answers.push(ServerAnswer {
                 server,
                 run,
+                recorded_at_ms,
                 kind,
                 status,
                 errcode,
@@ -598,13 +668,28 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    fn answer(server: &str, run: &str, kind: AnswerKind) -> ServerAnswer {
+    fn answer_at(server: &str, run: &str, at_ms: u64, kind: AnswerKind) -> ServerAnswer {
         ServerAnswer {
             server: server.to_owned(),
             run: run.to_owned(),
+            recorded_at_ms: at_ms,
             kind,
-            status: Some(404),
-            errcode: Some("M_NOT_FOUND".to_owned()),
+            status: match kind {
+                AnswerKind::Unanswered => None,
+                _ => Some(404),
+            },
+            errcode: None,
+        }
+    }
+
+    fn answer(server: &str, run: &str, kind: AnswerKind) -> ServerAnswer {
+        answer_at(server, run, 1, kind)
+    }
+
+    fn absent(servers: &[&str], as_of_ms: u64) -> GapStatus {
+        GapStatus::AbsentAmong {
+            servers: servers.iter().map(|server| (*server).to_owned()).collect(),
+            as_of_ms,
         }
     }
 
@@ -614,8 +699,11 @@ mod tests {
             "$absent",
             answer("matrix.example", "run-1", AnswerKind::NotFound),
         );
-        let absent = manifest.gaps.get_mut("$absent").unwrap();
-        absent.waiver = Some(Waiver {
+        manifest.record_answer(
+            "$waived",
+            answer("a.example", "run-1", AnswerKind::NotFound),
+        );
+        manifest.gaps.get_mut("$waived").unwrap().waiver = Some(Waiver {
             by: "operator".to_owned(),
             reason: "no source has it".to_owned(),
             recorded_at_ms: 7,
@@ -640,27 +728,43 @@ mod tests {
         let manifest = sample();
         let decoded = decode(&encode(&manifest).unwrap()).unwrap();
         assert_eq!(decoded, manifest);
-        assert!(decoded.gaps["$absent"].availability.is_absent());
-        assert!(!decoded.gaps["$open"].availability.is_absent());
+        assert_eq!(
+            decoded.gaps["$absent"].status(),
+            absent(&["matrix.example"], 1)
+        );
+        assert_eq!(decoded.gaps["$waived"].status(), GapStatus::Waived);
+        assert_eq!(decoded.gaps["$open"].status(), GapStatus::Anchored);
     }
 
     #[test]
-    fn absence_requires_a_definite_answer_from_every_server() {
-        let mut availability = Availability::default();
-        assert!(!availability.is_absent(), "nothing asked is not absence");
-        availability.answers = vec![answer("a", "run-1", AnswerKind::NotFound)];
-        assert!(availability.is_absent());
-        availability
+    fn absence_reads_only_the_latest_assessment() {
+        let mut gap = GapRecord::open();
+        assert_eq!(
+            gap.status(),
+            GapStatus::Open,
+            "nothing asked is not absence"
+        );
+
+        gap.availability.answers = vec![answer("a", "run-1", AnswerKind::NotFound)];
+        assert_eq!(gap.status(), absent(&["a"], 1));
+
+        gap.availability
             .answers
             .push(answer("b", "run-1", AnswerKind::Refused));
-        assert!(!availability.is_absent(), "a refusal is not absence");
-        availability.answers = vec![
+        assert_eq!(gap.status(), GapStatus::Open, "a refusal is not absence");
+
+        gap.availability.answers = vec![
             answer("a", "run-1", AnswerKind::NotFound),
             answer("b", "run-1", AnswerKind::Transient),
         ];
-        assert!(!availability.is_absent(), "a 5xx is not absence");
-        availability.answers = vec![answer("a", "run-1", AnswerKind::Unanswered)];
-        assert!(!availability.is_absent(), "an unsent query is not absence");
+        assert_eq!(gap.status(), GapStatus::Open, "a 5xx is not absence");
+
+        gap.availability.answers = vec![answer("a", "run-1", AnswerKind::Unanswered)];
+        assert_eq!(
+            gap.status(),
+            GapStatus::Open,
+            "an unsent query is not absence"
+        );
     }
 
     #[test]
@@ -671,7 +775,7 @@ mod tests {
         gap.availability.answers = vec![answer("a", "run-1", AnswerKind::NotFound)];
         assert_eq!(
             gap.status(),
-            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned()])),
+            absent(&["a"], 1),
             "an answer and only definite 404s is absent among those servers"
         );
 
@@ -709,45 +813,86 @@ mod tests {
     }
 
     #[test]
-    fn evidence_is_kept_per_run_and_never_erased_by_a_later_run() {
+    fn a_later_all_not_found_assessment_restores_absence_but_history_survives() {
         let mut manifest = GapManifest::default();
-        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::NotFound));
-        assert!(manifest.gaps["$gap"].availability.is_absent());
+        manifest.record_answer("$gap", answer_at("a", "run-1", 1, AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer_at("b", "run-1", 1, AnswerKind::Transient));
+        assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
+
+        // A later assessment asks both servers again and both answer 404.
+        manifest.record_answer("$gap", answer_at("a", "run-2", 2, AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer_at("b", "run-2", 2, AnswerKind::NotFound));
+        assert_eq!(manifest.gaps["$gap"].status(), absent(&["a", "b"], 2));
         assert_eq!(
-            manifest.gaps["$gap"].status(),
-            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned()]))
+            manifest.gaps["$gap"].availability.answers.len(),
+            4,
+            "earlier assessments are kept as history"
         );
 
-        // Re-reading run 1 corrects that run's answer rather than duplicating it.
-        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::Transient));
-        assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 1);
-        assert!(!manifest.gaps["$gap"].availability.is_absent());
-
-        // A later run is appended. Its 404 must not erase run 1's timeout.
-        manifest.record_answer("$gap", answer("a", "run-2", AnswerKind::NotFound));
-        assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 2);
-        assert!(
-            !manifest.gaps["$gap"].availability.is_absent(),
-            "an earlier transient still counts, so the gap stays open"
-        );
+        // A newer assessment with one timeout is open again.
+        manifest.record_answer("$gap", answer_at("a", "run-3", 3, AnswerKind::Transient));
+        manifest.record_answer("$gap", answer_at("b", "run-3", 3, AnswerKind::NotFound));
         assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
     }
 
     #[test]
-    fn absence_covers_every_recorded_attempt_not_just_the_latest_run() {
+    fn status_is_scoped_to_the_servers_the_assessment_asked() {
+        let mut gap = GapRecord::open();
+        gap.availability.answers = vec![
+            answer_at("a", "run-1", 1, AnswerKind::NotFound),
+            answer_at("b", "run-1", 1, AnswerKind::Transient),
+        ];
+        assert_eq!(gap.status(), GapStatus::Open);
+        assert_eq!(
+            gap.status_for("run-1", &BTreeSet::from(["a".to_owned()])),
+            absent(&["a"], 1),
+            "absence is only claimed for the servers actually asked"
+        );
+        assert_eq!(
+            gap.status_for("run-2", &BTreeSet::from(["a".to_owned()])),
+            GapStatus::Open,
+            "an answer from another assessment does not count for this one"
+        );
+        assert_eq!(
+            gap.status_for("run-1", &BTreeSet::from(["a".to_owned(), "b".to_owned()])),
+            GapStatus::Open
+        );
+        assert_eq!(
+            gap.status_for("run-1", &BTreeSet::from(["c".to_owned()])),
+            GapStatus::Open,
+            "a server with no answer in this assessment is not absent"
+        );
+        assert_eq!(
+            gap.status_for("run-1", &BTreeSet::new()),
+            GapStatus::Open,
+            "an empty assessment decides nothing"
+        );
+    }
+
+    #[test]
+    fn the_newest_timestamp_picks_the_assessment_not_vector_order() {
         let mut manifest = GapManifest::default();
-        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::NotFound));
-        manifest.record_answer("$gap", answer("b", "run-2", AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer_at("a", "run-2", 2, AnswerKind::NotFound));
+        // An older assessment ingested later must not become current.
+        manifest.record_answer("$gap", answer_at("a", "run-1", 1, AnswerKind::Transient));
         assert_eq!(
             manifest.gaps["$gap"].status(),
-            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned(), "b".to_owned()])),
-            "the status is over all recorded attempts, across every run"
+            absent(&["a"], 2),
+            "the timestamp, not insertion order, names the latest assessment"
         );
+    }
 
-        // A refusal in any run keeps the gap open, even though both servers
-        // answered 404 in the runs shown above.
-        manifest.record_answer("$gap", answer("c", "run-3", AnswerKind::Refused));
+    #[test]
+    fn re_reading_one_assessment_replaces_that_servers_answer() {
+        let mut manifest = GapManifest::default();
+        manifest.record_answer("$gap", answer_at("a", "run-1", 1, AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer_at("a", "run-1", 1, AnswerKind::Transient));
+        assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 1);
         assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
+
+        manifest.record_answer("$gap", answer_at("a", "run-2", 2, AnswerKind::NotFound));
+        assert_eq!(manifest.gaps["$gap"].status(), absent(&["a"], 2));
+        assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 2);
     }
 
     #[test]
