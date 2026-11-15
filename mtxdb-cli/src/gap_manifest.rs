@@ -476,14 +476,15 @@ fn unaccepted(manifest: &GapManifest, gate: PrevGate) -> Vec<(&str, GapStatus)> 
 
 /// One line describing tracked prev-gap history and whether the selected
 /// strict-import gate accepts it. This does not make claims about other room
-/// completeness dimensions such as signatures or auth chains.
+/// completeness dimensions such as signatures or auth chains. An anchor is
+/// trusted operator-supplied input; this report does not independently verify it.
 pub(crate) fn summarize(manifest: &GapManifest, gate: PrevGate) -> String {
     if manifest.gaps.is_empty() {
         return "prevs: complete (no tracked gaps)".to_owned();
     }
 
     let mut counts = [0_usize; 4];
-    let mut absent = BTreeMap::<String, usize>::new();
+    let mut absent = BTreeMap::<BTreeSet<String>, (usize, u64)>::new();
     for record in manifest.gaps.values() {
         let index = match record.status() {
             GapStatus::Open => 0,
@@ -495,23 +496,26 @@ pub(crate) fn summarize(manifest: &GapManifest, gate: PrevGate) -> String {
     }
 
     // Keep the human report's order aligned with the gate's decision order.
-    // Absent entries retain their server scope and assessment timestamp.
+    // Group absence by the assessed server set, and report its newest
+    // timestamp so repeated assessments do not produce duplicate rows.
     for record in manifest.gaps.values() {
-        let status = record.status();
-        if let GapStatus::AbsentAmong { .. } = status {
-            let count = absent.entry(status.describe()).or_default();
+        if let GapStatus::AbsentAmong { servers, as_of_ms } = record.status() {
+            let (count, newest_as_of) = absent.entry(servers).or_default();
             *count = count.saturating_add(1);
+            *newest_as_of = (*newest_as_of).max(as_of_ms);
         }
     }
     let mut parts = Vec::new();
     if counts[0] > 0 {
         parts.push(format!("{} open", counts[0]));
     }
-    parts.extend(
-        absent
-            .into_iter()
-            .map(|(description, count)| format!("{count} {description}")),
-    );
+    parts.extend(absent.into_iter().map(|(servers, (count, as_of_ms))| {
+        let names: Vec<&str> = servers.iter().map(String::as_str).collect();
+        format!(
+            "{count} absent among {} (as of {as_of_ms} ms)",
+            names.join(", ")
+        )
+    }));
     if counts[2] > 0 {
         parts.push(format!("{} waived", counts[2]));
     }
@@ -1689,6 +1693,20 @@ mod tests {
         assert_eq!(
             summarize(&waived, PrevGate::RequireAllowWaived),
             "prevs: gapped history, waived by operator (1); strict check passes"
+        );
+    }
+
+    #[test]
+    fn room_summary_groups_absence_by_server_set_at_newest_time() {
+        let mut manifest = tracked(&["$a", "$b"]);
+        for (id, run, seq, at_ms) in [("$a", "run-a", 1, 10), ("$b", "run-b", 2, 20)] {
+            let mut answer = answer_at("peer.test", run, at_ms, AnswerKind::NotFound);
+            answer.seq = seq;
+            manifest.record_answer(id, answer);
+        }
+        assert_eq!(
+            summarize(&manifest, PrevGate::Require),
+            "prevs: gapped (2 absent among peer.test (as of 20 ms)); strict check fails"
         );
     }
 }

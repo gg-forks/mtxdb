@@ -9174,7 +9174,7 @@ fn cmd_import(
     // After this import has recorded its gaps and before the marker is
     // committed: a failure leaves the database visibly unmarked, not complete.
     if !run.gap_rooms.is_empty() {
-        eprintln!("prev history by room:");
+        eprintln!("prev gaps by room:");
         crate::gap_manifest::report_rooms(&db, &run.gap_rooms, prev_gate)?;
     }
     crate::gap_manifest::check_complete_prevs(&db, &run.gap_rooms, prev_gate)?;
@@ -11273,7 +11273,7 @@ impl ImportContext<'_> {
             self.template,
             self.established_collections,
             self.write_state_hamts,
-            Some(&mut *self.room_cache),
+            &mut *self.room_cache,
         )?;
         Ok(ImportOutcome::default())
     }
@@ -11345,7 +11345,7 @@ impl ImportContext<'_> {
             self.template,
             self.established_collections,
             self.write_state_hamts,
-            Some(&mut *self.room_cache),
+            &mut *self.room_cache,
         )
     }
 
@@ -12012,7 +12012,7 @@ fn import_pdu_events_with_state_hamts(
         template,
         established_collections,
         write_state_hamts,
-        None,
+        &mut ImportRunCache::default(),
     )
 }
 
@@ -12051,7 +12051,7 @@ fn import_pdu_events_with_raw(
         template,
         established_collections,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
 }
 
@@ -12071,7 +12071,7 @@ fn import_pdu_events_with_raw_state_hamts(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
     write_state_hamts: bool,
-    mut room_cache: Option<&mut ImportRunCache>,
+    room_cache: &mut ImportRunCache,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
@@ -12190,12 +12190,9 @@ fn import_pdu_events_with_raw_state_hamts(
     );
     // The run cache carries the direct-path switch so a test can exercise the
     // fast path without mutating a process-global environment variable.
-    let direct = room_cache
-        .as_deref()
-        .map_or_else(direct_import_enabled, |cache| cache.direct);
-    let mut local_cache = ImportRunCache::default();
+    let direct = room_cache.direct;
     let (waiting_hits, stored_events_hint) = if direct && direct_identity && !to_write.is_empty() {
-        let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
+        let cache = &mut *room_cache;
         let waiting = cache.ensure_waiting(
             db,
             store,
@@ -12218,7 +12215,7 @@ fn import_pdu_events_with_raw_state_hamts(
         && !to_write.is_empty()
         && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty())
     {
-        let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
+        let cache = &mut *room_cache;
         match cache.dirty_closure(db, &collection_id, &resolved.canonical_id, &waiting_hits) {
             Ok(ids)
                 if stored_events_hint > 0 && ids.len().saturating_mul(2) > stored_events_hint =>
@@ -12289,7 +12286,8 @@ fn import_pdu_events_with_raw_state_hamts(
     // after the writes, never before: a record that was skipped or rejected by
     // the collision check must stay waiting for a later file.
     if direct && direct_identity {
-        if let Some(cache) = room_cache.as_mut() {
+        {
+            let cache = &mut *room_cache;
             let auth_arrived: HashSet<String> = auth_chain
                 .iter()
                 .filter(|event| template_node_id(template, event).ok().flatten().is_some())
@@ -12357,7 +12355,8 @@ fn import_pdu_events_with_raw_state_hamts(
             repaired_projections,
         )?;
     if direct_handled {
-        if let Some(cache) = room_cache.as_mut() {
+        {
+            let cache = &mut *room_cache;
             cache.rooms.remove(&collection_id);
             cache.direct_files = cache.direct_files.saturating_add(1);
         }
@@ -12370,10 +12369,7 @@ fn import_pdu_events_with_raw_state_hamts(
         // the walk sees the whole room, not just this file. Events written by
         // this file are excluded from the reloaded set: their input copies are
         // authoritative and still carry the unredacted auth fields.
-        let stored_events = match room_cache
-            .as_mut()
-            .and_then(|cache| cache.rooms.remove(&collection_id))
-        {
+        let stored_events = match room_cache.rooms.remove(&collection_id) {
             Some(cached) => cached,
             None => load_collection_events(store, &collection_id, &resolved.canonical_id)?,
         };
@@ -12676,9 +12672,7 @@ fn import_pdu_events_with_raw_state_hamts(
         report_import_phase("verdicts/flags", phase_verdicts.elapsed());
 
         crate::gap_manifest::record_import_gaps(db, &resolved.canonical_id, &all_events, &[])?;
-        if let Some(cache) = room_cache.as_mut() {
-            cache.gap_rooms.insert(resolved.canonical_id.clone());
-        }
+        room_cache.gap_rooms.insert(resolved.canonical_id.clone());
 
         if write_state_hamts {
             let phase_publish = Instant::now();
@@ -12696,7 +12690,8 @@ fn import_pdu_events_with_raw_state_hamts(
         // Keep the room in memory for the next file in this run. Only stored
         // timeline events are cached: auth-chain-only events must not become
         // flags or verdict rows on a later file.
-        if let Some(cache) = room_cache {
+        {
+            let cache = &mut *room_cache;
             let auth_only: HashSet<&str> = auth_chain
                 .iter()
                 .filter_map(event_id)
