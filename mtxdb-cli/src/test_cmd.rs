@@ -1,27 +1,27 @@
 use super::{
     all_verdicts_present, base_is_incomplete, build_event_dag, canonical_column_width,
-    cmd_collections, cmd_flags, cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove,
-    cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync,
-    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
-    decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
-    derive_template_key, direct_import_enabled, display_collection_role, event_id, event_room_id,
-    event_short_id, export_envelope_line, extract_pointer_string, finish_import,
-    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
-    import_data, import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
-    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
-    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
-    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
-    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
-    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    search_record_matches, search_template, split_canonical_display, template_collection_id,
-    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
-    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
-    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import, cmd_import_file,
+    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows,
+    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
+    compile_import_template, compute_state_groups_partial, decode_event_json_record,
+    decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
+    direct_import_enabled, display_collection_role, event_id, event_room_id, event_short_id,
+    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
+    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, json_string,
+    keys_first, listing_shard_types, load_collection_events, load_state_groups,
+    matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
+    meta_checkpoints, meta_lock_line, meta_pools, meta_raw, overlay_auth_projection, pack_identity,
+    parse_federation_input, parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag,
+    prepare_state_collection, pretty_print_payload, raw_auth_projection,
+    raw_auth_projection_collection_id, record_csr_adjacency, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, search_record_matches, search_template,
+    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
+    topological_event_order, valid_json_pointer, valid_state_group_id, verify_auth_chain_edges,
+    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    ImportRunCache, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting,
+    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -11552,4 +11552,54 @@ fn a_prev_already_stored_in_the_room_is_not_recorded_as_a_gap() {
         manifest.is_empty(),
         "a prev the room already holds is not a gap: {manifest:?}"
     );
+}
+
+#[test]
+fn gap_commands_edit_and_list_a_stored_manifest() {
+    use crate::gap_manifest::{self, AnchorBoundary, GapManifest, GapRecord, GapStatus};
+
+    let dir = unique_temp_dir();
+    let room = "!gapcli:test";
+    {
+        let db = Database::open(dir.clone()).unwrap();
+        let mut manifest = GapManifest::default();
+        manifest
+            .gaps
+            .insert("$gap".to_owned(), GapRecord::default());
+        gap_manifest::write(&db, room, &manifest).unwrap();
+    }
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Sync { all: true },
+    };
+    let status = || {
+        let db = Database::open(dir.clone()).unwrap();
+        gap_manifest::read(&db, room).unwrap().gaps["$gap"].status()
+    };
+
+    cmd_gap_list(&cli, room, None, true).unwrap();
+    assert_eq!(status(), GapStatus::Open);
+
+    // An id the manifest does not track is refused, and nothing is created.
+    assert!(cmd_gap_edit(&cli, room, |m| m.waive("$other", "me", "why", 1)).is_err());
+    {
+        let db = Database::open(dir.clone()).unwrap();
+        assert!(!gap_manifest::read(&db, room)
+            .unwrap()
+            .gaps
+            .contains_key("$other"));
+    }
+
+    cmd_gap_edit(&cli, room, |m| m.waive("$gap", "me", "accepted", 2)).unwrap();
+    assert_eq!(status(), GapStatus::Waived);
+    cmd_gap_edit(&cli, room, |m| {
+        m.anchor("$gap", "$e", AnchorBoundary::Before, "state_ids", 3)
+    })
+    .unwrap();
+    assert_eq!(status(), GapStatus::Anchored);
+    cmd_gap_list(&cli, room, Some("anchored"), false).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }

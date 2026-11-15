@@ -347,6 +347,24 @@ pub(crate) enum GapAction {
         run: String,
         report: PathBuf,
     },
+    List {
+        room: String,
+        status: Option<String>,
+        history: bool,
+    },
+    Waive {
+        room: String,
+        gap: String,
+        by: String,
+        reason: String,
+    },
+    Anchor {
+        room: String,
+        gap: String,
+        event: String,
+        after: bool,
+        source: String,
+    },
 }
 
 fn build_cli() -> Command {
@@ -1003,6 +1021,88 @@ fn sub_gaps() -> Command {
                         .help("JSON report emitted by `rezzy federation gap-fill`"),
                 ),
         )
+        .subcommand(
+            Command::new("list")
+                .about("List a room's gaps with their derived status")
+                .arg(gap_room_arg("Room whose gap manifest to list"))
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .value_name("STATUS")
+                        .value_parser(["open", "absent", "waived", "anchored"])
+                        .help("Show only gaps with this derived status"),
+                )
+                .arg(
+                    Arg::new("history")
+                        .long("history")
+                        .action(ArgAction::SetTrue)
+                        .help("Also print every recorded server answer, oldest assessment first"),
+                ),
+        )
+        .subcommand(
+            Command::new("waive")
+                .about("Record a decision not to chase a gap (policy only; the gap stays a gap)")
+                .arg(gap_room_arg("Room whose gap manifest to change"))
+                .arg(gap_id_arg())
+                .arg(
+                    Arg::new("by")
+                        .long("by")
+                        .required(true)
+                        .value_name("WHO")
+                        .help("Who made the decision"),
+                )
+                .arg(
+                    Arg::new("reason")
+                        .long("reason")
+                        .required(true)
+                        .value_name("TEXT")
+                        .help("Why the gap is not being chased"),
+                ),
+        )
+        .subcommand(
+            Command::new("anchor")
+                .about("Record a trusted state reference for a gap")
+                .arg(gap_room_arg("Room whose gap manifest to change"))
+                .arg(gap_id_arg())
+                .arg(
+                    Arg::new("event")
+                        .long("event")
+                        .required(true)
+                        .value_name("EVENT_ID")
+                        .help("The event the reference describes"),
+                )
+                .arg(
+                    Arg::new("boundary")
+                        .long("boundary")
+                        .required(true)
+                        .value_name("before|after")
+                        .value_parser(["before", "after"])
+                        .help("Whether the reference is the state before or after --event (`/state_ids` is before)"),
+                )
+                .arg(
+                    Arg::new("source")
+                        .long("source")
+                        .required(true)
+                        .value_name("TEXT")
+                        .help("Where the state came from, e.g. a server and request"),
+                ),
+        )
+}
+
+fn gap_room_arg(help: &'static str) -> Arg {
+    Arg::new("room")
+        .long("room")
+        .required(true)
+        .value_name("ROOM_ID")
+        .help(help)
+}
+
+fn gap_id_arg() -> Arg {
+    Arg::new("gap")
+        .long("gap")
+        .required(true)
+        .value_name("MISSING_EVENT_ID")
+        .help("The tracked gap (the missing prev event id)")
 }
 
 fn sub_export() -> Command {
@@ -1576,6 +1676,24 @@ fn parse_cli() -> Cli {
                     room: sub.get_one::<String>("room").unwrap().clone(),
                     run: sub.get_one::<String>("run").unwrap().clone(),
                     report: PathBuf::from(sub.get_one::<String>("report").unwrap()),
+                },
+                Some(("list", sub)) => GapAction::List {
+                    room: sub.get_one::<String>("room").unwrap().clone(),
+                    status: sub.get_one::<String>("status").cloned(),
+                    history: sub.get_flag("history"),
+                },
+                Some(("waive", sub)) => GapAction::Waive {
+                    room: sub.get_one::<String>("room").unwrap().clone(),
+                    gap: sub.get_one::<String>("gap").unwrap().clone(),
+                    by: sub.get_one::<String>("by").unwrap().clone(),
+                    reason: sub.get_one::<String>("reason").unwrap().clone(),
+                },
+                Some(("anchor", sub)) => GapAction::Anchor {
+                    room: sub.get_one::<String>("room").unwrap().clone(),
+                    gap: sub.get_one::<String>("gap").unwrap().clone(),
+                    event: sub.get_one::<String>("event").unwrap().clone(),
+                    after: sub.get_one::<String>("boundary").unwrap() == "after",
+                    source: sub.get_one::<String>("source").unwrap().clone(),
                 },
                 _ => unreachable!("subcommand_required enforces a gaps action"),
             },

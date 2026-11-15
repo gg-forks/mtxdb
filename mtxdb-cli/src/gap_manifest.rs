@@ -323,6 +323,90 @@ impl GapManifest {
     }
 }
 
+impl GapStatus {
+    /// The short name used by `gaps list --status`.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::Anchored => "anchored",
+            Self::Waived => "waived",
+            Self::AbsentAmong { .. } => "absent",
+            Self::Open => "open",
+        }
+    }
+
+    /// A one-line description. `absent` always names its servers: it is a
+    /// claim about those sources only.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::AbsentAmong { servers, as_of_ms } => {
+                let named: Vec<&str> = servers.iter().map(String::as_str).collect();
+                format!("absent among {} (as of {as_of_ms} ms)", named.join(", "))
+            }
+            other => other.name().to_owned(),
+        }
+    }
+}
+
+impl GapManifest {
+    /// Record an operator decision not to chase a tracked gap.
+    ///
+    /// A waiver is policy only. It never claims the gap is closed.
+    ///
+    /// # Errors
+    /// Returns an error for a gap the manifest does not track (a waiver never
+    /// creates one) or an empty `by` or `reason`.
+    pub(crate) fn waive(
+        &mut self,
+        gap: &str,
+        by: &str,
+        reason: &str,
+        recorded_at_ms: u64,
+    ) -> Result<()> {
+        if by.is_empty() || reason.is_empty() {
+            bail!("a waiver needs both who made it and why");
+        }
+        let record = self
+            .gaps
+            .get_mut(gap)
+            .with_context(|| format!("{gap} is not a tracked gap in this room"))?;
+        record.waiver = Some(Waiver {
+            by: by.to_owned(),
+            reason: reason.to_owned(),
+            recorded_at_ms,
+        });
+        Ok(())
+    }
+
+    /// Record a trusted state reference for a tracked gap. The boundary is
+    /// required because `/state_ids` for an event is the state *before* it.
+    ///
+    /// # Errors
+    /// Returns an error for an untracked gap or an empty `event_id` or `source`.
+    pub(crate) fn anchor(
+        &mut self,
+        gap: &str,
+        event_id: &str,
+        boundary: AnchorBoundary,
+        source: &str,
+        recorded_at_ms: u64,
+    ) -> Result<()> {
+        if event_id.is_empty() || source.is_empty() {
+            bail!("an anchor needs the event it describes and where the state came from");
+        }
+        let record = self
+            .gaps
+            .get_mut(gap)
+            .with_context(|| format!("{gap} is not a tracked gap in this room"))?;
+        record.anchor = Some(Anchor {
+            event_id: event_id.to_owned(),
+            boundary,
+            source: source.to_owned(),
+            recorded_at_ms,
+        });
+        Ok(())
+    }
+}
+
 /// What an ingest did, so the caller can say what it did and did not do.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct IngestSummary {
@@ -1286,5 +1370,40 @@ mod tests {
             assert!(ingest_report(&mut manifest, &report(bad), "run-2", 6).is_err());
             assert_eq!(manifest, before);
         }
+    }
+
+    #[test]
+    fn waive_and_anchor_need_a_tracked_gap_and_never_create_one() {
+        let mut manifest = tracked(&["$a"]);
+        assert!(manifest.waive("$nope", "me", "why", 1).is_err());
+        assert!(manifest
+            .anchor("$nope", "$e", AnchorBoundary::Before, "src", 1)
+            .is_err());
+        assert!(!manifest.gaps.contains_key("$nope"));
+        assert!(manifest.waive("$a", "", "why", 1).is_err());
+        assert!(manifest.waive("$a", "me", "", 1).is_err());
+        assert!(manifest
+            .anchor("$a", "", AnchorBoundary::After, "src", 1)
+            .is_err());
+        assert_eq!(manifest.gaps["$a"].status(), GapStatus::Open);
+
+        manifest.waive("$a", "me", "accepted", 2).unwrap();
+        assert_eq!(manifest.gaps["$a"].status(), GapStatus::Waived);
+        manifest
+            .anchor("$a", "$e", AnchorBoundary::Before, "state_ids", 3)
+            .unwrap();
+        assert_eq!(manifest.gaps["$a"].status(), GapStatus::Anchored);
+        assert_eq!(
+            manifest.gaps["$a"].anchor.as_ref().unwrap().boundary,
+            AnchorBoundary::Before
+        );
+    }
+
+    #[test]
+    fn a_status_names_the_servers_an_absence_covers() {
+        assert_eq!(GapStatus::Open.describe(), "open");
+        let text = absent(&["a.test", "b.test"], 9).describe();
+        assert!(text.contains("a.test, b.test") && text.starts_with("absent among"));
+        assert_eq!(absent(&["a.test"], 9).name(), "absent");
     }
 }

@@ -313,3 +313,60 @@ fn search_requires_a_term_and_defaults_its_limit() {
     );
     assert_eq!(sub.get_one::<i64>("limit"), Some(&50));
 }
+
+#[test]
+fn gaps_anchor_requires_an_explicit_boundary() {
+    let base = [
+        "mtxdb",
+        "gaps",
+        "anchor",
+        "--room",
+        "!r:t",
+        "--gap",
+        "$g",
+        "--event",
+        "$e",
+        "--source",
+        "state_ids",
+    ];
+    // `/state_ids` is the state before an event, so a missing boundary must be
+    // an error rather than a guessed default.
+    assert!(build_cli().try_get_matches_from(base).is_err());
+    for boundary in ["before", "after"] {
+        let mut args = base.to_vec();
+        args.extend(["--boundary", boundary]);
+        assert!(build_cli().try_get_matches_from(args).is_ok(), "{boundary}");
+    }
+    let mut bad = base.to_vec();
+    bad.extend(["--boundary", "during"]);
+    assert!(build_cli().try_get_matches_from(bad).is_err());
+}
+
+#[test]
+fn gaps_list_status_filter_rejects_unknown_names() {
+    let ok = build_cli().try_get_matches_from([
+        "mtxdb",
+        "gaps",
+        "list",
+        "--room",
+        "!r:t",
+        "--status",
+        "absent",
+        "--history",
+    ]);
+    assert!(ok.is_ok());
+    let bad = build_cli().try_get_matches_from([
+        "mtxdb", "gaps", "list", "--room", "!r:t", "--status", "closed",
+    ]);
+    assert!(
+        bad.is_err(),
+        "there is no closed status: a gap closes only by import"
+    );
+}
+
+#[test]
+fn gaps_waive_needs_who_and_why() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "gaps", "waive", "--room", "!r:t", "--gap", "$g"])
+        .is_err());
+}

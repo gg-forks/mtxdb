@@ -621,6 +621,42 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 cli.require_single_dir("gaps ingest")?;
                 cmd_gap_ingest(cli, room, run, report)
             }
+            GapAction::List {
+                room,
+                status,
+                history,
+            } => {
+                cli.require_single_dir("gaps list")?;
+                cmd_gap_list(cli, room, status.as_deref(), *history)
+            }
+            GapAction::Waive {
+                room,
+                gap,
+                by,
+                reason,
+            } => {
+                cli.require_single_dir("gaps waive")?;
+                cmd_gap_edit(cli, room, |manifest| {
+                    manifest.waive(gap, by, reason, crate::gap_manifest::now_ms())
+                })
+            }
+            GapAction::Anchor {
+                room,
+                gap,
+                event,
+                after,
+                source,
+            } => {
+                cli.require_single_dir("gaps anchor")?;
+                let boundary = if *after {
+                    crate::gap_manifest::AnchorBoundary::After
+                } else {
+                    crate::gap_manifest::AnchorBoundary::Before
+                };
+                cmd_gap_edit(cli, room, |manifest| {
+                    manifest.anchor(gap, event, boundary, source, crate::gap_manifest::now_ms())
+                })
+            }
         },
         Commands::Export {
             collection,
@@ -8882,6 +8918,95 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
             None => format!("{} bytes (undecodable, too short)", data.len()),
         },
     })
+}
+
+/// Apply one edit to a room's manifest and store it.
+fn cmd_gap_edit(
+    cli: &Cli,
+    room: &str,
+    edit: impl FnOnce(&mut crate::gap_manifest::GapManifest) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let db = open_database(layout.root().to_path_buf())
+        .context("opening the database for gap evidence")?;
+    let mut manifest = crate::gap_manifest::read(&db, room)?;
+    edit(&mut manifest)?;
+    crate::gap_manifest::write(&db, room, &manifest)
+}
+
+/// Print a room's gaps with their derived status, optionally filtered.
+fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let db =
+        open_database(layout.root().to_path_buf()).context("opening the database to list gaps")?;
+    let manifest = crate::gap_manifest::read(&db, room)?;
+    let matching: Vec<_> = manifest
+        .gaps
+        .iter()
+        .filter(|(_, record)| status.is_none_or(|wanted| wanted == record.status().name()))
+        .collect();
+    println!("room {room}: {} tracked gap(s)", matching.len());
+    if matching.is_empty() {
+        println!("  no gaps match the requested status");
+        return Ok(());
+    }
+    for (id, record) in matching {
+        let derived = record.status();
+        println!("{id}\t{}", derived.describe());
+        if let Some(waiver) = &record.waiver {
+            println!(
+                "  waiver: by={} at={} reason={:?}",
+                waiver.by, waiver.recorded_at_ms, waiver.reason
+            );
+        }
+        if let Some(anchor) = &record.anchor {
+            let boundary = match anchor.boundary {
+                crate::gap_manifest::AnchorBoundary::Before => "before",
+                crate::gap_manifest::AnchorBoundary::After => "after",
+            };
+            println!(
+                "  anchor: state {boundary} {} from {} at {}",
+                anchor.event_id, anchor.source, anchor.recorded_at_ms
+            );
+        }
+        let latest_seq = record
+            .availability
+            .answers
+            .iter()
+            .map(|answer| answer.seq)
+            .max();
+        if history {
+            for answer in &record.availability.answers {
+                print_gap_answer(answer, "history");
+            }
+        } else if let Some(seq) = latest_seq {
+            for answer in record
+                .availability
+                .answers
+                .iter()
+                .filter(|answer| answer.seq == seq)
+            {
+                print_gap_answer(answer, "latest");
+            }
+        } else {
+            println!("  no server assessment recorded");
+        }
+    }
+    Ok(())
+}
+
+fn print_gap_answer(answer: &crate::gap_manifest::ServerAnswer, label: &str) {
+    println!(
+        "  {label}: seq={} run={} server={} outcome={:?} status={} errcode={}",
+        answer.seq,
+        answer.run,
+        answer.server,
+        answer.kind,
+        answer
+            .status
+            .map_or_else(|| "-".to_owned(), |status| status.to_string()),
+        answer.errcode.as_deref().unwrap_or("-"),
+    );
 }
 
 fn cmd_gap_ingest(cli: &Cli, room: &str, run: &str, report_path: &Path) -> anyhow::Result<()> {
