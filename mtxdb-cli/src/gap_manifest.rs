@@ -324,6 +324,11 @@ pub(crate) fn record_import_gaps(
         .gaps
         .retain(|id, _| !known.contains(id) && !room_holds(db, room_id, id));
     for id in missing {
+        // A prev absent from this batch may already be stored in the room
+        // (an export re-import); that is not a gap.
+        if room_holds(db, room_id, &id) {
+            continue;
+        }
         manifest.gaps.entry(id).or_insert_with(GapRecord::open);
     }
     write(db, room_id, &manifest)

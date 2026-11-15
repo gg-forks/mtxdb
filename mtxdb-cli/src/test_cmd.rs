@@ -11491,3 +11491,64 @@ fn the_import_path_persists_a_gap_and_clears_it_on_repair() {
         "importing the missing event clears its gap"
     );
 }
+
+#[test]
+fn a_prev_already_stored_in_the_room_is_not_recorded_as_a_gap() {
+    let room = "!gapstored:test";
+    let template = default_matrix_import_template();
+    let raw = |id: &str, prev: &str| {
+        raw_event(
+            room,
+            id,
+            "m.room.message",
+            "",
+            r#"{"body":"x"}"#,
+            prev,
+            "[]",
+        )
+    };
+    let a = raw_event(
+        room,
+        "$a",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let b = raw("$b", r#"["$a"]"#);
+    let dir = unique_temp_dir().join("gap_stored");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let mut established = HashSet::new();
+    established.insert(template_collection_id(&template, room));
+    let mut import = |events: &[OwnedValue], name: &str| {
+        let text: String = events.iter().map(|e| e.encode() + "\n").collect();
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut cache = ImportRunCache::default();
+        cmd_import_file(
+            &db,
+            db.event_dag(),
+            db.state().as_ref(),
+            &path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+    };
+    import(&[a], "first.jsonl");
+    // An export carrying only `$b`: its prev is absent from the batch but the
+    // room already stores it. The export path passes just its own events.
+    crate::gap_manifest::record_import_gaps(&db, room, &[b], &[]).unwrap();
+    let manifest = crate::gap_manifest::read(&db, room).unwrap();
+    assert!(
+        manifest.is_empty(),
+        "a prev the room already holds is not a gap: {manifest:?}"
+    );
+}
