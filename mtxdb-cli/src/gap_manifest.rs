@@ -496,8 +496,10 @@ pub(crate) fn summarize(manifest: &GapManifest, gate: PrevGate) -> String {
     }
 
     // Keep the human report's order aligned with the gate's decision order.
-    // Group absence by the assessed server set, and report its newest
-    // timestamp so repeated assessments do not produce duplicate rows.
+    // Group absence by the assessed server set so repeated assessments do not
+    // produce duplicate rows. The gaps in a group may have been assessed at
+    // different times, so the single timestamp is the newest one written as an
+    // upper bound: every assessment behind the row is no later than that.
     for record in manifest.gaps.values() {
         if let GapStatus::AbsentAmong { servers, as_of_ms } = record.status() {
             let (count, newest_as_of) = absent.entry(servers).or_default();
@@ -512,7 +514,7 @@ pub(crate) fn summarize(manifest: &GapManifest, gate: PrevGate) -> String {
     parts.extend(absent.into_iter().map(|(servers, (count, as_of_ms))| {
         let names: Vec<&str> = servers.iter().map(String::as_str).collect();
         format!(
-            "{count} absent among {} (as of {as_of_ms} ms)",
+            "{count} absent among {} (as of ≤ {as_of_ms} ms)",
             names.join(", ")
         )
     }));
@@ -1697,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn room_summary_groups_absence_by_server_set_at_newest_time() {
+    fn room_summary_groups_absence_by_server_set_at_newest_time_as_upper_bound() {
         let mut manifest = tracked(&["$a", "$b"]);
         for (id, run, seq, at_ms) in [("$a", "run-a", 1, 10), ("$b", "run-b", 2, 20)] {
             let mut answer = answer_at("peer.test", run, at_ms, AnswerKind::NotFound);
@@ -1706,7 +1708,7 @@ mod tests {
         }
         assert_eq!(
             summarize(&manifest, PrevGate::Require),
-            "prevs: gapped (2 absent among peer.test (as of 20 ms)); strict check fails"
+            "prevs: gapped (2 absent among peer.test (as of ≤ 20 ms)); strict check fails"
         );
     }
 }
