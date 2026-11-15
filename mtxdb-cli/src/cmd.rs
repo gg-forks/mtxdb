@@ -11333,6 +11333,7 @@ impl ImportContext<'_> {
         )?;
         phases.push(("write records", lap.elapsed()));
         lap = Instant::now();
+        crate::gap_manifest::record_import_gaps(self.db, &export.room_id, &events, &[])?;
         if self.write_state_hamts {
             repair_import_state_groups(
                 self.state_store,
@@ -12496,6 +12497,8 @@ fn import_pdu_events_with_raw_state_hamts(
             );
         }
         report_import_phase("verdicts/flags", phase_verdicts.elapsed());
+
+        crate::gap_manifest::record_import_gaps(db, &resolved.canonical_id, &all_events, &[])?;
 
         if write_state_hamts {
             let phase_publish = Instant::now();

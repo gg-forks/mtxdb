@@ -268,6 +268,18 @@ impl Verdict {
     }
 }
 
+/// Derive the collection holding a room's gap manifest.
+#[must_use]
+pub fn gap_manifest_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_id(b"gap-manifest", room_id)
+}
+
+/// Node id holding a room's gap manifest.
+#[must_use]
+pub fn gap_manifest_node_id() -> [u8; 16] {
+    derive_id(b"manifest", b"gaps")
+}
+
 /// Derive an event record id as the first 16 bytes of the BLAKE3 hash of the
 /// complete event id, including any leading `$` and server name.
 #[must_use]

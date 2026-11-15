@@ -2527,8 +2527,11 @@ fn raw_import_marks_only_missing_parents_as_missing() {
         "only the parent no file supplied is missing"
     );
     assert!(
-        db.server_info().collection_ids().is_empty(),
-        "missing parents are derived from the CSR, not stored"
+        db.server_info()
+            .collection_ids()
+            .iter()
+            .all(|id| *id == mtxdb::interop::gap_manifest_collection_id(FIXTURE_ROOM.as_bytes())),
+        "missing parents are derived from the CSR; only the gap manifest records them"
     );
 }
 
@@ -4237,7 +4240,13 @@ fn raw_import_tracks_missing_parents_across_files() {
     );
     import_raw_events(&db, &template, "!room3", &[late], &[]);
     assert!(missing_parents(&db, &template, "!room3").is_empty());
-    assert_eq!(db.server_info().collection_ids(), Vec::<[u8; 16]>::new());
+    assert!(
+        db.server_info()
+            .collection_ids()
+            .iter()
+            .all(|id| *id == mtxdb::interop::gap_manifest_collection_id(b"!room3")),
+        "only the (now empty) gap manifest collection remains"
+    );
 }
 
 const FEDERATION_FIRST_DOC: &str = r#"{
@@ -11358,4 +11367,127 @@ fn a_hole_punched_room_publishes_only_oracle_groups_and_repairs_to_them() {
             );
         }
     }
+}
+
+#[test]
+fn importing_a_gap_records_it_open_and_clears_it_when_the_event_arrives() {
+    let dir = unique_temp_dir().join("gap_manifest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir).unwrap();
+    let room = "!gaps:test";
+    let message = |id: &str, prev: &str| {
+        raw_event(
+            room,
+            id,
+            "m.room.message",
+            "",
+            r#"{"body":"x"}"#,
+            prev,
+            "[]",
+        )
+    };
+    let child = message("$child", r#"["$missing"]"#);
+
+    crate::gap_manifest::record_import_gaps(&db, room, std::slice::from_ref(&child), &[]).unwrap();
+    let mut manifest = crate::gap_manifest::read(&db, room).unwrap();
+    assert!(
+        manifest.gaps.contains_key("$missing"),
+        "a prev with no event is a recorded gap: {manifest:?}"
+    );
+    assert!(
+        !manifest.gaps["$missing"].availability.is_absent(),
+        "nothing was asked, so the gap is open"
+    );
+
+    // A decision and evidence recorded now must survive a re-import of the
+    // same gap; only a resolved event clears it.
+    manifest.gaps.get_mut("$missing").unwrap().waiver = Some(crate::gap_manifest::Waiver {
+        by: "operator".to_owned(),
+        reason: "accepted".to_owned(),
+        recorded_at_ms: 1,
+    });
+    crate::gap_manifest::write(&db, room, &manifest).unwrap();
+    crate::gap_manifest::record_import_gaps(&db, room, std::slice::from_ref(&child), &[]).unwrap();
+    let reread = crate::gap_manifest::read(&db, room).unwrap();
+    assert!(
+        reread.gaps["$missing"].waiver.is_some(),
+        "a waiver is operator policy and survives a re-import"
+    );
+
+    let missing = message("$missing", "[]");
+    crate::gap_manifest::record_import_gaps(&db, room, &[child, missing], &[]).unwrap();
+    assert!(
+        crate::gap_manifest::read(&db, room).unwrap().is_empty(),
+        "the gap is gone once its event is in the batch"
+    );
+}
+
+#[test]
+fn the_import_path_persists_a_gap_and_clears_it_on_repair() {
+    let room = "!gapimport:test";
+    let template = default_matrix_import_template();
+    let message = |id: &str, prev: &str| {
+        raw_event(
+            room,
+            id,
+            "m.room.message",
+            "",
+            r#"{"body":"x"}"#,
+            prev,
+            "[]",
+        )
+    };
+    let create = raw_event(
+        room,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let a = message("$a", r#"["$create"]"#);
+    let b = message("$b", r#"["$a"]"#);
+    let dir = unique_temp_dir().join("gap_import");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let mut established = HashSet::new();
+    established.insert(template_collection_id(&template, room));
+    let mut import = |events: &[OwnedValue], name: &str| {
+        let mut text = String::new();
+        for event in events {
+            text.push_str(&event.encode());
+            text.push('\n');
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut cache = ImportRunCache::default();
+        cmd_import_file(
+            &db,
+            db.event_dag(),
+            db.state().as_ref(),
+            &path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+    };
+
+    import(&[create, b], "without.jsonl");
+    let manifest = crate::gap_manifest::read(&db, room).unwrap();
+    assert!(
+        manifest.gaps.contains_key("$a"),
+        "the import path records the missing prev: {manifest:?}"
+    );
+
+    import(&[a], "repair.jsonl");
+    assert!(
+        crate::gap_manifest::read(&db, room).unwrap().is_empty(),
+        "importing the missing event clears its gap"
+    );
 }

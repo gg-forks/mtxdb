@@ -2,6 +2,7 @@
 
 mod cmd;
 mod export_import;
+mod gap_manifest;
 mod interchange;
 mod state_hamt;
 mod state_policy;
