@@ -256,6 +256,9 @@ pub(crate) enum Commands {
         template: Option<PathBuf>,
         no_state_hamts: bool,
     },
+    Gaps {
+        action: GapAction,
+    },
     Export {
         collection: String,
         format: String,
@@ -336,6 +339,16 @@ pub(crate) enum PacksAction {
     },
 }
 
+/// Explicit actions over the per-room missing-prev manifest.
+#[derive(Clone)]
+pub(crate) enum GapAction {
+    Ingest {
+        room: String,
+        run: String,
+        report: PathBuf,
+    },
+}
+
 fn build_cli() -> Command {
     global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
         .version(concat!(
@@ -370,6 +383,7 @@ fn build_cli() -> Command {
         .subcommand(sub_reclaim_wal())
         .subcommand(sub_completions())
         .subcommand(sub_import())
+        .subcommand(sub_gaps())
         .subcommand(sub_export())
         .subcommand(sub_packs())
         .subcommand(sub_repack())
@@ -960,6 +974,37 @@ fn sub_import() -> Command {
         )
 }
 
+fn sub_gaps() -> Command {
+    Command::new("gaps")
+        .about("Inspect and record unresolved Matrix prev_events gaps")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("ingest")
+                .about("Record per-server outcomes from a rezzy federation gap-fill report")
+                .arg(
+                    Arg::new("room")
+                        .long("room")
+                        .required(true)
+                        .value_name("ROOM_ID")
+                        .help("Room whose gap manifest receives this report"),
+                )
+                .arg(
+                    Arg::new("run")
+                        .long("run")
+                        .required(true)
+                        .value_name("ASSESSMENT_ID")
+                        .help("Stable label for this gap-fill assessment; reuse it to re-ingest the same report"),
+                )
+                .arg(
+                    Arg::new("report")
+                        .required(true)
+                        .value_name("REPORT.json")
+                        .help("JSON report emitted by `rezzy federation gap-fill`"),
+                ),
+        )
+}
+
 fn sub_export() -> Command {
     Command::new("export")
         .about("Export a collection's records as JSONL to stdout")
@@ -1524,6 +1569,16 @@ fn parse_cli() -> Cli {
             collection: m.get_one::<String>("collection").cloned(),
             template: m.get_one::<String>("template").map(PathBuf::from),
             no_state_hamts: m.get_flag("no-state-hamts"),
+        },
+        Some(("gaps", m)) => Commands::Gaps {
+            action: match m.subcommand() {
+                Some(("ingest", sub)) => GapAction::Ingest {
+                    room: sub.get_one::<String>("room").unwrap().clone(),
+                    run: sub.get_one::<String>("run").unwrap().clone(),
+                    report: PathBuf::from(sub.get_one::<String>("report").unwrap()),
+                },
+                _ => unreachable!("subcommand_required enforces a gaps action"),
+            },
         },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),

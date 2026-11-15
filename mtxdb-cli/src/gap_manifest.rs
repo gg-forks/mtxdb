@@ -41,6 +41,8 @@ const MAX_ANSWERS: usize = 1_024;
 /// What one server said when asked for the missing event by id.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AnswerKind {
+    /// The server returned the event, but mtxdb has not imported it yet.
+    Found,
     /// A definite 404 from that server.
     NotFound,
     /// A 4xx other than 404. The server would not answer, so this says
@@ -55,19 +57,21 @@ pub(crate) enum AnswerKind {
 impl AnswerKind {
     const fn code(self) -> u8 {
         match self {
-            Self::NotFound => 0,
-            Self::Refused => 1,
-            Self::Transient => 2,
-            Self::Unanswered => 3,
+            Self::Found => 0,
+            Self::NotFound => 1,
+            Self::Refused => 2,
+            Self::Transient => 3,
+            Self::Unanswered => 4,
         }
     }
 
     const fn from_code(code: u8) -> Option<Self> {
         match code {
-            0 => Some(Self::NotFound),
-            1 => Some(Self::Refused),
-            2 => Some(Self::Transient),
-            3 => Some(Self::Unanswered),
+            0 => Some(Self::Found),
+            1 => Some(Self::NotFound),
+            2 => Some(Self::Refused),
+            3 => Some(Self::Transient),
+            4 => Some(Self::Unanswered),
             _ => None,
         }
     }
@@ -309,10 +313,6 @@ impl GapManifest {
     /// answer for the server, so duplicate ingestion does not pile up. A
     /// different assessment is appended: older answers stay as history, while
     /// the status reads only the newest assessment.
-    #[allow(
-        dead_code,
-        reason = "used by the gap-evidence command, which is not wired yet"
-    )]
     pub(crate) fn record_answer(&mut self, gap: &str, answer: ServerAnswer) {
         let record = self.gaps.entry(gap.to_owned()).or_default();
         record
@@ -324,10 +324,6 @@ impl GapManifest {
 }
 
 /// What an ingest did, so the caller can say what it did and did not do.
-#[allow(
-    dead_code,
-    reason = "used by the gap-evidence command, which is not wired yet"
-)]
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct IngestSummary {
     /// Tracked gaps that received this run's answers.
@@ -340,10 +336,6 @@ pub(crate) struct IngestSummary {
 }
 
 impl GapManifest {
-    #[allow(
-        dead_code,
-        reason = "used by the gap-evidence command, which is not wired yet"
-    )]
     /// The next assessment position: one past the highest recorded.
     fn next_seq(&self) -> u64 {
         self.gaps
@@ -354,10 +346,6 @@ impl GapManifest {
             .map_or(1, |seq| seq.saturating_add(1))
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the gap-evidence command, which is not wired yet"
-    )]
     /// The position already given to `run`, so re-reading its report cannot
     /// promote it above a newer assessment.
     fn seq_of_run(&self, run: &str) -> Option<u64> {
@@ -368,6 +356,86 @@ impl GapManifest {
             .map(|answer| answer.seq)
             .max()
     }
+}
+
+/// The servers a report says it asked. A report that asked no one assessed
+/// nothing.
+fn parse_queried(report: &OwnedValue) -> Result<BTreeSet<String>> {
+    let queried: BTreeSet<String> = report
+        .get("queried_servers")
+        .and_then(OwnedValue::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .map(|item| item.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+                .collect()
+        })
+        .context("report has no valid `queried_servers`")?;
+    if queried.is_empty() {
+        bail!("report names no queried servers, so nothing was assessed");
+    }
+    Ok(queried)
+}
+
+/// Every `(id, server)` answer a report carries: the still-missing outcomes and
+/// the `resolved` ids. Each must name a queried server and appear once.
+fn parse_outcomes(
+    report: &OwnedValue,
+    queried: &BTreeSet<String>,
+) -> Result<BTreeMap<String, BTreeMap<String, ServerAnswerParts>>> {
+    let mut parsed: BTreeMap<String, BTreeMap<String, ServerAnswerParts>> = BTreeMap::new();
+    let mut insert = |id: &str, server: &str, parts: ServerAnswerParts| -> Result<()> {
+        if !queried.contains(server) {
+            bail!("outcome for {id} names {server}, which the run did not query");
+        }
+        let previous = parsed
+            .entry(id.to_owned())
+            .or_default()
+            .insert(server.to_owned(), parts);
+        if previous.is_some() {
+            bail!("duplicate outcome for {id} on {server}");
+        }
+        Ok(())
+    };
+    let outcomes = report
+        .get("missing_prev_outcomes")
+        .and_then(OwnedValue::as_array)
+        .context("report has no `missing_prev_outcomes`")?;
+    for entry in outcomes {
+        let field = |name: &str| entry.get(name).and_then(OwnedValue::as_str);
+        let id = field("id").context("outcome without an `id`")?;
+        let server = field("server").context("outcome without a `server`")?;
+        let kind = match field("outcome") {
+            Some("not_found") => AnswerKind::NotFound,
+            Some("refused") => AnswerKind::Refused,
+            Some("transient") => AnswerKind::Transient,
+            Some("unanswered") => AnswerKind::Unanswered,
+            other => bail!("outcome for {id} on {server} is not recognized: {other:?}"),
+        };
+        let status = entry
+            .get("status")
+            .and_then(OwnedValue::as_u64)
+            .and_then(|n| u16::try_from(n).ok());
+        insert(
+            id,
+            server,
+            (kind, status, field("errcode").map(str::to_owned)),
+        )?;
+    }
+    let resolved = report
+        .get("resolved")
+        .and_then(OwnedValue::as_array)
+        .context("report has no `resolved` list")?;
+    for entry in resolved {
+        let field = |name: &str| entry.get(name).and_then(OwnedValue::as_str);
+        let id = field("id").context("resolved entry without an `id`")?;
+        let server = field("server").context("resolved entry without a `server`")?;
+        if field("outcome") != Some("found") {
+            bail!("resolved id {id} on {server} does not have outcome `found`");
+        }
+        insert(id, server, (AnswerKind::Found, None, None))?;
+    }
+    Ok(parsed)
 }
 
 /// Record a `rezzy federation gap-fill` report as one assessment named `run`.
@@ -382,10 +450,6 @@ impl GapManifest {
 /// Returns an error for a report without `queried_servers` or
 /// `missing_prev_outcomes`, an outcome from a server the run did not name, a
 /// duplicate or unrecognized outcome, or an empty `run`.
-#[allow(
-    dead_code,
-    reason = "used by the gap-evidence command, which is not wired yet"
-)]
 pub(crate) fn ingest_report(
     manifest: &mut GapManifest,
     report: &OwnedValue,
@@ -395,74 +459,27 @@ pub(crate) fn ingest_report(
     if run.is_empty() {
         bail!("a gap-fill run needs a non-empty label");
     }
-    let strings = |value: &OwnedValue| -> Option<Vec<String>> {
-        value
-            .as_array()?
-            .iter()
-            .map(|item| item.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .collect()
-    };
-    let queried: BTreeSet<String> = report
-        .get("queried_servers")
-        .and_then(strings)
-        .context("report has no valid `queried_servers`")?
-        .into_iter()
-        .collect();
-    if queried.is_empty() {
-        bail!("report names no queried servers, so nothing was assessed");
-    }
-    let outcomes = report
-        .get("missing_prev_outcomes")
-        .and_then(OwnedValue::as_array)
-        .context("report has no `missing_prev_outcomes`")?;
-    let mut parsed: BTreeMap<String, BTreeMap<String, ServerAnswerParts>> = BTreeMap::new();
-    for entry in outcomes {
-        let field = |name: &str| entry.get(name).and_then(OwnedValue::as_str);
-        let id = field("id").context("outcome without an `id`")?;
-        let server = field("server").context("outcome without a `server`")?;
-        if !queried.contains(server) {
-            bail!("outcome for {id} names {server}, which the run did not query");
-        }
-        let kind = match field("outcome") {
-            Some("not_found") => AnswerKind::NotFound,
-            Some("refused") => AnswerKind::Refused,
-            Some("transient") => AnswerKind::Transient,
-            Some("unanswered") => AnswerKind::Unanswered,
-            other => bail!("outcome for {id} on {server} is not recognized: {other:?}"),
-        };
-        let status = entry
-            .get("status")
-            .and_then(OwnedValue::as_u64)
-            .and_then(|n| u16::try_from(n).ok());
-        let errcode = field("errcode").map(str::to_owned);
-        let previous = parsed
-            .entry(id.to_owned())
-            .or_default()
-            .insert(server.to_owned(), (kind, status, errcode));
-        if previous.is_some() {
-            bail!("duplicate outcome for {id} on {server}");
-        }
-    }
-    let resolved = report
-        .get("resolved")
-        .and_then(strings_of_ids)
-        .unwrap_or_default();
+    let queried = parse_queried(report)?;
+    let parsed = parse_outcomes(report, &queried)?;
 
     let seq = manifest
         .seq_of_run(run)
         .unwrap_or_else(|| manifest.next_seq());
     let mut summary = IngestSummary::default();
-    for (id, by_server) in parsed {
-        if !manifest.gaps.contains_key(&id) {
-            summary.untracked.push(id);
-            continue;
+    let reported_ids: BTreeSet<String> = parsed.keys().cloned().collect();
+    for id in &reported_ids {
+        if !manifest.gaps.contains_key(id) {
+            summary.untracked.push(id.clone());
         }
+    }
+    let tracked_ids: Vec<String> = manifest.gaps.keys().cloned().collect();
+    for id in tracked_ids {
+        let by_server = parsed.get(&id);
         for server in &queried {
-            let (kind, status, errcode) =
-                by_server
-                    .get(server)
-                    .cloned()
-                    .unwrap_or((AnswerKind::Unanswered, None, None));
+            let (kind, status, errcode) = by_server
+                .and_then(|by_server| by_server.get(server))
+                .cloned()
+                .unwrap_or((AnswerKind::Unanswered, None, None));
             manifest.record_answer(
                 &id,
                 ServerAnswer {
@@ -478,36 +495,20 @@ pub(crate) fn ingest_report(
         }
         summary.recorded = summary.recorded.saturating_add(1);
     }
-    summary.found_not_yet_imported = resolved
-        .into_iter()
-        .filter(|id| manifest.gaps.contains_key(id))
+    summary.found_not_yet_imported = parsed
+        .iter()
+        .filter(|(id, by_server)| {
+            manifest.gaps.contains_key(*id)
+                && by_server
+                    .values()
+                    .any(|(kind, _, _)| *kind == AnswerKind::Found)
+        })
+        .map(|(id, _)| id.clone())
         .collect();
     Ok(summary)
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the gap-evidence command, which is not wired yet"
-)]
 type ServerAnswerParts = (AnswerKind, Option<u16>, Option<String>);
-
-/// The `id` of each `{id, ...}` entry in a report's `resolved` list.
-#[allow(
-    dead_code,
-    reason = "used by the gap-evidence command, which is not wired yet"
-)]
-fn strings_of_ids(value: &OwnedValue) -> Option<Vec<String>> {
-    value
-        .as_array()?
-        .iter()
-        .map(|entry| {
-            entry
-                .get("id")
-                .and_then(OwnedValue::as_str)
-                .map(str::to_owned)
-        })
-        .collect()
-}
 
 /// Read a room's manifest, or an empty one if none is stored.
 ///
@@ -602,10 +603,6 @@ pub(crate) fn record_import_gaps(
 
 /// Timestamp for a waiver or anchor recorded now.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "used by the gap waiver and anchor commands, which are not wired yet"
-)]
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1157,7 +1154,7 @@ mod tests {
         let summary = ingest_report(
             &mut manifest,
             &report(
-                r#"{"queried_servers":["x.test","y.test"],
+                r#"{"queried_servers":["x.test","y.test"],"resolved":[],
                     "missing_prev_outcomes":[
                       {"id":"$a","server":"x.test","outcome":"not_found","status":404},
                       {"id":"$a","server":"y.test","outcome":"not_found","status":404},
@@ -1243,7 +1240,7 @@ mod tests {
         let mut manifest = tracked(&["$a"]);
         let run = |outcome: &str| {
             report(&format!(
-                r#"{{"queried_servers":["x.test"],"missing_prev_outcomes":[
+                r#"{{"queried_servers":["x.test"],"resolved":[],"missing_prev_outcomes":[
                     {{"id":"$a","server":"x.test","outcome":"{outcome}"}}]}}"#
             ))
         };
@@ -1256,5 +1253,38 @@ mod tests {
         assert_eq!(manifest.gaps["$a"].status(), absent(&["x.test"], 100));
         let bytes = encode(&manifest).unwrap();
         assert_eq!(decode(&bytes).unwrap(), manifest, "seq survives the codec");
+    }
+
+    #[test]
+    fn a_found_id_is_recorded_but_keeps_the_gap_open_and_resolved_is_required() {
+        let mut manifest = tracked(&["$a"]);
+        ingest_report(
+            &mut manifest,
+            &report(
+                r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[],
+                    "resolved":[{"id":"$a","server":"x.test","outcome":"found"}]}"#,
+            ),
+            "run-1",
+            5,
+        )
+        .unwrap();
+        let record = &manifest.gaps["$a"];
+        assert_eq!(record.availability.answers[0].kind, AnswerKind::Found);
+        assert_eq!(
+            record.status(),
+            GapStatus::Open,
+            "found is not absence, and the event is not imported yet"
+        );
+        let before = manifest.clone();
+        for bad in [
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[]}"#,
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[],
+                "resolved":[{"id":"$a","server":"z.test","outcome":"found"}]}"#,
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[],
+                "resolved":[{"id":"$a","server":"x.test","outcome":"not_found"}]}"#,
+        ] {
+            assert!(ingest_report(&mut manifest, &report(bad), "run-2", 6).is_err());
+            assert_eq!(manifest, before);
+        }
     }
 }

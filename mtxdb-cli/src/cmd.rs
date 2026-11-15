@@ -36,7 +36,7 @@ use crate::export_import;
 use crate::interchange::{self, KeyRecord, RoomEvent, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
 use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
-use crate::{Cli, Commands, PacksAction};
+use crate::{Cli, Commands, GapAction, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
 /// Byte width of an STGP state-group instance id (128-bit).
@@ -452,6 +452,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Flags { .. } => "flags",
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
+        Commands::Gaps { .. } => "gaps",
         Commands::Export { .. } => "export",
         Commands::Packs { .. } => "packs",
         Commands::Repack { .. } => "repack",
@@ -615,6 +616,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 *no_state_hamts,
             )
         }
+        Commands::Gaps { action } => match action {
+            GapAction::Ingest { room, run, report } => {
+                cli.require_single_dir("gaps ingest")?;
+                cmd_gap_ingest(cli, room, run, report)
+            }
+        },
         Commands::Export {
             collection,
             format,
@@ -8875,6 +8882,31 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
             None => format!("{} bytes (undecodable, too short)", data.len()),
         },
     })
+}
+
+fn cmd_gap_ingest(cli: &Cli, room: &str, run: &str, report_path: &Path) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let db = open_database(layout.root().to_path_buf())
+        .context("opening the database for gap evidence")?;
+    let report_text = fs::read_to_string(report_path)
+        .with_context(|| format!("reading gap-fill report `{}`", report_path.display()))?;
+    let report = OwnedValue::parse_bytes(report_text.as_bytes())
+        .with_context(|| format!("parsing gap-fill report `{}`", report_path.display()))?;
+    let mut manifest = crate::gap_manifest::read(&db, room)?;
+    let summary = crate::gap_manifest::ingest_report(
+        &mut manifest,
+        &report,
+        run,
+        crate::gap_manifest::now_ms(),
+    )?;
+    crate::gap_manifest::write(&db, room, &manifest)?;
+    println!(
+        "recorded outcomes for {} tracked gap(s); {} found event(s) still need importing; {} report gap(s) are not tracked in this room",
+        summary.recorded,
+        summary.found_not_yet_imported.len(),
+        summary.untracked.len(),
+    );
+    Ok(())
 }
 
 #[allow(
