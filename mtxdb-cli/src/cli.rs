@@ -255,6 +255,8 @@ pub(crate) enum Commands {
         collection: Option<String>,
         template: Option<PathBuf>,
         no_state_hamts: bool,
+        require_complete_prevs: bool,
+        allow_waived_gaps: bool,
     },
     Gaps {
         action: GapAction,
@@ -990,6 +992,24 @@ fn sub_import() -> Command {
                      congruent's v20 migration.",
                 ),
         )
+        .arg(
+            Arg::new("require-complete-prevs")
+                .long("require-complete-prevs")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Fail the import if any room it touches still has an unresolved prev that \
+                     is not anchored. A gap known to be absent on the queried servers still \
+                     fails: absence is evidence, not completion. The failure leaves the \
+                     import marker unwritten.",
+                ),
+        )
+        .arg(
+            Arg::new("allow-waived-gaps")
+                .long("allow-waived-gaps")
+                .action(ArgAction::SetTrue)
+                .requires("require-complete-prevs")
+                .help("With --require-complete-prevs, accept gaps an operator waived"),
+        )
 }
 
 fn sub_gaps() -> Command {
@@ -1669,6 +1689,8 @@ fn parse_cli() -> Cli {
             collection: m.get_one::<String>("collection").cloned(),
             template: m.get_one::<String>("template").map(PathBuf::from),
             no_state_hamts: m.get_flag("no-state-hamts"),
+            require_complete_prevs: m.get_flag("require-complete-prevs"),
+            allow_waived_gaps: m.get_flag("allow-waived-gaps"),
         },
         Some(("gaps", m)) => Commands::Gaps {
             action: match m.subcommand() {

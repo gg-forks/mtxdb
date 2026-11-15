@@ -7504,6 +7504,8 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             collection: None,
             template: None,
             no_state_hamts: false,
+            require_complete_prevs: false,
+            allow_waived_gaps: false,
         },
         Commands::Export {
             collection: "0x00000000000000000000000000000000".to_owned(),
@@ -7780,10 +7782,20 @@ fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
             collection: None,
             template: None,
             no_state_hamts: false,
+            require_complete_prevs: false,
+            allow_waived_gaps: false,
         },
     };
 
-    cmd_import(&cli, &[input], None, None, false).expect("import into a fresh root");
+    cmd_import(
+        &cli,
+        &[input],
+        None,
+        None,
+        false,
+        crate::gap_manifest::PrevGate::Off,
+    )
+    .expect("import into a fresh root");
 
     assert!(
         layout.pool_path(ShardType::EventDag).is_dir(),
@@ -11602,4 +11614,211 @@ fn gap_commands_edit_and_list_a_stored_manifest() {
     assert_eq!(status(), GapStatus::Anchored);
     cmd_gap_list(&cli, room, Some("anchored"), false).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A room export whose `$join` event is missing, leaving a gap in the events
+/// that name it as a prev.
+fn room_export_missing_join() -> String {
+    const JOIN: &str = "$join:test.conduwuit.local";
+    let full = room_export_with_auth();
+    let lines: Vec<&str> = full
+        .lines()
+        .filter(|line| {
+            !(line.contains("\"t\":\"event\"")
+                && line.contains(&format!("\"event_id\":\"{JOIN}\""))
+                && line.contains("\"membership\""))
+        })
+        .collect();
+    let text = lines
+        .iter()
+        .map(|line| line.replace("\"events\":6", "\"events\":5"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    with_valid_content_hashes(&text)
+}
+
+fn import_cli(dir: &std::path::Path) -> Cli {
+    // `mtxdb init` equivalent: the import refuses a directory with no database.
+    drop(DatabaseLayout::open(dir.to_path_buf()).unwrap());
+    Cli {
+        dirs: vec![dir.to_path_buf()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Sync { all: true },
+    }
+}
+
+#[test]
+fn require_complete_prevs_fails_an_export_with_an_open_gap_and_writes_no_marker() {
+    use crate::gap_manifest::PrevGate;
+    let dir = unique_temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("gapped.jsonl");
+    std::fs::write(&input, room_export_missing_join()).unwrap();
+    let cli = import_cli(&dir);
+
+    let err = cmd_import(
+        &cli,
+        std::slice::from_ref(&input),
+        None,
+        None,
+        false,
+        PrevGate::Require,
+    )
+    .expect_err("an open gap must fail the strict import");
+    assert!(
+        format!("{err:#}").contains("--require-complete-prevs"),
+        "{err:#}"
+    );
+    let db = Database::open(dir.clone()).unwrap();
+    assert!(
+        export_import::read_marker(&db).unwrap().is_none(),
+        "a failed strict import must not be marked complete"
+    );
+    let manifest = crate::gap_manifest::read(&db, FIXTURE_ROOM).unwrap();
+    assert!(
+        manifest.gaps.contains_key("$join:test.conduwuit.local"),
+        "the gap is recorded even though the import was refused: {manifest:?}"
+    );
+}
+
+#[test]
+fn without_the_flag_the_same_gapped_export_imports_and_is_marked() {
+    use crate::gap_manifest::PrevGate;
+    let dir = unique_temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("gapped.jsonl");
+    std::fs::write(&input, room_export_missing_join()).unwrap();
+    cmd_import(
+        &import_cli(&dir),
+        &[input],
+        None,
+        None,
+        false,
+        PrevGate::Off,
+    )
+    .expect("the default import records the gap and proceeds");
+    let db = Database::open(dir).unwrap();
+    assert!(export_import::read_marker(&db).unwrap().is_some());
+}
+
+#[test]
+fn the_strict_import_honours_waivers_anchors_and_resolution() {
+    use crate::gap_manifest::{AnchorBoundary, PrevGate};
+    const JOIN: &str = "$join:test.conduwuit.local";
+    let dir = unique_temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let gapped = dir.join("gapped.jsonl");
+    std::fs::write(&gapped, room_export_missing_join()).unwrap();
+    let full = dir.join("full.jsonl");
+    std::fs::write(&full, room_export_with_auth()).unwrap();
+    let cli = import_cli(&dir);
+    let run = |path: &std::path::Path, gate| {
+        cmd_import(&cli, &[path.to_path_buf()], None, None, false, gate)
+    };
+
+    run(&gapped, PrevGate::Off).unwrap();
+    assert!(run(&gapped, PrevGate::Require).is_err());
+
+    cmd_gap_edit(&cli, FIXTURE_ROOM, |m| m.waive(JOIN, "me", "accepted", 1)).unwrap();
+    assert!(
+        run(&gapped, PrevGate::Require).is_err(),
+        "a waived gap fails without --allow-waived-gaps"
+    );
+    run(&gapped, PrevGate::RequireAllowWaived).expect("a waived gap passes with the flag");
+
+    cmd_gap_edit(&cli, FIXTURE_ROOM, |m| {
+        m.anchor(JOIN, "$e", AnchorBoundary::Before, "state_ids", 2)
+    })
+    .unwrap();
+    run(&gapped, PrevGate::Require).expect("an anchored gap passes");
+
+    // The import itself supplies the missing event: the gap is cleared, not
+    // merely accepted.
+    run(&full, PrevGate::Require).expect("a gap the import resolves passes");
+    let db = Database::open(dir).unwrap();
+    assert!(crate::gap_manifest::read(&db, FIXTURE_ROOM)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn the_strict_check_covers_every_room_the_run_touched() {
+    use crate::gap_manifest::{check_complete_prevs, AnchorBoundary, PrevGate};
+    let template = default_matrix_import_template();
+    let dir = unique_temp_dir().join("strict_rooms");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let mut established = HashSet::new();
+    let mut cache = ImportRunCache::default();
+    let rooms = ["!one:test", "!two:test"];
+    for room in rooms {
+        established.insert(template_collection_id(&template, room));
+        let raw = |id: &str, kind: &str, prev: &str| {
+            raw_event(
+                room,
+                id,
+                kind,
+                "",
+                r#"{"room_version":"11","body":"x"}"#,
+                prev,
+                "[]",
+            )
+        };
+        let events = [
+            raw("$create", "m.room.create", "[]"),
+            raw("$b", "m.room.message", r#"["$missing"]"#),
+        ];
+        let text: String = events.iter().map(|e| e.encode() + "\n").collect();
+        let path = dir.join(format!("{room}.jsonl").replace(['!', ':'], "_"));
+        std::fs::write(&path, text).unwrap();
+        cmd_import_file(
+            &db,
+            db.event_dag(),
+            db.state().as_ref(),
+            &path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        cache
+            .gap_rooms
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        rooms,
+        "the raw path records every room it touched"
+    );
+    let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("!one:test") && text.contains("!two:test"),
+        "{text}"
+    );
+
+    // Settling only the first room still fails on the second.
+    let settle = |room: &str| {
+        let mut manifest = crate::gap_manifest::read(&db, room).unwrap();
+        manifest
+            .anchor("$missing", "$e", AnchorBoundary::Before, "state_ids", 1)
+            .unwrap();
+        crate::gap_manifest::write(&db, room, &manifest).unwrap();
+    };
+    settle("!one:test");
+    let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("!two:test") && !text.contains("!one:test"),
+        "{text}"
+    );
+    settle("!two:test");
+    check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap();
 }

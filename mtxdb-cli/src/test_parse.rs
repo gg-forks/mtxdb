@@ -370,3 +370,19 @@ fn gaps_waive_needs_who_and_why() {
         .try_get_matches_from(["mtxdb", "gaps", "waive", "--room", "!r:t", "--gap", "$g"])
         .is_err());
 }
+
+#[test]
+fn allow_waived_gaps_needs_the_strict_flag() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "import", "--allow-waived-gaps", "x.jsonl"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "import",
+            "--require-complete-prevs",
+            "--allow-waived-gaps",
+            "x.jsonl"
+        ])
+        .is_ok());
+}

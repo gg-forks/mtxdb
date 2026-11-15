@@ -427,6 +427,104 @@ impl GapManifest {
     }
 }
 
+/// How strictly an import treats unresolved prevs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrevGate {
+    /// Record gaps and import anyway.
+    Off,
+    /// Fail unless every gap is anchored.
+    Require,
+    /// As `Require`, but an operator-waived gap also passes.
+    RequireAllowWaived,
+}
+
+impl PrevGate {
+    pub(crate) const fn from_flags(require: bool, allow_waived: bool) -> Self {
+        match (require, allow_waived) {
+            (false, _) => Self::Off,
+            (true, false) => Self::Require,
+            (true, true) => Self::RequireAllowWaived,
+        }
+    }
+
+    /// Whether a gap with this derived status is acceptable.
+    ///
+    /// Only an anchor completes state past a gap. `AbsentAmong` is evidence
+    /// about named servers, not completion, so it fails like `Open`. A waiver
+    /// is accepted only when the operator opted in to waived gaps.
+    const fn accepts(self, status: &GapStatus) -> bool {
+        match status {
+            GapStatus::Anchored => true,
+            GapStatus::Waived => matches!(self, Self::RequireAllowWaived),
+            GapStatus::AbsentAmong { .. } | GapStatus::Open => false,
+        }
+    }
+}
+
+/// The gaps in `manifest` that `gate` does not accept.
+fn unaccepted(manifest: &GapManifest, gate: PrevGate) -> Vec<(&str, GapStatus)> {
+    if gate == PrevGate::Off {
+        return Vec::new();
+    }
+    manifest
+        .gaps
+        .iter()
+        .map(|(id, record)| (id.as_str(), record.status()))
+        .filter(|(_, status)| !gate.accepts(status))
+        .collect()
+}
+
+/// Fail an import that leaves a touched room with an unaccepted gap.
+///
+/// Every room in `rooms` is checked, and every failure is reported, not just
+/// the first. Run it after the import has recorded its gaps and before the
+/// import marker is committed.
+///
+/// # Errors
+/// Returns an error naming each room and gap that failed, or a storage error
+/// from reading a manifest.
+pub(crate) fn check_complete_prevs(
+    db: &Database,
+    rooms: &BTreeSet<String>,
+    gate: PrevGate,
+) -> Result<()> {
+    const SHOWN: usize = 5;
+    if gate == PrevGate::Off {
+        return Ok(());
+    }
+    let mut report = Vec::new();
+    for room in rooms {
+        let manifest = read(db, room)?;
+        let failing = unaccepted(&manifest, gate);
+        if failing.is_empty() {
+            continue;
+        }
+        let mut lines = vec![format!("{room}: {} unresolved prev(s)", failing.len())];
+        for (id, status) in failing.iter().take(SHOWN) {
+            lines.push(format!("    {id}: {}", status.describe()));
+        }
+        if failing.len() > SHOWN {
+            lines.push(format!(
+                "    ... and {} more",
+                failing.len().saturating_sub(SHOWN)
+            ));
+        }
+        report.push(lines.join("\n"));
+    }
+    if report.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "--require-complete-prevs: the import leaves gaps that are not anchored{}:\n{}",
+        if gate == PrevGate::RequireAllowWaived {
+            " or waived"
+        } else {
+            " (use --allow-waived-gaps to accept waived ones)"
+        },
+        report.join("\n")
+    )
+}
+
 /// What an ingest did, so the caller can say what it did and did not do.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct IngestSummary {
@@ -1457,5 +1555,35 @@ mod tests {
             assert!(!kind.name().chars().any(char::is_uppercase), "{kind:?}");
         }
         assert_eq!(AnswerKind::NotFound.name(), "not_found");
+    }
+
+    #[test]
+    fn the_gate_accepts_only_anchored_and_optionally_waived_gaps() {
+        let mut manifest = tracked(&["$open", "$absent", "$waived", "$anchored"]);
+        ingest_report(
+            &mut manifest,
+            &report(
+                r#"{"queried_servers":["x.test"],"resolved":[],"missing_prev_outcomes":[
+                    {"id":"$absent","server":"x.test","outcome":"not_found"}]}"#,
+            ),
+            "run",
+            1,
+        )
+        .unwrap();
+        manifest.waive("$waived", "me", "ok", 1).unwrap();
+        manifest
+            .anchor("$anchored", "$e", AnchorBoundary::Before, "src", 1)
+            .unwrap();
+        let ids = |gate| -> Vec<&str> {
+            unaccepted(&manifest, gate)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert!(ids(PrevGate::Off).is_empty());
+        assert_eq!(ids(PrevGate::Require), ["$absent", "$open", "$waived"]);
+        assert_eq!(ids(PrevGate::RequireAllowWaived), ["$absent", "$open"]);
+        assert!(unaccepted(&GapManifest::default(), PrevGate::Require).is_empty());
+        assert_eq!(PrevGate::from_flags(false, true), PrevGate::Off);
     }
 }

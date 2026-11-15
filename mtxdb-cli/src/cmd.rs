@@ -606,6 +606,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             template,
             no_state_hamts,
+            require_complete_prevs,
+            allow_waived_gaps,
         } => {
             cli.require_single_dir("import")?;
             cmd_import(
@@ -614,6 +616,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 collection.as_deref(),
                 template.as_deref(),
                 *no_state_hamts,
+                crate::gap_manifest::PrevGate::from_flags(
+                    *require_complete_prevs,
+                    *allow_waived_gaps,
+                ),
             )
         }
         Commands::Gaps { action } => match action {
@@ -9052,6 +9058,7 @@ fn cmd_import(
     collection_override: Option<&str>,
     template: Option<&Path>,
     no_state_hamts: bool,
+    prev_gate: crate::gap_manifest::PrevGate,
 ) -> anyhow::Result<()> {
     let import_started = Instant::now();
     let setup_started = Instant::now();
@@ -9164,6 +9171,9 @@ fn cmd_import(
             .context("persisting imported signing keys")?;
         report_import_phase("server-info pool sync", sync_started.elapsed());
     }
+    // After this import has recorded its gaps and before the marker is
+    // committed: a failure leaves the database visibly unmarked, not complete.
+    crate::gap_manifest::check_complete_prevs(&db, &run.gap_rooms, prev_gate)?;
     let finish_started = Instant::now();
     finish_import(&db, &run)?;
     report_import_phase("finish marker", finish_started.elapsed());
@@ -9179,6 +9189,8 @@ fn cmd_import(
 /// What the inputs of one `mtxdb import` run amounted to.
 #[derive(Debug)]
 struct ImportRun {
+    /// Rooms whose gap manifest this run updated, for `--require-complete-prevs`.
+    gap_rooms: std::collections::BTreeSet<String>,
     /// Inputs that failed.
     failures: usize,
     /// A keys export wrote into the server-info pool.
@@ -9388,6 +9400,7 @@ fn import_data(
         eprintln!("clearing the import marker: {error:#}");
     }
     let mut run = ImportRun {
+        gap_rooms: std::collections::BTreeSet::new(),
         failures: usize::from(marker_cleared.is_err()),
         server_keys: false,
         exported_events: 0,
@@ -9483,6 +9496,7 @@ fn import_data(
             );
         }
     }
+    run.gap_rooms = std::mem::take(&mut room_cache.gap_rooms);
     let reconciliation_started = Instant::now();
     reconcile_verified_key_observations(db, &mut run);
     report_import_phase(
@@ -10556,6 +10570,9 @@ struct ImportRunCache {
     /// server-info pool, so rooms share one read per server. Cleared when a
     /// keys file is imported.
     server_keys: HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
+    /// Rooms this run recorded gaps for, so `--require-complete-prevs` checks
+    /// every touched room rather than the first.
+    gap_rooms: std::collections::BTreeSet<String>,
 }
 
 impl Default for ImportRunCache {
@@ -10567,6 +10584,7 @@ impl Default for ImportRunCache {
             direct: direct_import_enabled(),
             direct_files: 0,
             server_keys: HashMap::new(),
+            gap_rooms: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -11499,6 +11517,9 @@ impl ImportContext<'_> {
         phases.push(("write records", lap.elapsed()));
         lap = Instant::now();
         crate::gap_manifest::record_import_gaps(self.db, &export.room_id, &events, &[])?;
+        if let Some(cache) = self.room_cache.as_deref_mut() {
+            cache.gap_rooms.insert(export.room_id.clone());
+        }
         if self.write_state_hamts {
             repair_import_state_groups(
                 self.state_store,
@@ -12664,6 +12685,9 @@ fn import_pdu_events_with_raw_state_hamts(
         report_import_phase("verdicts/flags", phase_verdicts.elapsed());
 
         crate::gap_manifest::record_import_gaps(db, &resolved.canonical_id, &all_events, &[])?;
+        if let Some(cache) = room_cache.as_mut() {
+            cache.gap_rooms.insert(resolved.canonical_id.clone());
+        }
 
         if write_state_hamts {
             let phase_publish = Instant::now();
