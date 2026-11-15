@@ -126,6 +126,12 @@ impl Availability {
     }
 
     /// The servers this assessment covered, taken from its answers.
+    ///
+    /// The ingest records one answer per gap for every entry in the report's
+    /// `queried_servers`, using `Unanswered` when the report did not name the
+    /// id. That keeps this set equal to `queried_servers`: a server the latest
+    /// run named but never answered still counts and keeps the gap open, while
+    /// a server dropped from that run stops counting.
     fn servers_in_run(&self, run: &str) -> BTreeSet<String> {
         self.answers
             .iter()
@@ -893,6 +899,32 @@ mod tests {
         manifest.record_answer("$gap", answer_at("a", "run-2", 2, AnswerKind::NotFound));
         assert_eq!(manifest.gaps["$gap"].status(), absent(&["a"], 2));
         assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 2);
+    }
+
+    #[test]
+    fn a_server_dropped_from_the_latest_run_stops_counting() {
+        let mut manifest = GapManifest::default();
+        manifest.record_answer("$gap", answer_at("a", "run-1", 1, AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer_at("b", "run-1", 1, AnswerKind::NotFound));
+        assert_eq!(manifest.gaps["$gap"].status(), absent(&["a", "b"], 1));
+
+        // The newest run asks only `a`; `b`'s stale 404 no longer carries.
+        manifest.record_answer("$gap", answer_at("a", "run-2", 2, AnswerKind::NotFound));
+        assert_eq!(manifest.gaps["$gap"].status(), absent(&["a"], 2));
+    }
+
+    #[test]
+    fn a_server_named_but_unanswered_in_the_latest_run_keeps_the_gap_open() {
+        let mut gap = GapRecord::open();
+        gap.availability.answers = vec![
+            answer_at("a", "run-1", 1, AnswerKind::NotFound),
+            answer_at("b", "run-1", 1, AnswerKind::Unanswered),
+        ];
+        assert_eq!(
+            gap.status(),
+            GapStatus::Open,
+            "a queried server with no answer is not a 404"
+        );
     }
 
     #[test]
