@@ -55,6 +55,12 @@ use crate::layout::{DatabaseLayout, ShardType};
 
 const SEGMENT_MAGIC: [u8; 4] = *b"MCSS";
 const SEGMENT_VERSION: u8 = 1;
+/// Read retries allowed while another process seals segments under a reader.
+///
+/// Writers in this process are excluded by the store lock, so only a foreign
+/// writer can keep moving the segment generation. Bounded so a reader reports
+/// contention instead of spinning forever.
+const MAX_READ_ATTEMPTS: usize = 16;
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".csr";
 const TAIL_FILE: &str = "tail.log";
@@ -67,8 +73,11 @@ const EDGE_SIZE: usize = 4 + 2;
 /// Segment header: magic, version, scope count, record count, payload length.
 const SEGMENT_HEADER: usize = 4 + 1 + 4 + 4 + 4;
 /// One scope index entry: scope, flags, block offset, block length, directory
-/// length. The directory is `(family, owner) -> row`.
-const SCOPE_ENTRY: usize = 16 + 4 + 4 + 4 + 4;
+/// length, directory checksum. The directory is `(family, owner) -> row`.
+///
+/// The directory checksum lets a point read verify the entries it probed
+/// without reading the scope's row data, which each row checksums itself.
+const SCOPE_ENTRY: usize = 16 + 4 + 4 + 4 + 4 + 4;
 /// One directory entry: family, owner, row offset in the data region, row
 /// length, row checksum.
 const DIR_ENTRY: usize = 2 + 4 + 4 + 4 + 4;
@@ -447,7 +456,12 @@ impl CsrStore {
     }
 
     fn read_scope_locked(&self, scope: ScopeId) -> io::Result<ScopeData> {
+        let mut attempts = 0_usize;
         let rows = loop {
+            attempts = attempts.saturating_add(1);
+            if attempts > MAX_READ_ATTEMPTS {
+                return Err(read_contention(&self.dir));
+            }
             let segments = self.segments()?;
             let generation = generation_of(&segments);
             let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
@@ -509,7 +523,12 @@ impl CsrStore {
         for (family, owner) in keys {
             wanted.insert((family.id, *owner));
         }
+        let mut attempts = 0_usize;
         let found = loop {
+            attempts = attempts.saturating_add(1);
+            if attempts > MAX_READ_ATTEMPTS {
+                return Err(read_contention(&self.dir));
+            }
             let segments = self.segments()?;
             let generation = generation_of(&segments);
             let mut found: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
@@ -562,7 +581,12 @@ impl CsrStore {
         scope: ScopeId,
         family: EdgeFamily,
     ) -> io::Result<Vec<(u32, Vec<Edge>)>> {
+        let mut attempts = 0_usize;
         let rows = loop {
+            attempts = attempts.saturating_add(1);
+            if attempts > MAX_READ_ATTEMPTS {
+                return Err(read_contention(&self.dir));
+            }
             let segments = self.segments()?;
             let generation = generation_of(&segments);
             let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
@@ -682,7 +706,12 @@ impl CsrStore {
 
     /// The tail prefix verified under the current segment generation.
     fn tail_valid(&self) -> io::Result<u64> {
+        let mut attempts = 0_usize;
         loop {
+            attempts = attempts.saturating_add(1);
+            if attempts > MAX_READ_ATTEMPTS {
+                return Err(read_contention(&self.dir));
+            }
             let generation = self.segment_generation()?;
             if let Some(valid) = self.with_tail(generation, |tail| tail.valid)? {
                 return Ok(valid);
@@ -786,7 +815,10 @@ fn encode_scope_block(group: &mut ScopeGroup) -> io::Result<(Vec<u8>, Vec<u8>)> 
 }
 
 /// Lay the grouped tail out as one segment file: header, scope index, payload
-/// and a checksum over the index and payload.
+/// and a checksum over the index.
+///
+/// Rows carry their own checksums in the scope directory, so a point read
+/// trusts the bytes it read without touching the rest of the payload.
 fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     let mut index = Vec::with_capacity(groups.len().saturating_mul(SCOPE_ENTRY));
@@ -809,6 +841,7 @@ fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::
                 .map_err(|_| too_large("csr directory too large"))?
                 .to_le_bytes(),
         );
+        index.extend_from_slice(&crc32fast::hash(&directory).to_le_bytes());
         payload.extend_from_slice(&directory);
         payload.extend_from_slice(&data);
     }
@@ -837,10 +870,7 @@ fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::
     );
     file_bytes.extend_from_slice(&index);
     file_bytes.extend_from_slice(&payload);
-    let mut checksum_data = Vec::with_capacity(index.len().saturating_add(payload.len()));
-    checksum_data.extend_from_slice(&index);
-    checksum_data.extend_from_slice(&payload);
-    file_bytes.extend_from_slice(&crc32fast::hash(&checksum_data).to_le_bytes());
+    file_bytes.extend_from_slice(&crc32fast::hash(&index).to_le_bytes());
     Ok(file_bytes)
 }
 
@@ -1074,6 +1104,7 @@ fn apply_segment(
         let block_len = u32::from_le_bytes([entry[24], entry[25], entry[26], entry[27]]) as usize;
         let directory_len =
             u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize;
+        let directory_crc = u32::from_le_bytes([entry[32], entry[33], entry[34], entry[35]]);
         if block_off
             .checked_add(block_len)
             .is_none_or(|end| end > payload_len)
@@ -1089,39 +1120,34 @@ fn apply_segment(
         let data_len = block_len.saturating_sub(directory_len);
         let directory_start = payload_start.saturating_add(block_off);
         file.seek(SeekFrom::Start(directory_start as u64))?;
-        let mut count_bytes = [0u8; BLOCK_COUNT];
-        file.read_exact(&mut count_bytes)?;
-        let count = u32::from_le_bytes(count_bytes) as usize;
+        let mut directory = vec![0u8; directory_len];
+        file.read_exact(&mut directory)?;
+        if crc32fast::hash(&directory) != directory_crc {
+            return Err(corrupt("scope directory checksum mismatch"));
+        }
+        let count = u32::from_le_bytes(
+            directory
+                .get(..BLOCK_COUNT)
+                .ok_or_else(|| corrupt("scope directory is short"))?
+                .try_into()
+                .map_err(|_| corrupt("scope directory is short"))?,
+        ) as usize;
         if BLOCK_COUNT.saturating_add(count.saturating_mul(DIR_ENTRY)) != directory_len {
             return Err(corrupt("scope directory length does not match its count"));
         }
-        let entries_start = directory_start.saturating_add(BLOCK_COUNT);
+        let entries = &directory[BLOCK_COUNT..];
         let data_start = directory_start.saturating_add(directory_len);
         if let Some(wanted) = wanted {
-            // Sorted directory: probe it on disk instead of reading it.
+            // The directory is sorted, so probe it in memory.
             for &(family, owner) in wanted {
-                if let Some((offset, len, crc)) =
-                    find_directory_entry(&mut file, entries_start, count, family, owner)?
-                {
+                if let Some((offset, len, crc)) = find_directory_entry(entries, family, owner) {
                     read_row_at(&mut file, data_start, data_len, offset, len, crc, rows)?;
                 }
             }
         } else if let Some(family) = family {
-            read_family_directory(
-                &mut file,
-                entries_start,
-                count,
-                data_start,
-                data_len,
-                family.id,
-                rows,
-            )?;
+            read_family_directory(&mut file, entries, data_start, data_len, family.id, rows)?;
         } else {
-            read_whole_directory(&mut file, entries_start, count, data_start, data_len, rows)
-                .map_err(|e| match e.kind() {
-                    io::ErrorKind::UnexpectedEof => corrupt("scope directory entry is short"),
-                    _ => e,
-                })?;
+            read_whole_directory(&mut file, entries, data_start, data_len, rows)?;
         }
         return Ok(());
     }
@@ -1135,7 +1161,22 @@ fn segment_error(path: &Path, what: &str) -> io::Error {
     )
 }
 
-/// Open a sealed segment and validate its header, index, payload and length.
+/// The reader lost `MAX_READ_ATTEMPTS` races against a writer that keeps
+/// sealing segments. Reported as `WouldBlock` so a caller may retry.
+fn read_contention(dir: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "csr store {} is sealing continuously; retry the read",
+            dir.display()
+        ),
+    )
+}
+
+/// Open a sealed segment and validate its header, index checksum and length.
+///
+/// The payload is not read here. Each row is checksummed in its directory
+/// entry, so a point read verifies the row it reads instead of the segment.
 fn open_segment(path: &Path) -> io::Result<(File, Vec<u8>, usize, usize)> {
     let corrupt = |what: &str| segment_error(path, what);
     let mut file = File::open(path)?;
@@ -1165,15 +1206,14 @@ fn open_segment(path: &Path) -> io::Result<(File, Vec<u8>, usize, usize)> {
     {
         return Err(corrupt("length does not match file size"));
     }
-    let mut payload = vec![0u8; payload_len];
-    file.read_exact(&mut payload)?;
+    let checksum_at = (payload_start as u64)
+        .checked_add(payload_len as u64)
+        .ok_or_else(|| corrupt("payload overflows"))?;
+    file.seek(SeekFrom::Start(checksum_at))?;
     let mut stored_crc = [0u8; 4];
     file.read_exact(&mut stored_crc)?;
-    let mut checksum_data = Vec::with_capacity(index_bytes.len().saturating_add(payload.len()));
-    checksum_data.extend_from_slice(&index_bytes);
-    checksum_data.extend_from_slice(&payload);
-    if crc32fast::hash(&checksum_data) != u32::from_le_bytes(stored_crc) {
-        return Err(corrupt("index or payload checksum mismatch"));
+    if crc32fast::hash(&index_bytes) != u32::from_le_bytes(stored_crc) {
+        return Err(corrupt("index checksum mismatch"));
     }
     file.seek(SeekFrom::Start(payload_start as u64))?;
     Ok((file, index_bytes, payload_start, payload_len))
@@ -1182,16 +1222,12 @@ fn open_segment(path: &Path) -> io::Result<(File, Vec<u8>, usize, usize)> {
 /// Read every row of one scope directory.
 fn read_whole_directory(
     file: &mut File,
-    entries_start: usize,
-    count: usize,
+    entries: &[u8],
     data_start: usize,
     data_len: usize,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    file.seek(SeekFrom::Start(entries_start as u64))?;
-    let mut directory = vec![0u8; count.saturating_mul(DIR_ENTRY)];
-    file.read_exact(&mut directory)?;
-    for item in directory.as_chunks::<DIR_ENTRY>().0 {
+    for item in entries.as_chunks::<DIR_ENTRY>().0 {
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1210,28 +1246,19 @@ fn read_whole_directory(
     Ok(())
 }
 
-/// Read only the contiguous directory range for `family_id`.
+/// Read every row whose directory entry belongs to `family_id`.
 fn read_family_directory(
     file: &mut File,
-    entries_start: usize,
-    count: usize,
+    entries: &[u8],
     data_start: usize,
     data_len: usize,
     family_id: u16,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    let lower = family_bound(file, entries_start, count, family_id, false)?;
-    let upper = family_bound(file, entries_start, count, family_id, true)?;
-    if lower == upper {
-        return Ok(());
-    }
-    let byte_len = upper.saturating_sub(lower).saturating_mul(DIR_ENTRY);
-    let mut directory = vec![0u8; byte_len];
-    file.seek(SeekFrom::Start(
-        entries_start.saturating_add(lower.saturating_mul(DIR_ENTRY)) as u64,
-    ))?;
-    file.read_exact(&mut directory)?;
-    for item in directory.as_chunks::<DIR_ENTRY>().0 {
+    for item in entries.as_chunks::<DIR_ENTRY>().0 {
+        if le_u16(item, 0) != Some(family_id) {
+            continue;
+        }
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1253,73 +1280,31 @@ fn read_family_directory(
     Ok(())
 }
 
-/// Lower or upper bound of `family_id` in the sorted scope directory.
-fn family_bound(
-    file: &mut File,
-    entries_start: usize,
-    count: usize,
-    family_id: u16,
-    upper: bool,
-) -> io::Result<usize> {
-    let mut low = 0usize;
-    let mut high = count;
-    let mut entry = [0u8; DIR_ENTRY];
-    while low < high {
-        let mid = low.saturating_add(high.saturating_sub(low) / 2);
-        file.seek(SeekFrom::Start(
-            entries_start.saturating_add(mid.saturating_mul(DIR_ENTRY)) as u64,
-        ))?;
-        file.read_exact(&mut entry)?;
-        let current = le_u16(&entry, 0).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "csr directory entry is truncated",
-            )
-        })?;
-        if current < family_id || (upper && current == family_id) {
-            low = mid.saturating_add(1);
-        } else {
-            high = mid;
-        }
-    }
-    Ok(low)
-}
-
-/// Binary-search a sorted directory for one `(family, owner)` entry.
-fn find_directory_entry(
-    file: &mut File,
-    entries_start: usize,
-    count: usize,
-    family: u16,
-    owner: u32,
-) -> io::Result<Option<(usize, usize, u32)>> {
+/// Binary-search a sorted in-memory directory for one `(family, owner)` entry.
+fn find_directory_entry(entries: &[u8], family: u16, owner: u32) -> Option<(usize, usize, u32)> {
     use std::cmp::Ordering;
     let mut low = 0usize;
-    let mut high = count;
-    let mut entry = [0u8; DIR_ENTRY];
+    let mut high = entries.len() / DIR_ENTRY;
     while low < high {
         let mid = low.saturating_add(high.saturating_sub(low) / 2);
-        file.seek(SeekFrom::Start(
-            entries_start.saturating_add(mid.saturating_mul(DIR_ENTRY)) as u64,
-        ))?;
-        file.read_exact(&mut entry)?;
+        let item = &entries[mid.saturating_mul(DIR_ENTRY)..][..DIR_ENTRY];
         let found = (
-            u16::from_le_bytes([entry[0], entry[1]]),
-            u32::from_le_bytes([entry[2], entry[3], entry[4], entry[5]]),
+            u16::from_le_bytes([item[0], item[1]]),
+            u32::from_le_bytes([item[2], item[3], item[4], item[5]]),
         );
         match found.cmp(&(family, owner)) {
             Ordering::Less => low = mid.saturating_add(1),
             Ordering::Greater => high = mid,
             Ordering::Equal => {
-                return Ok(Some((
-                    u32::from_le_bytes([entry[6], entry[7], entry[8], entry[9]]) as usize,
-                    u32::from_le_bytes([entry[10], entry[11], entry[12], entry[13]]) as usize,
-                    u32::from_le_bytes([entry[14], entry[15], entry[16], entry[17]]),
-                )));
+                return Some((
+                    u32::from_le_bytes([item[6], item[7], item[8], item[9]]) as usize,
+                    u32::from_le_bytes([item[10], item[11], item[12], item[13]]) as usize,
+                    u32::from_le_bytes([item[14], item[15], item[16], item[17]]),
+                ));
             }
         }
     }
-    Ok(None)
+    None
 }
 
 fn read_row_at(
