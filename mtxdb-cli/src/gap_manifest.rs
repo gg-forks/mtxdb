@@ -170,14 +170,16 @@ pub(crate) struct GapRecord {
 ///
 /// Order matters. An anchor is the only fact that can complete state past a
 /// gap, so it outranks everything. A waiver is an operator decision, so it
-/// outranks mere evidence. `Absent` says only that the named servers all
-/// answered `404`; it is still a gap and never closes one.
+/// outranks mere evidence. `AbsentAmong` says every recorded attempt, in every
+/// run, answered `404`; it is still a gap and never closes one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GapStatus {
     Anchored,
     Waived,
-    /// Every recorded answer is a definite 404. The set names the servers the
-    /// answer is relative to: it is not a claim that nobody holds the event.
+    /// Every recorded attempt — not just the latest run — is a definite 404.
+    /// The set names the servers those attempts covered. It is not a claim
+    /// that nobody holds the event, and one historical refusal or timeout
+    /// keeps the gap `Open`.
     AbsentAmong(BTreeSet<String>),
     Open,
 }
@@ -728,6 +730,23 @@ mod tests {
             !manifest.gaps["$gap"].availability.is_absent(),
             "an earlier transient still counts, so the gap stays open"
         );
+        assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
+    }
+
+    #[test]
+    fn absence_covers_every_recorded_attempt_not_just_the_latest_run() {
+        let mut manifest = GapManifest::default();
+        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer("b", "run-2", AnswerKind::NotFound));
+        assert_eq!(
+            manifest.gaps["$gap"].status(),
+            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned(), "b".to_owned()])),
+            "the status is over all recorded attempts, across every run"
+        );
+
+        // A refusal in any run keeps the gap open, even though both servers
+        // answered 404 in the runs shown above.
+        manifest.record_answer("$gap", answer("c", "run-3", AnswerKind::Refused));
         assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
     }
 
