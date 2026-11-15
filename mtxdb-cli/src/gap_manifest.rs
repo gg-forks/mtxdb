@@ -92,6 +92,10 @@ pub(crate) struct ServerAnswer {
     /// same report replaces that assessment's answer for the server; a new
     /// assessment adds another record.
     pub(crate) run: String,
+    /// Position of this assessment in ingest order, assigned by the ingest.
+    /// The newest assessment is the highest `seq`, so a backwards clock step
+    /// cannot make an older run current. `recorded_at_ms` breaks ties.
+    pub(crate) seq: u64,
     /// When this answer was recorded, so the newest assessment and the
     /// status's `as_of` can be named without trusting vector order.
     pub(crate) recorded_at_ms: u64,
@@ -118,7 +122,8 @@ impl Availability {
     fn latest_run(&self) -> Option<&str> {
         let mut newest: Option<&ServerAnswer> = None;
         for answer in &self.answers {
-            if newest.is_none_or(|current| answer.recorded_at_ms >= current.recorded_at_ms) {
+            let key = (answer.seq, answer.recorded_at_ms);
+            if newest.is_none_or(|current| key >= (current.seq, current.recorded_at_ms)) {
                 newest = Some(answer);
             }
         }
@@ -318,6 +323,192 @@ impl GapManifest {
     }
 }
 
+/// What an ingest did, so the caller can say what it did and did not do.
+#[allow(
+    dead_code,
+    reason = "used by the gap-evidence command, which is not wired yet"
+)]
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct IngestSummary {
+    /// Tracked gaps that received this run's answers.
+    pub(crate) recorded: usize,
+    /// Ids the report covers that the manifest does not track.
+    pub(crate) untracked: Vec<String>,
+    /// Tracked gaps the report says were found. They stay open until the event
+    /// is imported; a report cannot close a gap.
+    pub(crate) found_not_yet_imported: Vec<String>,
+}
+
+impl GapManifest {
+    #[allow(
+        dead_code,
+        reason = "used by the gap-evidence command, which is not wired yet"
+    )]
+    /// The next assessment position: one past the highest recorded.
+    fn next_seq(&self) -> u64 {
+        self.gaps
+            .values()
+            .flat_map(|record| &record.availability.answers)
+            .map(|answer| answer.seq)
+            .max()
+            .map_or(1, |seq| seq.saturating_add(1))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by the gap-evidence command, which is not wired yet"
+    )]
+    /// The position already given to `run`, so re-reading its report cannot
+    /// promote it above a newer assessment.
+    fn seq_of_run(&self, run: &str) -> Option<u64> {
+        self.gaps
+            .values()
+            .flat_map(|record| &record.availability.answers)
+            .filter(|answer| answer.run == run)
+            .map(|answer| answer.seq)
+            .max()
+    }
+}
+
+/// Record a `rezzy federation gap-fill` report as one assessment named `run`.
+///
+/// Every tracked gap the report covers gets one answer for each server in
+/// `queried_servers`, `Unanswered` where the report names no outcome, so the
+/// assessed set equals what the run actually asked. Only definite answers from
+/// a named server are evidence; omission is not, and `resolved` closes
+/// nothing. The whole report is validated before the manifest is touched.
+///
+/// # Errors
+/// Returns an error for a report without `queried_servers` or
+/// `missing_prev_outcomes`, an outcome from a server the run did not name, a
+/// duplicate or unrecognized outcome, or an empty `run`.
+#[allow(
+    dead_code,
+    reason = "used by the gap-evidence command, which is not wired yet"
+)]
+pub(crate) fn ingest_report(
+    manifest: &mut GapManifest,
+    report: &OwnedValue,
+    run: &str,
+    now_ms: u64,
+) -> Result<IngestSummary> {
+    if run.is_empty() {
+        bail!("a gap-fill run needs a non-empty label");
+    }
+    let strings = |value: &OwnedValue| -> Option<Vec<String>> {
+        value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect()
+    };
+    let queried: BTreeSet<String> = report
+        .get("queried_servers")
+        .and_then(strings)
+        .context("report has no valid `queried_servers`")?
+        .into_iter()
+        .collect();
+    if queried.is_empty() {
+        bail!("report names no queried servers, so nothing was assessed");
+    }
+    let outcomes = report
+        .get("missing_prev_outcomes")
+        .and_then(OwnedValue::as_array)
+        .context("report has no `missing_prev_outcomes`")?;
+    let mut parsed: BTreeMap<String, BTreeMap<String, ServerAnswerParts>> = BTreeMap::new();
+    for entry in outcomes {
+        let field = |name: &str| entry.get(name).and_then(OwnedValue::as_str);
+        let id = field("id").context("outcome without an `id`")?;
+        let server = field("server").context("outcome without a `server`")?;
+        if !queried.contains(server) {
+            bail!("outcome for {id} names {server}, which the run did not query");
+        }
+        let kind = match field("outcome") {
+            Some("not_found") => AnswerKind::NotFound,
+            Some("refused") => AnswerKind::Refused,
+            Some("transient") => AnswerKind::Transient,
+            Some("unanswered") => AnswerKind::Unanswered,
+            other => bail!("outcome for {id} on {server} is not recognized: {other:?}"),
+        };
+        let status = entry
+            .get("status")
+            .and_then(OwnedValue::as_u64)
+            .and_then(|n| u16::try_from(n).ok());
+        let errcode = field("errcode").map(str::to_owned);
+        let previous = parsed
+            .entry(id.to_owned())
+            .or_default()
+            .insert(server.to_owned(), (kind, status, errcode));
+        if previous.is_some() {
+            bail!("duplicate outcome for {id} on {server}");
+        }
+    }
+    let resolved = report
+        .get("resolved")
+        .and_then(strings_of_ids)
+        .unwrap_or_default();
+
+    let seq = manifest
+        .seq_of_run(run)
+        .unwrap_or_else(|| manifest.next_seq());
+    let mut summary = IngestSummary::default();
+    for (id, by_server) in parsed {
+        if !manifest.gaps.contains_key(&id) {
+            summary.untracked.push(id);
+            continue;
+        }
+        for server in &queried {
+            let (kind, status, errcode) =
+                by_server
+                    .get(server)
+                    .cloned()
+                    .unwrap_or((AnswerKind::Unanswered, None, None));
+            manifest.record_answer(
+                &id,
+                ServerAnswer {
+                    server: server.clone(),
+                    run: run.to_owned(),
+                    seq,
+                    recorded_at_ms: now_ms,
+                    kind,
+                    status,
+                    errcode,
+                },
+            );
+        }
+        summary.recorded = summary.recorded.saturating_add(1);
+    }
+    summary.found_not_yet_imported = resolved
+        .into_iter()
+        .filter(|id| manifest.gaps.contains_key(id))
+        .collect();
+    Ok(summary)
+}
+
+#[allow(
+    dead_code,
+    reason = "used by the gap-evidence command, which is not wired yet"
+)]
+type ServerAnswerParts = (AnswerKind, Option<u16>, Option<String>);
+
+/// The `id` of each `{id, ...}` entry in a report's `resolved` list.
+#[allow(
+    dead_code,
+    reason = "used by the gap-evidence command, which is not wired yet"
+)]
+fn strings_of_ids(value: &OwnedValue) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            entry
+                .get("id")
+                .and_then(OwnedValue::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Read a room's manifest, or an empty one if none is stored.
 ///
 /// # Errors
@@ -482,6 +673,7 @@ pub(crate) fn encode(manifest: &GapManifest) -> Result<Vec<u8>> {
         for answer in &record.availability.answers {
             put_str(&mut out, &answer.server)?;
             put_str(&mut out, &answer.run)?;
+            out.extend_from_slice(&answer.seq.to_le_bytes());
             out.extend_from_slice(&answer.recorded_at_ms.to_le_bytes());
             out.push(answer.kind.code());
             match answer.status {
@@ -535,6 +727,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
         for _ in 0..answers {
             let server = reader.string()?;
             let run = reader.string()?;
+            let seq = reader.u64()?;
             let recorded_at_ms = reader.u64()?;
             let kind = AnswerKind::from_code(reader.u8()?)
                 .ok_or_else(|| anyhow::anyhow!("unknown gap answer code"))?;
@@ -547,6 +740,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
             record.availability.answers.push(ServerAnswer {
                 server,
                 run,
+                seq,
                 recorded_at_ms,
                 kind,
                 status,
@@ -678,6 +872,7 @@ mod tests {
         ServerAnswer {
             server: server.to_owned(),
             run: run.to_owned(),
+            seq: 0,
             recorded_at_ms: at_ms,
             kind,
             status: match kind {
@@ -942,5 +1137,124 @@ mod tests {
     fn an_empty_manifest_writes_no_record() {
         let encoded = encode(&GapManifest::default()).unwrap();
         assert!(decode(&encoded).unwrap().is_empty());
+    }
+
+    fn report(json: &str) -> OwnedValue {
+        OwnedValue::parse_bytes(json.as_bytes()).expect("test report is JSON")
+    }
+
+    fn tracked(ids: &[&str]) -> GapManifest {
+        let mut manifest = GapManifest::default();
+        for id in ids {
+            manifest.gaps.insert((*id).to_owned(), GapRecord::open());
+        }
+        manifest
+    }
+
+    #[test]
+    fn ingest_answers_every_queried_server_and_marks_the_unnamed_unanswered() {
+        let mut manifest = tracked(&["$a", "$b"]);
+        let summary = ingest_report(
+            &mut manifest,
+            &report(
+                r#"{"queried_servers":["x.test","y.test"],
+                    "missing_prev_outcomes":[
+                      {"id":"$a","server":"x.test","outcome":"not_found","status":404},
+                      {"id":"$a","server":"y.test","outcome":"not_found","status":404},
+                      {"id":"$b","server":"x.test","outcome":"not_found","status":404}]}"#,
+            ),
+            "run-1",
+            10,
+        )
+        .unwrap();
+        assert_eq!(summary.recorded, 2);
+        assert_eq!(
+            manifest.gaps["$a"].status(),
+            absent(&["x.test", "y.test"], 10)
+        );
+        // y.test was queried but named nothing for $b: that is not a 404.
+        assert_eq!(manifest.gaps["$b"].availability.answers.len(), 2);
+        assert_eq!(manifest.gaps["$b"].status(), GapStatus::Open);
+    }
+
+    #[test]
+    fn a_bad_report_changes_nothing() {
+        let mut manifest = tracked(&["$a"]);
+        let before = manifest.clone();
+        for bad in [
+            // an outcome from a server the run never named
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[
+                {"id":"$a","server":"z.test","outcome":"not_found"}]}"#,
+            // `found` cannot be an answer for a still-missing prev
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[
+                {"id":"$a","server":"x.test","outcome":"found"}]}"#,
+            // duplicate (id, server)
+            r#"{"queried_servers":["x.test"],"missing_prev_outcomes":[
+                {"id":"$a","server":"x.test","outcome":"not_found"},
+                {"id":"$a","server":"x.test","outcome":"transient"}]}"#,
+            r#"{"queried_servers":[],"missing_prev_outcomes":[]}"#,
+            r#"{"missing_prev_outcomes":[]}"#,
+            r#"{"queried_servers":["x.test"]}"#,
+        ] {
+            assert!(
+                ingest_report(&mut manifest, &report(bad), "r", 1).is_err(),
+                "{bad}"
+            );
+            assert_eq!(manifest, before, "{bad}");
+        }
+        assert!(ingest_report(
+            &mut manifest,
+            &report(r#"{"queried_servers":["x"],"missing_prev_outcomes":[]}"#),
+            "",
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_report_never_creates_or_closes_a_gap() {
+        let mut manifest = tracked(&["$a", "$found"]);
+        let summary = ingest_report(
+            &mut manifest,
+            &report(
+                r#"{"queried_servers":["x.test"],
+                    "resolved":[{"id":"$found","server":"x.test","outcome":"found"}],
+                    "missing_prev_outcomes":[
+                      {"id":"$other","server":"x.test","outcome":"not_found"}]}"#,
+            ),
+            "run-1",
+            1,
+        )
+        .unwrap();
+        assert_eq!(summary.untracked, vec!["$other".to_owned()]);
+        assert_eq!(summary.found_not_yet_imported, vec!["$found".to_owned()]);
+        assert!(
+            !manifest.gaps.contains_key("$other"),
+            "ingest creates no gap"
+        );
+        assert!(
+            manifest.gaps.contains_key("$found"),
+            "a found id stays a gap until its event is imported"
+        );
+    }
+
+    #[test]
+    fn ingest_order_beats_the_clock_and_a_re_read_cannot_promote_an_old_run() {
+        let mut manifest = tracked(&["$a"]);
+        let run = |outcome: &str| {
+            report(&format!(
+                r#"{{"queried_servers":["x.test"],"missing_prev_outcomes":[
+                    {{"id":"$a","server":"x.test","outcome":"{outcome}"}}]}}"#
+            ))
+        };
+        ingest_report(&mut manifest, &run("transient"), "old", 900).unwrap();
+        // The clock stepped backwards: the newer assessment has a smaller time.
+        ingest_report(&mut manifest, &run("not_found"), "new", 100).unwrap();
+        assert_eq!(manifest.gaps["$a"].status(), absent(&["x.test"], 100));
+        // Re-reading the old report keeps its place in the order.
+        ingest_report(&mut manifest, &run("transient"), "old", 2000).unwrap();
+        assert_eq!(manifest.gaps["$a"].status(), absent(&["x.test"], 100));
+        let bytes = encode(&manifest).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), manifest, "seq survives the codec");
     }
 }
