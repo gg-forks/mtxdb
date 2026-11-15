@@ -10,6 +10,12 @@
 //! A waiver never makes state authoritative. An anchor always names whether it
 //! supplies the state before or after its event, because `/state_ids` for an
 //! event returns the state *before* it.
+//!
+//! Availability answers are scoped to a run and to the servers actually asked:
+//! `not_found` means "not found on these named servers in this run", never
+//! "nobody has it". A gap-fill report that omits an id because it found the
+//! event is not evidence of anything here. Only the event arriving (in the
+//! import batch or already stored in the room) closes a gap.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,9 +81,18 @@ impl AnswerKind {
 
 /// One server's answer about one gap, kept with the request outcome so a
 /// refusal is not mistaken for absence.
+///
+/// Answers are evidence from a named server in a named run. They are kept
+/// across runs rather than overwritten: a later run that says `404` does not
+/// erase an earlier timeout, so nothing can silently turn an open gap into
+/// absence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ServerAnswer {
     pub(crate) server: String,
+    /// Label for the gap-fill run that produced this answer. Re-reading the
+    /// same report replaces that run's answer for the server; a new run adds
+    /// another record.
+    pub(crate) run: String,
     pub(crate) kind: AnswerKind,
     pub(crate) status: Option<u16>,
     pub(crate) errcode: Option<String>,
@@ -86,8 +101,9 @@ pub(crate) struct ServerAnswer {
 /// What the queried servers said about a gap.
 ///
 /// `Absent` is derived, never stored as an independent claim: it requires at
-/// least one answer and a definite 404 from every server asked. Any refusal,
-/// transient failure or unanswered query leaves the gap open.
+/// least one answer and a definite 404 for every recorded answer. Any refusal,
+/// transient failure or unanswered query — including one from an earlier run —
+/// leaves the gap open.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Availability {
     pub(crate) answers: Vec<ServerAnswer>,
@@ -95,10 +111,6 @@ pub(crate) struct Availability {
 
 impl Availability {
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "read by the strict-import gap check, which is not wired yet"
-    )]
     pub(crate) fn is_absent(&self) -> bool {
         !self.answers.is_empty()
             && self
@@ -157,9 +169,49 @@ pub(crate) struct GapRecord {
     pub(crate) anchor: Option<Anchor>,
 }
 
+/// A gap's state, derived from its records. Never stored: a new answer, a
+/// waiver or an anchor changes it without rewriting a status field.
+///
+/// Order matters. An anchor is the only fact that can complete state past a
+/// gap, so it outranks everything. A waiver is an operator decision, so it
+/// outranks mere evidence. `Absent` says only that the named servers all
+/// answered `404`; it is still a gap and never closes one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GapStatus {
+    Anchored,
+    Waived,
+    /// Every recorded answer is a definite 404. The set names the servers the
+    /// answer is relative to: it is not a claim that nobody holds the event.
+    AbsentAmong(BTreeSet<String>),
+    Open,
+}
+
 impl GapRecord {
     fn open() -> Self {
         Self::default()
+    }
+
+    /// Derive the gap's status. See [`GapStatus`].
+    #[allow(
+        dead_code,
+        reason = "read by the strict-import gap check, which is not wired yet"
+    )]
+    pub(crate) fn status(&self) -> GapStatus {
+        if self.anchor.is_some() {
+            GapStatus::Anchored
+        } else if self.waiver.is_some() {
+            GapStatus::Waived
+        } else if self.availability.is_absent() {
+            GapStatus::AbsentAmong(
+                self.availability
+                    .answers
+                    .iter()
+                    .map(|answer| answer.server.clone())
+                    .collect(),
+            )
+        } else {
+            GapStatus::Open
+        }
     }
 }
 
@@ -175,11 +227,12 @@ impl GapManifest {
         self.gaps.is_empty()
     }
 
-    /// Record a server answer, replacing any earlier answer from that server.
+    /// Record a server answer. Evidence is kept per `(server, run)`.
     ///
-    /// Evidence arrives per run, so the latest answer wins. Only `not_found`
-    /// can make the gap absent; a later refusal or transient failure opens it
-    /// again.
+    /// Re-reading the same run's report replaces that run's answer for the
+    /// server, so duplicate ingestion does not pile up. A different run is
+    /// appended, never substituted: an earlier refusal or timeout still counts
+    /// when absence is derived.
     #[allow(
         dead_code,
         reason = "used by the gap-evidence command, which is not wired yet"
@@ -189,7 +242,7 @@ impl GapManifest {
         record
             .availability
             .answers
-            .retain(|existing| existing.server != answer.server);
+            .retain(|existing| !(existing.server == answer.server && existing.run == answer.run));
         record.availability.answers.push(answer);
     }
 }
@@ -239,8 +292,10 @@ pub(crate) fn write(db: &Database, room_id: &str, manifest: &GapManifest) -> Res
 /// Record the gaps visible in `events` and clear gaps that are now resolved.
 ///
 /// Existing records keep their answers, waiver and anchor; only newly seen
-/// gaps start open. A gap is resolved when its event is in this batch or
-/// already stored in the room.
+/// gaps start open. A gap is resolved only when its event is in this batch or
+/// already stored in the room: a report that says the event was found, or
+/// omits it from a missing list, does not close the gap. Presence in the store
+/// is what lets the state walk resolve the prev.
 ///
 /// # Errors
 /// Propagates storage errors from the read, resolution check and write.
@@ -344,6 +399,7 @@ pub(crate) fn encode(manifest: &GapManifest) -> Result<Vec<u8>> {
         );
         for answer in &record.availability.answers {
             put_str(&mut out, &answer.server)?;
+            put_str(&mut out, &answer.run)?;
             out.push(answer.kind.code());
             match answer.status {
                 Some(status) => {
@@ -395,6 +451,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
         let mut record = GapRecord::default();
         for _ in 0..answers {
             let server = reader.string()?;
+            let run = reader.string()?;
             let kind = AnswerKind::from_code(reader.u8()?)
                 .ok_or_else(|| anyhow::anyhow!("unknown gap answer code"))?;
             let status = match reader.u8()? {
@@ -405,6 +462,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GapManifest> {
             let errcode = reader.opt_string()?;
             record.availability.answers.push(ServerAnswer {
                 server,
+                run,
                 kind,
                 status,
                 errcode,
@@ -531,9 +589,10 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    fn answer(server: &str, kind: AnswerKind) -> ServerAnswer {
+    fn answer(server: &str, run: &str, kind: AnswerKind) -> ServerAnswer {
         ServerAnswer {
             server: server.to_owned(),
+            run: run.to_owned(),
             kind,
             status: Some(404),
             errcode: Some("M_NOT_FOUND".to_owned()),
@@ -542,7 +601,10 @@ mod tests {
 
     fn sample() -> GapManifest {
         let mut manifest = GapManifest::default();
-        manifest.record_answer("$absent", answer("matrix.example", AnswerKind::NotFound));
+        manifest.record_answer(
+            "$absent",
+            answer("matrix.example", "run-1", AnswerKind::NotFound),
+        );
         let absent = manifest.gaps.get_mut("$absent").unwrap();
         absent.waiver = Some(Waiver {
             by: "operator".to_owned(),
@@ -551,8 +613,8 @@ mod tests {
         });
         let mut open = GapRecord::open();
         open.availability.answers = vec![
-            answer("a.example", AnswerKind::NotFound),
-            answer("b.example", AnswerKind::Transient),
+            answer("a.example", "run-1", AnswerKind::NotFound),
+            answer("b.example", "run-1", AnswerKind::Transient),
         ];
         open.anchor = Some(Anchor {
             event_id: "$later".to_owned(),
@@ -577,27 +639,89 @@ mod tests {
     fn absence_requires_a_definite_answer_from_every_server() {
         let mut availability = Availability::default();
         assert!(!availability.is_absent(), "nothing asked is not absence");
-        availability.answers = vec![answer("a", AnswerKind::NotFound)];
+        availability.answers = vec![answer("a", "run-1", AnswerKind::NotFound)];
         assert!(availability.is_absent());
-        availability.answers.push(answer("b", AnswerKind::Refused));
+        availability
+            .answers
+            .push(answer("b", "run-1", AnswerKind::Refused));
         assert!(!availability.is_absent(), "a refusal is not absence");
         availability.answers = vec![
-            answer("a", AnswerKind::NotFound),
-            answer("b", AnswerKind::Transient),
+            answer("a", "run-1", AnswerKind::NotFound),
+            answer("b", "run-1", AnswerKind::Transient),
         ];
         assert!(!availability.is_absent(), "a 5xx is not absence");
-        availability.answers = vec![answer("a", AnswerKind::Unanswered)];
+        availability.answers = vec![answer("a", "run-1", AnswerKind::Unanswered)];
         assert!(!availability.is_absent(), "an unsent query is not absence");
     }
 
     #[test]
-    fn the_latest_answer_from_one_server_wins() {
+    fn a_gap_status_is_derived_from_its_facts_in_priority_order() {
+        let mut gap = GapRecord::open();
+        assert_eq!(gap.status(), GapStatus::Open, "no facts is open");
+
+        gap.availability.answers = vec![answer("a", "run-1", AnswerKind::NotFound)];
+        assert_eq!(
+            gap.status(),
+            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned()])),
+            "an answer and only definite 404s is absent among those servers"
+        );
+
+        gap.availability
+            .answers
+            .push(answer("b", "run-1", AnswerKind::Transient));
+        assert_eq!(
+            gap.status(),
+            GapStatus::Open,
+            "one non-404 leaves the gap open"
+        );
+
+        gap.waiver = Some(Waiver {
+            by: "operator".to_owned(),
+            reason: "accepted".to_owned(),
+            recorded_at_ms: 1,
+        });
+        assert_eq!(
+            gap.status(),
+            GapStatus::Waived,
+            "a waiver outranks availability"
+        );
+
+        gap.anchor = Some(Anchor {
+            event_id: "$later".to_owned(),
+            boundary: AnchorBoundary::Before,
+            source: "snapshot".to_owned(),
+            recorded_at_ms: 2,
+        });
+        assert_eq!(
+            gap.status(),
+            GapStatus::Anchored,
+            "an anchor outranks a waiver"
+        );
+    }
+
+    #[test]
+    fn evidence_is_kept_per_run_and_never_erased_by_a_later_run() {
         let mut manifest = GapManifest::default();
-        manifest.record_answer("$gap", answer("a", AnswerKind::NotFound));
+        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::NotFound));
         assert!(manifest.gaps["$gap"].availability.is_absent());
-        manifest.record_answer("$gap", answer("a", AnswerKind::Transient));
-        assert!(!manifest.gaps["$gap"].availability.is_absent());
+        assert_eq!(
+            manifest.gaps["$gap"].status(),
+            GapStatus::AbsentAmong(BTreeSet::from(["a".to_owned()]))
+        );
+
+        // Re-reading run 1 corrects that run's answer rather than duplicating it.
+        manifest.record_answer("$gap", answer("a", "run-1", AnswerKind::Transient));
         assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 1);
+        assert!(!manifest.gaps["$gap"].availability.is_absent());
+
+        // A later run is appended. Its 404 must not erase run 1's timeout.
+        manifest.record_answer("$gap", answer("a", "run-2", AnswerKind::NotFound));
+        assert_eq!(manifest.gaps["$gap"].availability.answers.len(), 2);
+        assert!(
+            !manifest.gaps["$gap"].availability.is_absent(),
+            "an earlier transient still counts, so the gap stays open"
+        );
+        assert_eq!(manifest.gaps["$gap"].status(), GapStatus::Open);
     }
 
     #[test]
