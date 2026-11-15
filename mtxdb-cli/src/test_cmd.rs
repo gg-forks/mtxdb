@@ -11486,33 +11486,36 @@ fn a_prev_from_another_room_stays_a_gap() {
         ),
     ];
 
-    let import =
-        |db: &Database, dir: &std::path::Path, name: &str, events: &[(&str, OwnedValue)]| {
-            let mut text = String::new();
-            for (_, event) in events {
-                text.push_str(&event.encode());
-                text.push('\n');
-            }
-            let path = dir.join(name);
-            std::fs::write(&path, text).unwrap();
-            let mut established = HashSet::new();
-            let room = events[0].1.get("room_id").and_then(|v| v.as_str()).unwrap();
-            established.insert(template_collection_id(&template, room));
-            cmd_import_file(
-                db,
-                db.event_dag(),
-                db.state().as_ref(),
-                &path,
-                None,
-                &template,
-                &mut established,
-                false,
-                None,
-                true,
-                Some(&mut ImportRunCache::default()),
-            )
-            .unwrap();
-        };
+    let import = |db: &Database,
+                  dir: &std::path::Path,
+                  name: &str,
+                  events: &[(&str, OwnedValue)],
+                  direct: bool| {
+        let mut text = String::new();
+        for (_, event) in events {
+            text.push_str(&event.encode());
+            text.push('\n');
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut established = HashSet::new();
+        let room = events[0].1.get("room_id").and_then(|v| v.as_str()).unwrap();
+        established.insert(template_collection_id(&template, room));
+        cmd_import_file(
+            db,
+            db.event_dag(),
+            db.state().as_ref(),
+            &path,
+            None,
+            &template,
+            &mut established,
+            direct,
+            None,
+            true,
+            Some(&mut ImportRunCache::default()),
+        )
+        .unwrap();
+    };
     let mapped = |db: &Database, ids: &[&str]| {
         let aux = AuxiliaryIndex::open(db.state().as_ref(), STATE_GROUP_NAMESPACE);
         let keys: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes()).collect();
@@ -11523,26 +11526,28 @@ fn a_prev_from_another_room_stays_a_gap() {
             .collect::<Vec<_>>()
     };
 
-    let dir = unique_temp_dir().join("cross_room_prev");
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = Database::open(dir.clone()).unwrap();
-    import(&db, &dir, "room_a.jsonl", &a_events);
-    import(&db, &dir, "room_b.jsonl", &b_events);
+    for direct in [false, true] {
+        let dir = unique_temp_dir().join(format!("cross_room_prev_{direct}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.clone()).unwrap();
+        import(&db, &dir, "room_a.jsonl", &a_events, direct);
+        import(&db, &dir, "room_b.jsonl", &b_events, direct);
 
-    assert_eq!(
-        mapped(&db, &["$a_create", "$a_join", "$a_pl", "$a_topic"]),
-        vec![true, true, true, true],
-        "the other room must keep its own complete state"
-    );
-    assert_eq!(
-        mapped(&db, &["$b_create", "$b_join", "$b_pl"]),
-        vec![true, true, true],
-        "the events before the foreign prev are complete"
-    );
-    assert_eq!(
-        mapped(&db, &["$b_x", "$b_after"]),
-        vec![false, false],
-        "a prev from another room is a gap, so the citing event and its \
-         descendants must stay unmapped"
-    );
+        assert_eq!(
+            mapped(&db, &["$a_create", "$a_join", "$a_pl", "$a_topic"]),
+            vec![true, true, true, true],
+            "direct={direct}: the other room must keep its own complete state"
+        );
+        assert_eq!(
+            mapped(&db, &["$b_create", "$b_join", "$b_pl"]),
+            vec![true, true, true],
+            "direct={direct}: the events before the foreign prev are complete"
+        );
+        assert_eq!(
+            mapped(&db, &["$b_x", "$b_after"]),
+            vec![false, false],
+            "direct={direct}: a prev from another room is a gap, so the citing \
+             event and its descendants must stay unmapped"
+        );
+    }
 }
