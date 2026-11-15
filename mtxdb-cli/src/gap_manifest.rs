@@ -474,21 +474,16 @@ fn unaccepted(manifest: &GapManifest, gate: PrevGate) -> Vec<(&str, GapStatus)> 
         .collect()
 }
 
-/// One line saying whether a room's manifest holds unresolved prevs, and how
-/// each is currently classified.
-///
-/// "No unresolved prevs" is about prevs only: it is what this manifest knows,
-/// not a claim that every other part of the room is verified.
-pub(crate) fn summarize(manifest: &GapManifest) -> String {
+/// One line describing tracked prev-gap history and whether the selected
+/// strict-import gate accepts it. This does not make claims about other room
+/// completeness dimensions such as signatures or auth chains.
+pub(crate) fn summarize(manifest: &GapManifest, gate: PrevGate) -> String {
     if manifest.gaps.is_empty() {
-        return "no unresolved prevs".to_owned();
+        return "prevs: complete (no tracked gaps)".to_owned();
     }
-    let mut counts = [
-        ("open", 0_usize),
-        ("absent", 0),
-        ("waived", 0),
-        ("anchored", 0),
-    ];
+
+    let mut counts = [0_usize; 4];
+    let mut absent = BTreeMap::<String, usize>::new();
     for record in manifest.gaps.values() {
         let index = match record.status() {
             GapStatus::Open => 0,
@@ -496,18 +491,49 @@ pub(crate) fn summarize(manifest: &GapManifest) -> String {
             GapStatus::Waived => 2,
             GapStatus::Anchored => 3,
         };
-        counts[index].1 = counts[index].1.saturating_add(1);
+        counts[index] = counts[index].saturating_add(1);
     }
-    let parts: Vec<String> = counts
-        .iter()
-        .filter(|(_, count)| *count > 0)
-        .map(|(name, count)| format!("{count} {name}"))
-        .collect();
-    format!(
-        "{} tracked prev gap(s): {}",
-        manifest.gaps.len(),
-        parts.join(", "),
-    )
+
+    // Keep the human report's order aligned with the gate's decision order.
+    // Absent entries retain their server scope and assessment timestamp.
+    for record in manifest.gaps.values() {
+        let status = record.status();
+        if let GapStatus::AbsentAmong { .. } = status {
+            let count = absent.entry(status.describe()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    let mut parts = Vec::new();
+    if counts[0] > 0 {
+        parts.push(format!("{} open", counts[0]));
+    }
+    parts.extend(
+        absent
+            .into_iter()
+            .map(|(description, count)| format!("{count} {description}")),
+    );
+    if counts[2] > 0 {
+        parts.push(format!("{} waived", counts[2]));
+    }
+    if counts[3] > 0 {
+        parts.push(format!("{} anchored", counts[3]));
+    }
+
+    let statuses: Vec<GapStatus> = manifest.gaps.values().map(GapRecord::status).collect();
+    let gate_result = match gate {
+        PrevGate::Off => "strict check not requested".to_owned(),
+        _ if statuses.iter().all(|status| gate.accepts(status)) => "strict check passes".to_owned(),
+        _ => "strict check fails".to_owned(),
+    };
+
+    let classification = if counts[0] == 0 && counts[1] == 0 && counts[2] == 0 {
+        format!("gapped history, state known by anchor ({})", counts[3])
+    } else if counts[0] == 0 && counts[1] == 0 && counts[3] == 0 {
+        format!("gapped history, waived by operator ({})", counts[2])
+    } else {
+        format!("gapped ({})", parts.join(", "))
+    };
+    format!("prevs: {classification}; {gate_result}")
 }
 
 /// Print one line per touched room, so an import always says whether it left
@@ -515,9 +541,9 @@ pub(crate) fn summarize(manifest: &GapManifest) -> String {
 ///
 /// # Errors
 /// Returns a storage error from reading a manifest.
-pub(crate) fn report_rooms(db: &Database, rooms: &BTreeSet<String>) -> Result<()> {
+pub(crate) fn report_rooms(db: &Database, rooms: &BTreeSet<String>, gate: PrevGate) -> Result<()> {
     for room in rooms {
-        eprintln!("  {room}: {}", summarize(&read(db, room)?));
+        eprintln!("  {room}: {}", summarize(&read(db, room)?, gate));
     }
     Ok(())
 }
@@ -1636,16 +1662,33 @@ mod tests {
     }
 
     #[test]
-    fn a_room_summary_says_whether_prevs_are_unresolved_and_how_they_stand() {
-        assert_eq!(summarize(&GapManifest::default()), "no unresolved prevs");
+    fn a_room_summary_reports_gap_history_and_the_gate_result() {
+        assert_eq!(
+            summarize(&GapManifest::default(), PrevGate::Require),
+            "prevs: complete (no tracked gaps)"
+        );
         let mut manifest = tracked(&["$a", "$b", "$c"]);
         manifest.waive("$b", "me", "ok", 1).unwrap();
         manifest
             .anchor("$c", "$e", AnchorBoundary::After, "src", 1)
             .unwrap();
         assert_eq!(
-            summarize(&manifest),
-            "3 tracked prev gap(s): 1 open, 1 waived, 1 anchored"
+            summarize(&manifest, PrevGate::Require),
+            "prevs: gapped (1 open, 1 waived, 1 anchored); strict check fails"
+        );
+        let mut anchored = tracked(&["$a"]);
+        anchored
+            .anchor("$a", "$e", AnchorBoundary::Before, "src", 1)
+            .unwrap();
+        assert_eq!(
+            summarize(&anchored, PrevGate::Require),
+            "prevs: gapped history, state known by anchor (1); strict check passes"
+        );
+        let mut waived = tracked(&["$a"]);
+        waived.waive("$a", "me", "ok", 1).unwrap();
+        assert_eq!(
+            summarize(&waived, PrevGate::RequireAllowWaived),
+            "prevs: gapped history, waived by operator (1); strict check passes"
         );
     }
 }
