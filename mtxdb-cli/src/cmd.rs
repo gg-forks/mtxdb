@@ -8945,7 +8945,15 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
         .iter()
         .filter(|(_, record)| status.is_none_or(|wanted| wanted == record.status().name()))
         .collect();
-    println!("room {room}: {} tracked gap(s)", matching.len());
+    if status.is_some() {
+        println!(
+            "room {room}: {} of {} tracked gap(s) match",
+            matching.len(),
+            manifest.gaps.len()
+        );
+    } else {
+        println!("room {room}: {} tracked gap(s)", matching.len());
+    }
     if matching.is_empty() {
         println!("  no gaps match the requested status");
         return Ok(());
@@ -8976,7 +8984,7 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
             .map(|answer| answer.seq)
             .max();
         if history {
-            for answer in &record.availability.answers {
+            for answer in record.availability.history() {
                 print_gap_answer(answer, "history");
             }
         } else if let Some(seq) = latest_seq {
@@ -8997,11 +9005,11 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
 
 fn print_gap_answer(answer: &crate::gap_manifest::ServerAnswer, label: &str) {
     println!(
-        "  {label}: seq={} run={} server={} outcome={:?} status={} errcode={}",
+        "  {label}: seq={} run={} server={} outcome={} status={} errcode={}",
         answer.seq,
         answer.run,
         answer.server,
-        answer.kind,
+        answer.kind.name(),
         answer
             .status
             .map_or_else(|| "-".to_owned(), |status| status.to_string()),

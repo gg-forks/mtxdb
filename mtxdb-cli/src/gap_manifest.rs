@@ -55,6 +55,17 @@ pub(crate) enum AnswerKind {
 }
 
 impl AnswerKind {
+    /// Stable spelling shared with rezzy's gap-fill report.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::NotFound => "not_found",
+            Self::Refused => "refused",
+            Self::Transient => "transient",
+            Self::Unanswered => "unanswered",
+        }
+    }
+
     const fn code(self) -> u8 {
         match self {
             Self::Found => 0,
@@ -121,6 +132,15 @@ pub(crate) struct Availability {
 }
 
 impl Availability {
+    /// Every recorded answer in assessment order: by `seq`, then server. The
+    /// stored order is not meaningful, because re-reading a run moves its
+    /// answers to the end.
+    pub(crate) fn history(&self) -> Vec<&ServerAnswer> {
+        let mut answers: Vec<&ServerAnswer> = self.answers.iter().collect();
+        answers.sort_by(|a, b| (a.seq, &a.server).cmp(&(b.seq, &b.server)));
+        answers
+    }
+
     /// The run label of the newest answer. Ties go to the answer recorded
     /// later, which is the one `record_answer` appended last.
     fn latest_run(&self) -> Option<&str> {
@@ -1405,5 +1425,37 @@ mod tests {
         let text = absent(&["a.test", "b.test"], 9).describe();
         assert!(text.contains("a.test, b.test") && text.starts_with("absent among"));
         assert_eq!(absent(&["a.test"], 9).name(), "absent");
+    }
+
+    #[test]
+    fn history_follows_assessment_order_and_names_match_the_report() {
+        let mut manifest = tracked(&["$a"]);
+        let run = |outcome: &str, server: &str| {
+            report(&format!(
+                r#"{{"queried_servers":["{server}"],"resolved":[],"missing_prev_outcomes":[
+                    {{"id":"$a","server":"{server}","outcome":"{outcome}"}}]}}"#
+            ))
+        };
+        ingest_report(&mut manifest, &run("transient", "x.test"), "old", 1).unwrap();
+        ingest_report(&mut manifest, &run("not_found", "x.test"), "new", 2).unwrap();
+        // Re-reading the old run moves its answer to the end of the stored vector.
+        ingest_report(&mut manifest, &run("transient", "x.test"), "old", 3).unwrap();
+        let runs: Vec<&str> = manifest.gaps["$a"]
+            .availability
+            .history()
+            .iter()
+            .map(|answer| answer.run.as_str())
+            .collect();
+        assert_eq!(runs, ["old", "new"]);
+        for kind in [
+            AnswerKind::Found,
+            AnswerKind::NotFound,
+            AnswerKind::Refused,
+            AnswerKind::Transient,
+            AnswerKind::Unanswered,
+        ] {
+            assert!(!kind.name().chars().any(char::is_uppercase), "{kind:?}");
+        }
+        assert_eq!(AnswerKind::NotFound.name(), "not_found");
     }
 }
