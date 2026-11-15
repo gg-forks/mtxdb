@@ -9480,7 +9480,7 @@ fn import_data(
             signature_checks_enabled,
             run.signature_catalog.as_ref(),
             write_state_hamts,
-            Some(&mut room_cache),
+            &mut room_cache,
         ) {
             Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
@@ -11122,7 +11122,7 @@ fn cmd_import_file(
     signature_checks_enabled: bool,
     signature_catalog: Option<&export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
-    room_cache: Option<&mut ImportRunCache>,
+    room_cache: &mut ImportRunCache,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -11154,7 +11154,7 @@ struct ImportContext<'a> {
     signature_checks_enabled: bool,
     signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
-    room_cache: Option<&'a mut ImportRunCache>,
+    room_cache: &'a mut ImportRunCache,
 }
 
 impl ImportContext<'_> {
@@ -11214,9 +11214,7 @@ impl ImportContext<'_> {
                 let signature_catalog = export_import::SignatureKeyCatalog::from_records(&records);
                 let key_bindings = self.import_keys_export(path, &records)?;
                 // The stored keys just changed; anything remembered is stale.
-                if let Some(cache) = self.room_cache.as_deref_mut() {
-                    cache.server_keys.clear();
-                }
+                self.room_cache.server_keys.clear();
                 Ok(ImportOutcome {
                     server_keys: true,
                     signature_catalog: Some(signature_catalog),
@@ -11235,11 +11233,7 @@ impl ImportContext<'_> {
         &mut self,
         export: &interchange::RoomExport,
     ) -> anyhow::Result<export_import::SignatureKeyCatalog> {
-        let mut unshared = HashMap::new();
-        let memo = match self.room_cache.as_deref_mut() {
-            Some(cache) => &mut cache.server_keys,
-            None => &mut unshared,
-        };
+        let memo = &mut self.room_cache.server_keys;
         export_import::SignatureKeyCatalog::read_for_room(self.db.server_info(), export, memo)
             .with_context(|| format!("reading signing keys needed by {}", export.room_id))
     }
@@ -11279,7 +11273,7 @@ impl ImportContext<'_> {
             self.template,
             self.established_collections,
             self.write_state_hamts,
-            self.room_cache.as_deref_mut(),
+            Some(&mut *self.room_cache),
         )?;
         Ok(ImportOutcome::default())
     }
@@ -11351,7 +11345,7 @@ impl ImportContext<'_> {
             self.template,
             self.established_collections,
             self.write_state_hamts,
-            self.room_cache.as_deref_mut(),
+            Some(&mut *self.room_cache),
         )
     }
 
@@ -11383,10 +11377,7 @@ impl ImportContext<'_> {
         record_csr_adjacency(self.db, self.template, auth_chain)?;
         let (by_collection, skipped) =
             group_auth_chain(auth_chain, self.template, detected_collection)?;
-        let direct = self
-            .room_cache
-            .as_deref()
-            .map_or_else(direct_import_enabled, |cache| cache.direct);
+        let direct = self.room_cache.direct;
         let direct_identity = matches!(
             &self.template.record_id_rule.policy,
             FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
@@ -11409,20 +11400,18 @@ impl ImportContext<'_> {
                 entries,
             )?);
             if direct && direct_identity {
-                if let Some(cache) = self.room_cache.as_deref_mut() {
-                    let timeline_collection = template_collection_id(self.template, &room_id);
-                    cache.observe_written(
-                        self.db,
-                        self.store,
-                        self.state_store,
-                        self.template,
-                        &timeline_collection,
-                        &room_id,
-                        &HashSet::new(),
-                        &auth_arrived,
-                        events_by_room.get(&room_id).into_iter().flatten().copied(),
-                    )?;
-                }
+                let timeline_collection = template_collection_id(self.template, &room_id);
+                self.room_cache.observe_written(
+                    self.db,
+                    self.store,
+                    self.state_store,
+                    self.template,
+                    &timeline_collection,
+                    &room_id,
+                    &HashSet::new(),
+                    &auth_arrived,
+                    events_by_room.get(&room_id).into_iter().flatten().copied(),
+                )?;
             }
         }
         auth_store.sync_all()?;
@@ -11521,9 +11510,7 @@ impl ImportContext<'_> {
         phases.push(("write records", lap.elapsed()));
         lap = Instant::now();
         crate::gap_manifest::record_import_gaps(self.db, &export.room_id, &events, &[])?;
-        if let Some(cache) = self.room_cache.as_deref_mut() {
-            cache.gap_rooms.insert(export.room_id.clone());
-        }
+        self.room_cache.gap_rooms.insert(export.room_id.clone());
         if self.write_state_hamts {
             repair_import_state_groups(
                 self.state_store,

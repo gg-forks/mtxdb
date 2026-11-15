@@ -483,19 +483,30 @@ pub(crate) fn summarize(manifest: &GapManifest) -> String {
     if manifest.gaps.is_empty() {
         return "no unresolved prevs".to_owned();
     }
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut counts = [
+        ("open", 0_usize),
+        ("absent", 0),
+        ("waived", 0),
+        ("anchored", 0),
+    ];
     for record in manifest.gaps.values() {
-        let count = counts.entry(record.status().name()).or_insert(0);
-        *count = count.saturating_add(1);
+        let index = match record.status() {
+            GapStatus::Open => 0,
+            GapStatus::AbsentAmong { .. } => 1,
+            GapStatus::Waived => 2,
+            GapStatus::Anchored => 3,
+        };
+        counts[index].1 = counts[index].1.saturating_add(1);
     }
     let parts: Vec<String> = counts
         .iter()
+        .filter(|(_, count)| *count > 0)
         .map(|(name, count)| format!("{count} {name}"))
         .collect();
     format!(
-        "{} unresolved prev(s): {}",
+        "{} tracked prev gap(s): {}",
         manifest.gaps.len(),
-        parts.join(", ")
+        parts.join(", "),
     )
 }
 
@@ -1634,7 +1645,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             summarize(&manifest),
-            "3 unresolved prev(s): 1 anchored, 1 open, 1 waived"
+            "3 tracked prev gap(s): 1 open, 1 waived, 1 anchored"
         );
     }
 }

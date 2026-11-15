@@ -2843,7 +2843,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
 
@@ -3016,7 +3016,7 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
 
@@ -3042,7 +3042,7 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
 
@@ -3074,7 +3074,7 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
 
@@ -3215,7 +3215,7 @@ fn direct_import_runs_when_a_new_event_has_an_auth_projection() {
         false,
         None,
         true,
-        Some(&mut cache),
+        &mut cache,
     )
     .unwrap();
 
@@ -3232,7 +3232,7 @@ fn direct_import_runs_when_a_new_event_has_an_auth_projection() {
         false,
         None,
         true,
-        Some(&mut cache),
+        &mut cache,
     )
     .unwrap();
 
@@ -3289,7 +3289,7 @@ fn auth_only_federation_document_updates_the_waiting_set() {
         false,
         None,
         true,
-        Some(&mut cache),
+        &mut cache,
     )
     .unwrap();
 
@@ -3380,7 +3380,7 @@ fn direct_import_leaves_a_gapped_append_unmapped() {
         false,
         None,
         true,
-        Some(&mut cache),
+        &mut cache,
     )
     .unwrap();
 
@@ -3396,7 +3396,7 @@ fn direct_import_leaves_a_gapped_append_unmapped() {
         false,
         None,
         true,
-        Some(&mut cache),
+        &mut cache,
     )
     .unwrap();
     assert_eq!(
@@ -3563,7 +3563,7 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
                     false,
                     None,
                     true,
-                    Some(cache),
+                    cache,
                 )
                 .unwrap();
             };
@@ -3861,7 +3861,7 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
                     false,
                     None,
                     true,
-                    Some(&mut cache),
+                    &mut cache,
                 )
                 .unwrap();
             }
@@ -4303,7 +4303,7 @@ fn raw_import_derives_missing_parents_for_federation_documents() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -4327,7 +4327,7 @@ fn raw_import_derives_missing_parents_for_federation_documents() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -5257,7 +5257,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-state");
@@ -5275,7 +5275,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -5338,7 +5338,7 @@ fn import_establishment_persists_the_matrix_extension() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -5709,7 +5709,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -5747,7 +5747,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -5787,7 +5787,7 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
 
@@ -6645,7 +6645,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         false,
         None,
         true,
-        None,
+        &mut ImportRunCache::default(),
     )
     .unwrap();
     db.state().sync_all().unwrap();
@@ -11306,7 +11306,7 @@ fn a_hole_punched_room_publishes_only_oracle_groups_and_repairs_to_them() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
     };
@@ -11486,7 +11486,7 @@ fn the_import_path_persists_a_gap_and_clears_it_on_repair() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
     };
@@ -11551,7 +11551,7 @@ fn a_prev_already_stored_in_the_room_is_not_recorded_as_a_gap() {
             false,
             None,
             true,
-            Some(&mut cache),
+            &mut cache,
         )
         .unwrap();
     };
@@ -11714,29 +11714,53 @@ fn the_strict_import_honours_waivers_anchors_and_resolution() {
     let full = dir.join("full.jsonl");
     std::fs::write(&full, room_export_with_auth()).unwrap();
     let cli = import_cli(&dir);
-    let run = |path: &std::path::Path, gate| {
-        cmd_import(&cli, &[path.to_path_buf()], None, None, false, gate)
+    let run = |path: &std::path::Path, no_state_hamts, gate| {
+        cmd_import(
+            &cli,
+            &[path.to_path_buf()],
+            None,
+            None,
+            no_state_hamts,
+            gate,
+        )
     };
 
-    run(&gapped, PrevGate::Off).unwrap();
-    assert!(run(&gapped, PrevGate::Require).is_err());
+    run(&gapped, false, PrevGate::Off).unwrap();
+    assert!(run(&gapped, true, PrevGate::Require).is_err());
+
+    // An all-404 assessment is still an unresolved gap, not a completion.
+    let db = Database::open(dir.clone()).unwrap();
+    let mut manifest = crate::gap_manifest::read(&db, FIXTURE_ROOM).unwrap();
+    crate::gap_manifest::ingest_report(
+        &mut manifest,
+        &owned_value(
+            r#"{"queried_servers":["peer.test"],"resolved":[],"missing_prev_outcomes":[
+                {"id":"$join:test.conduwuit.local","server":"peer.test","outcome":"not_found","status":404}] }"#,
+        ),
+        "all-404",
+        10,
+    )
+    .unwrap();
+    crate::gap_manifest::write(&db, FIXTURE_ROOM, &manifest).unwrap();
+    drop(db);
+    assert!(run(&gapped, false, PrevGate::Require).is_err());
 
     cmd_gap_edit(&cli, FIXTURE_ROOM, |m| m.waive(JOIN, "me", "accepted", 1)).unwrap();
     assert!(
-        run(&gapped, PrevGate::Require).is_err(),
+        run(&gapped, false, PrevGate::Require).is_err(),
         "a waived gap fails without --allow-waived-gaps"
     );
-    run(&gapped, PrevGate::RequireAllowWaived).expect("a waived gap passes with the flag");
+    run(&gapped, false, PrevGate::RequireAllowWaived).expect("a waived gap passes with the flag");
 
     cmd_gap_edit(&cli, FIXTURE_ROOM, |m| {
         m.anchor(JOIN, "$e", AnchorBoundary::Before, "state_ids", 2)
     })
     .unwrap();
-    run(&gapped, PrevGate::Require).expect("an anchored gap passes");
+    run(&gapped, false, PrevGate::Require).expect("an anchored gap passes");
 
     // The import itself supplies the missing event: the gap is cleared, not
     // merely accepted.
-    run(&full, PrevGate::Require).expect("a gap the import resolves passes");
+    run(&full, false, PrevGate::Require).expect("a gap the import resolves passes");
     let db = Database::open(dir).unwrap();
     assert!(crate::gap_manifest::read(&db, FIXTURE_ROOM)
         .unwrap()
@@ -11747,78 +11771,84 @@ fn the_strict_import_honours_waivers_anchors_and_resolution() {
 fn the_strict_check_covers_every_room_the_run_touched() {
     use crate::gap_manifest::{check_complete_prevs, AnchorBoundary, PrevGate};
     let template = default_matrix_import_template();
-    let dir = unique_temp_dir().join("strict_rooms");
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = Database::open(dir.clone()).unwrap();
-    let mut established = HashSet::new();
-    let mut cache = ImportRunCache::default();
-    let rooms = ["!one:test", "!two:test"];
-    for room in rooms {
-        established.insert(template_collection_id(&template, room));
-        let raw = |id: &str, kind: &str, prev: &str| {
-            raw_event(
-                room,
-                id,
-                kind,
-                "",
-                r#"{"room_version":"11","body":"x"}"#,
-                prev,
-                "[]",
-            )
+    for direct in [false, true] {
+        let dir = unique_temp_dir().join(format!("strict_rooms_{direct}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.clone()).unwrap();
+        let mut established = HashSet::new();
+        let mut cache = ImportRunCache {
+            direct,
+            ..ImportRunCache::default()
         };
-        let events = [
-            raw("$create", "m.room.create", "[]"),
-            raw("$b", "m.room.message", r#"["$missing"]"#),
-        ];
-        let text: String = events.iter().map(|e| e.encode() + "\n").collect();
-        let path = dir.join(format!("{room}.jsonl").replace(['!', ':'], "_"));
-        std::fs::write(&path, text).unwrap();
-        cmd_import_file(
-            &db,
-            db.event_dag(),
-            db.state().as_ref(),
-            &path,
-            None,
-            &template,
-            &mut established,
-            false,
-            None,
-            true,
-            Some(&mut cache),
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        cache
-            .gap_rooms
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        rooms,
-        "the raw path records every room it touched"
-    );
-    let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(
-        text.contains("!one:test") && text.contains("!two:test"),
-        "{text}"
-    );
-
-    // Settling only the first room still fails on the second.
-    let settle = |room: &str| {
-        let mut manifest = crate::gap_manifest::read(&db, room).unwrap();
-        manifest
-            .anchor("$missing", "$e", AnchorBoundary::Before, "state_ids", 1)
+        let rooms = ["!one:test", "!two:test"];
+        for room in rooms {
+            established.insert(template_collection_id(&template, room));
+            let raw = |id: &str, kind: &str, prev: &str| {
+                raw_event(
+                    room,
+                    id,
+                    kind,
+                    "",
+                    r#"{"room_version":"11","body":"x"}"#,
+                    prev,
+                    "[]",
+                )
+            };
+            let events = [
+                raw("$create", "m.room.create", "[]"),
+                raw("$b", "m.room.message", r#"["$missing"]"#),
+            ];
+            let text: String = events.iter().map(|e| e.encode() + "\n").collect();
+            let path = dir.join(format!("{room}.jsonl").replace(['!', ':'], "_"));
+            std::fs::write(&path, text).unwrap();
+            cmd_import_file(
+                &db,
+                db.event_dag(),
+                db.state().as_ref(),
+                &path,
+                None,
+                &template,
+                &mut established,
+                false,
+                None,
+                true,
+                &mut cache,
+            )
             .unwrap();
-        crate::gap_manifest::write(&db, room, &manifest).unwrap();
-    };
-    settle("!one:test");
-    let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(
-        text.contains("!two:test") && !text.contains("!one:test"),
-        "{text}"
-    );
-    settle("!two:test");
-    check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap();
+        }
+        assert_eq!(
+            cache
+                .gap_rooms
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            rooms,
+            "the raw path records every room it touched (direct={direct})"
+        );
+        let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("!one:test") && text.contains("!two:test"),
+            "direct={direct}: {text}"
+        );
+
+        // Settling only the first room still fails on the second.
+        let settle = |room: &str| {
+            let mut manifest = crate::gap_manifest::read(&db, room).unwrap();
+            manifest
+                .anchor("$missing", "$e", AnchorBoundary::Before, "state_ids", 1)
+                .unwrap();
+            crate::gap_manifest::write(&db, room, &manifest).unwrap();
+        };
+        settle("!one:test");
+        let err = check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("!two:test") && !text.contains("!one:test"),
+            "direct={direct}: {text}"
+        );
+        settle("!two:test");
+        check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
