@@ -70,10 +70,6 @@ impl AnswerKind {
     }
 
     /// Whether this answer says the event is not held here.
-    #[allow(
-        dead_code,
-        reason = "read by the strict-import gap check, which is not wired yet"
-    )]
     const fn is_definite_absence(self) -> bool {
         matches!(self, Self::NotFound)
     }
