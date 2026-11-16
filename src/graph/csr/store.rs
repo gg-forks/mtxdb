@@ -1082,18 +1082,28 @@ fn apply_payload(payload: &[u8], rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>) 
     Ok(())
 }
 
-/// Apply only `scope`'s block from one sealed segment.
+/// One scope's verified directory inside a sealed segment.
 ///
-/// The segment carries a small scope index, so a read seeks straight to its
-/// own rows and never decodes the other scopes sharing the file.
-fn apply_segment(
+/// Sealed segments are immutable, so this is the unit the optional directory
+/// cache keeps: reading it means reading and checksumming the whole directory.
+struct ScopeDir {
+    purge: bool,
+    /// The directory entries, checksum-verified, without the count prefix.
+    entries: Vec<u8>,
+    data_start: usize,
+    data_len: usize,
+}
+
+/// Locate `scope` in a segment's index and read and verify its directory.
+/// `None` when the segment holds no block for the scope.
+fn read_scope_dir(
     path: &Path,
+    file: &mut File,
+    index_bytes: &[u8],
+    payload_start: usize,
+    payload_len: usize,
     scope: ScopeId,
-    wanted: Option<&HashSet<(u16, u32)>>,
-    family: Option<EdgeFamily>,
-    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
-) -> io::Result<()> {
-    let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
+) -> io::Result<Option<ScopeDir>> {
     let corrupt = |what: &str| segment_error(path, what);
     for entry in index_bytes.as_chunks::<SCOPE_ENTRY>().0 {
         if entry[..16] != scope.0 {
@@ -1114,9 +1124,6 @@ fn apply_segment(
         if directory_len < BLOCK_COUNT || directory_len > block_len {
             return Err(corrupt("scope directory out of range"));
         }
-        if flags & SCOPE_FLAG_PURGE != 0 {
-            rows.retain(|(row_scope, _, _), _| *row_scope != scope.0);
-        }
         let data_len = block_len.saturating_sub(directory_len);
         let directory_start = payload_start.saturating_add(block_off);
         file.seek(SeekFrom::Start(directory_start as u64))?;
@@ -1135,23 +1142,174 @@ fn apply_segment(
         if BLOCK_COUNT.saturating_add(count.saturating_mul(DIR_ENTRY)) != directory_len {
             return Err(corrupt("scope directory length does not match its count"));
         }
-        let entries = &directory[BLOCK_COUNT..];
-        let data_start = directory_start.saturating_add(directory_len);
-        if let Some(wanted) = wanted {
-            // The directory is sorted, so probe it in memory.
-            for &(family, owner) in wanted {
-                if let Some((offset, len, crc)) = find_directory_entry(entries, family, owner) {
-                    read_row_at(&mut file, data_start, data_len, offset, len, crc, rows)?;
-                }
+        directory.drain(..BLOCK_COUNT);
+        return Ok(Some(ScopeDir {
+            purge: flags & SCOPE_FLAG_PURGE != 0,
+            entries: directory,
+            data_start: directory_start.saturating_add(directory_len),
+            data_len,
+        }));
+    }
+    Ok(None)
+}
+
+/// Apply one scope's directory: honor its purge flag, then read the wanted
+/// rows, the family's rows or every row.
+fn apply_scope_dir(
+    file: &mut File,
+    dir: &ScopeDir,
+    scope: ScopeId,
+    wanted: Option<&HashSet<(u16, u32)>>,
+    family: Option<EdgeFamily>,
+    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+) -> io::Result<()> {
+    if dir.purge {
+        rows.retain(|(row_scope, _, _), _| *row_scope != scope.0);
+    }
+    let entries = &dir.entries;
+    if let Some(wanted) = wanted {
+        // The directory is sorted, so probe it in memory.
+        for &(family, owner) in wanted {
+            if let Some((offset, len, crc)) = find_directory_entry(entries, family, owner) {
+                read_row_at(file, dir.data_start, dir.data_len, offset, len, crc, rows)?;
             }
-        } else if let Some(family) = family {
-            read_family_directory(&mut file, entries, data_start, data_len, family.id, rows)?;
-        } else {
-            read_whole_directory(&mut file, entries, data_start, data_len, rows)?;
         }
-        return Ok(());
+    } else if let Some(family) = family {
+        read_family_directory(file, entries, dir.data_start, dir.data_len, family.id, rows)?;
+    } else {
+        read_whole_directory(file, entries, dir.data_start, dir.data_len, rows)?;
     }
     Ok(())
+}
+
+/// Apply only `scope`'s block from one sealed segment.
+///
+/// The segment carries a small scope index, so a read seeks straight to its
+/// own rows and never decodes the other scopes sharing the file.
+fn apply_segment(
+    path: &Path,
+    scope: ScopeId,
+    wanted: Option<&HashSet<(u16, u32)>>,
+    family: Option<EdgeFamily>,
+    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+) -> io::Result<()> {
+    if wanted.is_some() {
+        return dir_cache::apply_point(path, scope, wanted, rows);
+    }
+    let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
+    if let Some(dir) = read_scope_dir(
+        path,
+        &mut file,
+        &index_bytes,
+        payload_start,
+        payload_len,
+        scope,
+    )? {
+        apply_scope_dir(&mut file, &dir, scope, wanted, family, rows)?;
+    }
+    Ok(())
+}
+
+/// Cache of verified scope directories for point reads.
+///
+/// A point read otherwise reads and checksums each segment's whole scope
+/// directory on every lookup, so its cost grows with the total rows stored.
+/// Sealed segments never change, so the directory is read once and reused. An
+/// entry is trusted only while the segment file still has the identity (size,
+/// mtime and inode) it had when cached, which also covers a store directory
+/// deleted and recreated under the same path. The cache is bounded: past
+/// [`CAP_BYTES`] it is cleared and refilled by later reads.
+mod dir_cache {
+    use super::{
+        apply_scope_dir, open_segment, read_scope_dir, Edge, File, HashMap, HashSet, LazyLock,
+        Mutex, Path, PathBuf, PoisonError, RowKey, ScopeDir, ScopeId,
+    };
+    use std::io;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    /// Clear the cache once cached directories exceed this many bytes.
+    const CAP_BYTES: usize = 256 * 1024 * 1024;
+
+    #[derive(PartialEq, Eq, Clone, Copy)]
+    struct Stamp {
+        len: u64,
+        modified: Option<SystemTime>,
+        inode: u64,
+    }
+
+    type CacheKey = (PathBuf, [u8; 16]);
+    type CacheValue = (Stamp, Option<Arc<ScopeDir>>);
+
+    fn stamp_of(file: &File) -> io::Result<Stamp> {
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Ok(Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        })
+    }
+
+    #[derive(Default)]
+    struct Cache {
+        map: HashMap<CacheKey, CacheValue>,
+        bytes: usize,
+    }
+
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
+
+    pub(super) fn apply_point(
+        path: &Path,
+        scope: ScopeId,
+        wanted: Option<&HashSet<(u16, u32)>>,
+        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+    ) -> io::Result<()> {
+        let mut file = File::open(path)?;
+        let stamp = stamp_of(&file)?;
+        let key = (path.to_path_buf(), scope.0);
+        let hit = CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map
+            .get(&key)
+            .filter(|(cached, _)| *cached == stamp)
+            .map(|(_, dir)| dir.clone());
+        let dir = if let Some(dir) = hit {
+            dir
+        } else {
+            let (mut opened, index_bytes, payload_start, payload_len) = open_segment(path)?;
+            let dir = read_scope_dir(
+                path,
+                &mut opened,
+                &index_bytes,
+                payload_start,
+                payload_len,
+                scope,
+            )?
+            .map(Arc::new);
+            let size = dir.as_ref().map_or(0, |dir| dir.entries.len());
+            let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.bytes.saturating_add(size) > CAP_BYTES {
+                cache.map.clear();
+                cache.bytes = 0;
+            }
+            if let Some((_, old)) = cache.map.insert(key, (stamp, dir.clone())) {
+                cache.bytes = cache
+                    .bytes
+                    .saturating_sub(old.as_ref().map_or(0, |dir| dir.entries.len()));
+            }
+            cache.bytes = cache.bytes.saturating_add(size);
+            dir
+        };
+        if let Some(dir) = dir {
+            apply_scope_dir(&mut file, &dir, scope, wanted, None, rows)?;
+        }
+        Ok(())
+    }
 }
 
 fn segment_error(path: &Path, what: &str) -> io::Error {

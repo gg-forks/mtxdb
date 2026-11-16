@@ -43,6 +43,82 @@ fn per(total: Duration, n: usize) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+#[cfg(feature = "prev-children")]
+fn measure_children_reads(adj: &CsrAdjacency, db: &Database, shorts: &[u32], lookups: usize) {
+    if shorts.is_empty() {
+        return;
+    }
+    let missing = (0..=u32::MAX)
+        .rev()
+        .find(|candidate| shorts.binary_search(candidate).is_err())
+        .expect("room cannot contain every short id");
+
+    // A missing key still traverses and probes every sealed segment's
+    // directory, but has no matching row to read/decode. Interleave misses
+    // and hits to keep cache and temperature effects similar.
+    let mut children = 0usize;
+    let mut hit_read = Duration::ZERO;
+    let mut miss_read = Duration::ZERO;
+    for i in 0..lookups {
+        let slot = i
+            .checked_mul(7919)
+            .expect("lookup index multiplication overflow")
+            .checked_rem(shorts.len())
+            .expect("parent list is nonempty");
+        let parent = shorts[slot];
+        if i.is_multiple_of(2) {
+            let started = Instant::now();
+            children = children
+                .checked_add(
+                    adj.children_of(db, parent)
+                        .expect("children_of")
+                        .map_or(0, |c| c.len()),
+                )
+                .expect("child count overflow");
+            hit_read = hit_read.saturating_add(started.elapsed());
+
+            let started = Instant::now();
+            assert!(
+                adj.children_of(db, missing)
+                    .expect("missing children_of")
+                    .is_none(),
+                "selected short id must be absent"
+            );
+            miss_read = miss_read.saturating_add(started.elapsed());
+        } else {
+            let started = Instant::now();
+            assert!(
+                adj.children_of(db, missing)
+                    .expect("missing children_of")
+                    .is_none(),
+                "selected short id must be absent"
+            );
+            miss_read = miss_read.saturating_add(started.elapsed());
+
+            let started = Instant::now();
+            children = children
+                .checked_add(
+                    adj.children_of(db, parent)
+                        .expect("children_of")
+                        .map_or(0, |c| c.len()),
+                )
+                .expect("child count overflow");
+            hit_read = hit_read.saturating_add(started.elapsed());
+        }
+    }
+    let row_delta = hit_read.checked_sub(miss_read).map_or_else(
+        || format!("-{:?}", per(miss_read.saturating_sub(hit_read), lookups)),
+        |delta| format!("+{:?}", per(delta, lookups)),
+    );
+    println!(
+        "{:>44} directory miss {:?}/lookup | hit {:?}/lookup | hit-minus-miss {row_delta}/lookup",
+        "",
+        per(miss_read, lookups),
+        per(hit_read, lookups),
+    );
+    println!("{:>44} children_of x{lookups}: {children} children", "");
+}
+
 fn run(base: &std::path::Path, events: usize, fanout: usize, lookups: usize) {
     let root = base.join(format!(
         "mtxdb-prevchildren-{}-{events}",
@@ -98,33 +174,7 @@ fn run(base: &std::path::Path, events: usize, fanout: usize, lookups: usize) {
         per(record, events)
     );
     #[cfg(feature = "prev-children")]
-    {
-        let started = Instant::now();
-        let mut children = 0usize;
-        if !shorts.is_empty() {
-            for i in 0..lookups {
-                let slot = i
-                    .checked_mul(7919)
-                    .expect("lookup index multiplication overflow")
-                    .checked_rem(shorts.len())
-                    .expect("parent list is nonempty");
-                let parent = shorts[slot];
-                children = children
-                    .checked_add(
-                        adj.children_of(&db, parent)
-                            .expect("children_of")
-                            .map_or(0, |c| c.len()),
-                    )
-                    .expect("child count overflow");
-            }
-        }
-        let read = started.elapsed();
-        println!(
-            "{:>44} children_of x{lookups}: {:?}/lookup ({children} children)",
-            "",
-            per(read, lookups)
-        );
-    }
+    measure_children_reads(&adj, &db, shorts, lookups);
     #[cfg(not(feature = "prev-children"))]
     let _ = (shorts, lookups);
     let _ = std::fs::remove_dir_all(&root);
