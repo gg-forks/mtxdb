@@ -578,3 +578,47 @@ fn concurrent_recordings_of_one_event_cannot_both_succeed() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(feature = "prev-children")]
+#[test]
+fn children_of_matches_the_derived_reverse_family() {
+    let root = test_root("children-of");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$a", &[], &[], None).unwrap();
+    // Fan-out in separate batches and a merge event with two parents.
+    adj.record_event(&db, "$b", &["$a"], &[], None).unwrap();
+    adj.record_event(&db, "$c", &["$a"], &[], None).unwrap();
+    adj.record_events(
+        &db,
+        &[
+            EventRecord {
+                event_id: "$d",
+                prev: &["$b", "$c"],
+                auth: &[],
+                relation: None,
+            },
+            EventRecord {
+                event_id: "$e",
+                prev: &["$a"],
+                auth: &[],
+                relation: None,
+            },
+        ],
+    )
+    .unwrap();
+    // Re-recording identical data must not change the reverse rows.
+    adj.record_event(&db, "$b", &["$a"], &[], None).unwrap();
+
+    let derived = adj.reverse_family(&db, PREV).unwrap();
+    for id in ["$a", "$b", "$c", "$d", "$e"] {
+        let short = adj.short_id(&db, id).unwrap().unwrap();
+        let expected: Option<Vec<u32>> = derived
+            .children_of(short)
+            .map(|edges| edges.iter().map(|edge| edge.target).collect());
+        assert_eq!(adj.children_of(&db, short).unwrap(), expected, "{id}");
+    }
+    // The reverse rows must not break the forward snapshot or verification.
+    assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}

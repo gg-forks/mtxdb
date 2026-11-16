@@ -81,6 +81,13 @@ pub const RELATIONS: EdgeFamily = EdgeFamily::typed(3);
 
 const FAMILIES: [EdgeFamily; 3] = [PREV, AUTH, RELATIONS];
 
+/// Reverse of [`PREV`]: the row owned by a parent lists its children.
+///
+/// Derived from `PREV` and written with it; it is not one of the forward
+/// [`FAMILIES`], so snapshots and verification skip it.
+#[cfg(feature = "prev-children")]
+pub const PREV_CHILDREN: EdgeFamily = EdgeFamily::plain(4);
+
 /// Relation types defined by the Matrix spec, with fixed kind ids (1-based, in
 /// this order).
 pub const KNOWN_RELATION_TYPES: [&str; 4] =
@@ -269,6 +276,10 @@ impl CsrAdjacency {
         // a successful allocation.
         let mut snapshot = Snapshot::empty(0);
         for row in data.rows {
+            #[cfg(feature = "prev-children")]
+            if row.family.id == PREV_CHILDREN.id {
+                continue;
+            }
             let Some(index) = FAMILIES
                 .iter()
                 .position(|family| family.id == row.family.id && family.typed == row.family.typed)
@@ -394,7 +405,10 @@ impl CsrAdjacency {
             // Allocate every id in one call, exactly as the short-id layer did.
             let (keys, starts) = batch_keys(&prepared);
             let ids = self.events.get_or_create(db, &keys)?;
-            let (owners, changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
+            #[allow(unused_mut)]
+            let (owners, mut changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
+            #[cfg(feature = "prev-children")]
+            self.add_child_rows(db, &mut changed_rows)?;
             if !changed_rows.is_empty() {
                 store
                     .writer(db)
@@ -410,6 +424,68 @@ impl CsrAdjacency {
             }
             Ok(owners)
         })
+    }
+
+    /// Add the reverse rows for the `PREV` rows in `changed`: for each parent,
+    /// the stored children plus the batch's new ones. Runs under the store's
+    /// write lock, so the read-merge-append is atomic.
+    #[cfg(feature = "prev-children")]
+    fn add_child_rows(
+        &self,
+        db: &Database,
+        changed: &mut Vec<RowRecord>,
+    ) -> Result<(), StorageError> {
+        let mut added: std::collections::BTreeMap<u32, BTreeSet<Edge>> =
+            std::collections::BTreeMap::new();
+        for row in changed.iter().filter(|row| row.family.id == PREV.id) {
+            for edge in &row.edges {
+                added.entry(edge.target).or_default().insert(Edge {
+                    target: row.owner,
+                    kind: 0,
+                });
+            }
+        }
+        if added.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<(EdgeFamily, u32)> = added.keys().map(|&p| (PREV_CHILDREN, p)).collect();
+        let existing = self
+            .store(db)
+            .read_rows_locked(self.scope(), &keys)
+            .map_err(StorageError::Io)?;
+        for ((_, parent), old) in keys.iter().zip(existing) {
+            let mut children: BTreeSet<Edge> = old.unwrap_or_default().into_iter().collect();
+            let before = children.len();
+            children.extend(added.remove(parent).unwrap_or_default());
+            if children.len() != before {
+                changed.push(RowRecord {
+                    family: PREV_CHILDREN,
+                    owner: *parent,
+                    edges: children.into_iter().collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The events that list `short_id` in their `prev_events`, from the
+    /// maintained reverse family: one point read, no whole-room scan. `None`
+    /// when no child is recorded.
+    ///
+    /// Rooms recorded before the feature was enabled have no reverse rows;
+    /// this does not backfill them.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt segment.
+    #[cfg(feature = "prev-children")]
+    pub fn children_of(
+        &self,
+        db: &Database,
+        short_id: u32,
+    ) -> Result<Option<Vec<u32>>, StorageError> {
+        Ok(self
+            .family_edges(db, short_id, PREV_CHILDREN)?
+            .map(|edges| edges.into_iter().map(|edge| edge.target).collect()))
     }
 
     /// Make every row appended so far durable, including rows written under
