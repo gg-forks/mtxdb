@@ -27,15 +27,22 @@ struct Case {
 fn cases(span: u32) -> Vec<Case> {
     let dense: Vec<u32> = (0..span).collect();
     let sparse: Vec<u32> = (0..span).step_by(64).collect();
-    let mut mixed: Vec<u32> = (0..span / 2)
-        .chain((span / 2..span).step_by(64))
-        .collect();
+    let mut mixed: Vec<u32> = (0..span / 2).chain((span / 2..span).step_by(64)).collect();
     mixed.dedup();
 
     vec![
-        Case { kind: "dense", values: dense },
-        Case { kind: "sparse", values: sparse },
-        Case { kind: "mixed", values: mixed },
+        Case {
+            kind: "dense",
+            values: dense,
+        },
+        Case {
+            kind: "sparse",
+            values: sparse,
+        },
+        Case {
+            kind: "mixed",
+            values: mixed,
+        },
     ]
 }
 
@@ -60,8 +67,21 @@ fn time_queries(values: &[u32], iterations: u32, mut query: impl FnMut(u32) -> b
             black_box(query(black_box(value)));
         }
     }
-    let per_query = start.elapsed().as_nanos() as f64 / f64::from(iterations);
-    per_query / values.len() as f64 / 1e3
+    let query_count = u128::from(iterations)
+        .checked_mul(u128::try_from(values.len()).expect("query count fits u128"))
+        .expect("total query count fits u128");
+    let per_query_nanos = start
+        .elapsed()
+        .as_nanos()
+        .checked_div(query_count)
+        .expect("iterations and query set are nonempty");
+    // Keep the integer conversion exact and bounded before formatting the
+    // subsecond result as microseconds. Benchmark durations here are far below
+    // u64::MAX nanoseconds (about 584 years).
+    let per_query = std::time::Duration::from_nanos(
+        u64::try_from(per_query_nanos).expect("per-query nanoseconds fit u64"),
+    );
+    per_query.as_secs_f64() * 1_000_000.0
 }
 
 fn main() {

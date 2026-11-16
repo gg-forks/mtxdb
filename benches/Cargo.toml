@@ -217,6 +217,12 @@ name = "csr_read_cache"
 path = "csr_read_cache.rs"
 harness = false
 
+# Request-scoped parent->children derivation (reverse_family) cost vs room size.
+[[bench]]
+name = "reverse_family"
+path = "reverse_family.rs"
+harness = false
+
 [[bench]]
 name = "bitmap_membership"
 path = "bitmap_membership.rs"
