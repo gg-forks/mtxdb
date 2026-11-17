@@ -101,7 +101,7 @@ fn test_hit_rate() {
 
     assert_eq!(cache.hits(), 2);
     assert_eq!(cache.misses(), 1);
-    assert_eq!(cache.hit_rate().total_cmp(&0.6666), Ordering::Equal);
+    assert_eq!(cache.hit_rate().total_cmp(&(2.0 / 3.0)), Ordering::Equal);
 }
 
 #[test]
