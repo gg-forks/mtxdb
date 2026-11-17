@@ -1660,10 +1660,13 @@ mod tests {
                 .map(|(id, _)| id)
                 .collect()
         };
-        assert!(ids(PrevGate::Off).is_empty());
+        assert_eq!(ids(PrevGate::Off), Vec::<&str>::new());
         assert_eq!(ids(PrevGate::Require), ["$absent", "$open", "$waived"]);
         assert_eq!(ids(PrevGate::RequireAllowWaived), ["$absent", "$open"]);
-        assert!(unaccepted(&GapManifest::default(), PrevGate::Require).is_empty());
+        assert_eq!(
+            unaccepted(&GapManifest::default(), PrevGate::Require),
+            Vec::new()
+        );
         assert_eq!(PrevGate::from_flags(false, true), PrevGate::Off);
     }
 
