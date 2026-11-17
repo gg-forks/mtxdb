@@ -1538,7 +1538,9 @@ fn a_batch_removal_loses_to_a_concurrent_re_put_of_identical_content() {
 // frame of each key.
 
 fn assert_index_matches_packs(store: &PackfileStorage, collection: &[u8; 16], stage: &str) {
-    let stats = store.removal_stats(collection).unwrap();
+    let stats = store
+        .removal_stats(collection)
+        .unwrap_or_else(|e| panic!("{stage}: removal_stats failed: {e:?}"));
     let (len, _, _) = store
         .collection_index_info(collection)
         .unwrap_or_else(|| panic!("{stage}: collection is not loaded"));
