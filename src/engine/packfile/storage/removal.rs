@@ -186,9 +186,9 @@ impl PackfileStorage {
             // file, and resolving a path first would let that rename land
             // between the lookup and the open.
             let file = shard.open_data_file()?;
-            let file_len = file.metadata()?.len();
-            let mut entries = packfile::scan_packfile_iter_from_file(file, false)?
-                .collect::<std::io::Result<Vec<_>>>()?;
+            let scanner = packfile::scan_packfile_iter_from_file(file, false)?;
+            let file_len = scanner.file_end();
+            let mut entries = scanner.collect::<std::io::Result<Vec<_>>>()?;
             entries.sort_unstable_by_key(|(_, _, offset)| *offset);
             for (index, (rid, hash, offset)) in entries.iter().enumerate() {
                 if rid != collection_id {
