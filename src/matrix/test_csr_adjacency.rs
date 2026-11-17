@@ -628,8 +628,8 @@ fn children_of_falls_back_then_backfills_a_legacy_scope() {
     let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     // Rows as a build without the reverse family wrote them.
-    adj.record_legacy_prev(&db, "$b", "$a").unwrap();
-    adj.record_legacy_prev(&db, "$c", "$a").unwrap();
+    adj.record_legacy_prev(&db, &[("$b", "$a"), ("$c", "$a")])
+        .unwrap();
     let a = adj.short_id(&db, "$a").unwrap().unwrap();
     let b = adj.short_id(&db, "$b").unwrap().unwrap();
     let c = adj.short_id(&db, "$c").unwrap().unwrap();
@@ -644,4 +644,43 @@ fn children_of_falls_back_then_backfills_a_legacy_scope() {
     assert_eq!(adj.children_of(&db, d).unwrap(), None);
     assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Timing only: `cargo test --release --lib legacy_scope_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing run"]
+fn legacy_scope_timing() {
+    for events in [10_000_usize, 100_000] {
+        let root = test_root("children-of-legacy-timing");
+        let db = Database::open(root.clone()).unwrap();
+        let adj = adjacency();
+        // Spread ids (constant-prefix ids cluster the hash index) in a chain.
+        let names: Vec<String> = (0..=events)
+            .map(|n| format!("${:016x}", (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+            .collect();
+        for chunk in names.windows(2).collect::<Vec<_>>().chunks(256) {
+            let pairs: Vec<(&str, &str)> = chunk
+                .iter()
+                .map(|w| (w[1].as_str(), w[0].as_str()))
+                .collect();
+            adj.record_legacy_prev(&db, &pairs).unwrap();
+        }
+        let mid = adj.short_id(&db, &names[events / 2]).unwrap().unwrap();
+        let t = std::time::Instant::now();
+        let fallback = adj.children_of(&db, mid).unwrap();
+        let fallback_time = t.elapsed();
+        assert!(fallback.is_some());
+        let t = std::time::Instant::now();
+        adj.record_event(&db, "$new", &[names[events].as_str()], &[], None)
+            .unwrap();
+        let backfill_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let fast = adj.children_of(&db, mid).unwrap();
+        let fast_time = t.elapsed();
+        assert_eq!(fast, fallback);
+        println!(
+            "legacy {events:>7} events: fallback children_of {fallback_time:?} | first write (backfill) {backfill_time:?} | children_of after {fast_time:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -534,34 +534,36 @@ impl CsrAdjacency {
             .map(|edges| edges.iter().map(|edge| edge.target).collect()))
     }
 
-    /// Write one forward `PREV` row the way a pre-reverse-family build did:
-    /// no reverse rows and no completeness marker.
+    /// Write forward `PREV` rows the way a pre-reverse-family build did: no
+    /// reverse rows and no completeness marker. Each pair is (child, parent).
     #[cfg(test)]
     pub(crate) fn record_legacy_prev(
         &self,
         db: &Database,
-        child: &str,
-        parent: &str,
+        pairs: &[(&str, &str)],
     ) -> Result<(), StorageError> {
-        let ids = self
-            .events
-            .get_or_create(db, &[child.as_bytes(), parent.as_bytes()])?;
+        let keys: Vec<&[u8]> = pairs
+            .iter()
+            .flat_map(|(child, parent)| [child.as_bytes(), parent.as_bytes()])
+            .collect();
+        let ids = self.events.get_or_create(db, &keys)?;
+        let rows: Vec<RowRecord> = ids
+            .chunks(2)
+            .map(|pair| RowRecord {
+                family: PREV,
+                owner: pair[0],
+                edges: vec![Edge {
+                    target: pair[1],
+                    kind: 0,
+                }],
+            })
+            .collect();
         let store = self.store(db);
         store
             .with_write_lock(|| {
-                store.writer(db).and_then(|writer| {
-                    writer.append_rows_locked(
-                        self.scope(),
-                        &[RowRecord {
-                            family: PREV,
-                            owner: ids[0],
-                            edges: vec![Edge {
-                                target: ids[1],
-                                kind: 0,
-                            }],
-                        }],
-                    )
-                })
+                store
+                    .writer(db)
+                    .and_then(|writer| writer.append_rows_locked(self.scope(), &rows))
             })
             .map_err(StorageError::Io)
     }
