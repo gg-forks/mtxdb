@@ -579,7 +579,6 @@ fn concurrent_recordings_of_one_event_cannot_both_succeed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[cfg(feature = "prev-children")]
 #[test]
 fn children_of_matches_the_derived_reverse_family() {
     let root = test_root("children-of");
@@ -619,6 +618,30 @@ fn children_of_matches_the_derived_reverse_family() {
         assert_eq!(adj.children_of(&db, short).unwrap(), expected, "{id}");
     }
     // The reverse rows must not break the forward snapshot or verification.
+    assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn children_of_falls_back_then_backfills_a_legacy_scope() {
+    let root = test_root("children-of-legacy");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    // Rows as a build without the reverse family wrote them.
+    adj.record_legacy_prev(&db, "$b", "$a").unwrap();
+    adj.record_legacy_prev(&db, "$c", "$a").unwrap();
+    let a = adj.short_id(&db, "$a").unwrap().unwrap();
+    let b = adj.short_id(&db, "$b").unwrap().unwrap();
+    let c = adj.short_id(&db, "$c").unwrap().unwrap();
+    // Unmarked: the derive fallback must still answer correctly.
+    assert_eq!(adj.children_of(&db, a).unwrap(), Some(vec![b, c]));
+    assert_eq!(adj.children_of(&db, b).unwrap(), None);
+    // The next write backfills the old rows and marks the scope.
+    adj.record_event(&db, "$d", &["$b"], &[], None).unwrap();
+    let d = adj.short_id(&db, "$d").unwrap().unwrap();
+    assert_eq!(adj.children_of(&db, a).unwrap(), Some(vec![b, c]));
+    assert_eq!(adj.children_of(&db, b).unwrap(), Some(vec![d]));
+    assert_eq!(adj.children_of(&db, d).unwrap(), None);
     assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
     let _ = std::fs::remove_dir_all(root);
 }

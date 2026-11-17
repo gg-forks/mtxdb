@@ -119,12 +119,6 @@ test-util = []
 # alternate CAS or version paths.
 multi-reader = []
 
-# Prototype: maintain a persisted parent -> children reverse family for `prev`
-# edges, written in the same append as the forward row, so `children_of` is a
-# point read instead of a whole-room `reverse_family` derive. Costs one extra
-# row rewrite per parent per recorded event; see benches/prev_children.rs.
-prev-children = []
-
 # Domain-tagged bitmap sets and Matrix auth-closure APIs. This remains
 # switchable for minimal builds, while staying enabled by default for
 # compatibility with the public graph and Matrix APIs.

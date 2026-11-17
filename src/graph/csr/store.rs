@@ -576,7 +576,7 @@ impl CsrStore {
         self.with_read_lock(|| self.read_family_locked(scope, family))
     }
 
-    fn read_family_locked(
+    pub(crate) fn read_family_locked(
         &self,
         scope: ScopeId,
         family: EdgeFamily,

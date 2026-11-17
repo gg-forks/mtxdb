@@ -1,12 +1,8 @@
 //! Write cost of the maintained `PREV_CHILDREN` reverse family, and bounded
 //! `children_of` reads against the whole-room `reverse_family` derive.
 //!
-//! Run twice and compare the record time:
-//!
 //! ```text
 //! cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench prev_children
-//! cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench prev_children \
-//!   --features prev-children
 //! ```
 //!
 //! Knobs: `MTXDB_PC_SIZES` (default `10000,100000`), `MTXDB_PC_FANOUT` (extra
@@ -43,7 +39,6 @@ fn per(total: Duration, n: usize) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-#[cfg(feature = "prev-children")]
 fn measure_children_reads(adj: &CsrAdjacency, db: &Database, shorts: &[u32], lookups: usize) {
     if shorts.is_empty() {
         return;
@@ -173,10 +168,7 @@ fn run(base: &std::path::Path, events: usize, fanout: usize, lookups: usize) {
         "events {events:>8} fanout/1000 {fanout}: record {record:>10.2?} ({:?}/event) | reverse_family derive {derive:>10.2?}",
         per(record, events)
     );
-    #[cfg(feature = "prev-children")]
     measure_children_reads(&adj, &db, shorts, lookups);
-    #[cfg(not(feature = "prev-children"))]
-    let _ = (shorts, lookups);
     let _ = std::fs::remove_dir_all(&root);
 }
 

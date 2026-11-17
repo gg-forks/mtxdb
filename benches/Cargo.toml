@@ -33,10 +33,6 @@ mtxdb = { path = "..", features = ["reconcile", "test-util"] }
 
 rusqlite = "0.32"
 
-[features]
-# Forwarded to mtxdb: also maintain the persisted PREV_CHILDREN reverse family.
-prev-children = ["mtxdb/prev-children"]
-
 [target.'cfg(windows)'.dependencies]
 # No system SQLite and no pkg-config on Windows, so build and link the bundled
 # amalgamation instead (MSVC is available on the CI runner). Linux/macOS keep
@@ -229,7 +225,7 @@ path = "reverse_family.rs"
 harness = false
 
 # Write cost of maintaining PREV_CHILDREN and children_of read latency vs the
-# whole-room reverse_family derive. Run with and without --features prev-children.
+# whole-room reverse_family derive.
 [[bench]]
 name = "prev_children"
 path = "prev_children.rs"
