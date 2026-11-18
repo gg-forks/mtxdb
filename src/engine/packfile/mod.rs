@@ -504,16 +504,6 @@ impl Iterator for PackfileScanner {
 }
 
 impl PackfileScanner {
-    /// The file length captured when this scanner was created.
-    ///
-    /// Frame bounds are enforced against this length, so a caller computing the
-    /// end of the last scanned frame should use it rather than a fresh metadata
-    /// read, which could describe a longer file.
-    #[must_use]
-    pub(crate) fn file_end(&self) -> u64 {
-        self.file_end
-    }
-
     /// Read the next frame's identity and removal marker without retaining a
     /// scan-sized vector. The ordinary iterator intentionally keeps its
     /// historical `(collection_id, hash, offset)` item shape.
