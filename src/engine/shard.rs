@@ -383,6 +383,9 @@ pub struct Shard {
     // remap can therefore replace this slot without invalidating an already
     // returned node.
     pub(crate) mmap: RwLock<Option<Arc<Mmap>>>,
+    /// Separate mapping for random point reads. Advice on this mapping does
+    /// not change the readahead policy of the sequential mapping above.
+    point_mmap: RwLock<Option<Arc<Mmap>>>,
     /// Serializes appends to this shard.
     pub(crate) append_lock: parking_lot::Mutex<()>,
     /// Serializes fsyncs of this shard across concurrent `sync_dirty`/
@@ -448,6 +451,10 @@ pub struct Shard {
     /// shard is refused rather than risk writing on top of, or scanning
     /// past, that corrupt physical tail.
     poisoned: AtomicBool,
+    /// Fail the next flush before its positioned write, exercising the
+    /// append rollback path without relying on filesystem-specific failures.
+    #[cfg(test)]
+    fail_next_flush: AtomicBool,
 }
 
 /// A byte range which keeps the mmap that backs it alive.  `Bytes::from_owner`
@@ -615,6 +622,7 @@ impl Shard {
             path,
             publication: Mutex::new(PackPublication::Published),
             mmap: RwLock::new(None),
+            point_mmap: RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
             sync_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
@@ -630,6 +638,8 @@ impl Shard {
             preallocated_len: AtomicU64::new(file_len),
             prealloc_disabled: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_flush: AtomicBool::new(false),
         }
     }
 
@@ -689,6 +699,30 @@ impl Shard {
         match &*self.publication.lock() {
             PackPublication::Staged(path) => path.clone(),
             PackPublication::Renamed | PackPublication::Published => self.path.clone(),
+        }
+    }
+
+    /// Run a path-based scan against the file currently backing this shard.
+    ///
+    /// `data_path` is only a snapshot: a background fsync or seal can publish
+    /// the pack (staging name to canonical name) between the snapshot and the
+    /// scan's `open`, which then reports `NotFound`. Publication is one-way,
+    /// so a single retry with a fresh snapshot always sees the final name.
+    ///
+    /// # Errors
+    /// Returns whatever `scan` returns for the final attempt.
+    pub(crate) fn scan_data_path<T>(&self, scan: impl Fn(&Path) -> io::Result<T>) -> io::Result<T> {
+        let first = self.data_path();
+        match scan(&first) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let second = self.data_path();
+                if second == first {
+                    Err(error)
+                } else {
+                    scan(&second)
+                }
+            }
+            result => result,
         }
     }
 
@@ -846,6 +880,41 @@ impl Shard {
         }
         drop(guard);
         Ok(self.mmap.read())
+    }
+
+    /// Get the point-read mapping, creating it with random-access advice.
+    pub(crate) fn point_mmap(
+        &self,
+    ) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<Arc<Mmap>>>> {
+        let guard = self.point_mmap.read();
+        if guard.is_some() {
+            return Ok(guard);
+        }
+        drop(guard);
+        let mut guard = self.point_mmap.write();
+        if guard.is_none() {
+            let mapping = packfile::map_pack(&self.file)?;
+            #[cfg(unix)]
+            let _ = mapping.advise(memmap2::Advice::Random);
+            *guard = Some(Arc::new(mapping));
+        }
+        drop(guard);
+        Ok(self.point_mmap.read())
+    }
+
+    /// Drop this shard's cached mapping and return the mapping length.
+    ///
+    /// Previously returned zero-copy byte ranges may keep the mapping alive
+    /// until their `Arc` references are dropped. This only removes the shard's
+    /// own reference; it does not invalidate outstanding reads.
+    pub(crate) fn unmap(&self) -> u64 {
+        let sequential = self.mmap.write().take().map_or(0, |mapping| {
+            u64::try_from(mapping.len()).unwrap_or(u64::MAX)
+        });
+        let point = self.point_mmap.write().take().map_or(0, |mapping| {
+            u64::try_from(mapping.len()).unwrap_or(u64::MAX)
+        });
+        sequential.max(point)
     }
 }
 
@@ -1804,13 +1873,18 @@ impl ShardPool {
     /// contended pool lock.
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
+        max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> io::Result<Self> {
+        let max_shard_bytes = match max_shard_bytes {
+            None => MAX_SHARD_BYTES,
+            Some(value) => Self::validate_shard_size(value)?,
+        };
         Self::open_internal_locked(
             base_dir,
             true,
-            MAX_SHARD_BYTES,
+            max_shard_bytes,
             compress,
             checksum_policy,
             false,
@@ -2858,6 +2932,9 @@ impl ShardPool {
                     // tail.
                     match shard.file.set_len(committed) {
                         Ok(()) => {
+                            // A mapping made before the failed flush can extend
+                            // beyond the truncated file. Retire both views.
+                            let _ = shard.unmap();
                             pending.truncate(pending_start);
                             shard.pending_records.fetch_sub(1, Ordering::Relaxed);
                         }
@@ -2961,6 +3038,10 @@ impl ShardPool {
                 // Nothing buffered: nothing to commit or dirty.
                 return Ok(());
             }
+            #[cfg(test)]
+            if shard.fail_next_flush.swap(false, Ordering::AcqRel) {
+                return Err(io::Error::other("injected test flush failure"));
+            }
             let committed = shard.file_len.load(Ordering::Acquire);
             // Write directly from the still-buffered bytes rather than
             // draining them first: `append_lock` is held for this whole
@@ -3040,10 +3121,23 @@ impl ShardPool {
         shard: &Shard,
         offset: u64,
     ) -> Result<u64, crate::storage::StorageError> {
+        Self::record_disk_len_at_mode(shard, offset, false)
+    }
+
+    pub(crate) fn record_disk_len_at_mode(
+        shard: &Shard,
+        offset: u64,
+        point: bool,
+    ) -> Result<u64, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         for attempt in 0..2 {
-            let guard = shard.mmap().map_err(StorageError::Io)?;
+            let guard = if point {
+                shard.point_mmap()
+            } else {
+                shard.mmap()
+            }
+            .map_err(StorageError::Io)?;
             let Some(mapping) = guard.as_ref().cloned() else {
                 return Err(StorageError::Unsupported(
                     "shard could not be mapped".to_owned(),
@@ -3122,13 +3216,23 @@ impl ShardPool {
         offset: u64,
         verify: bool,
     ) -> Result<Record, crate::storage::StorageError> {
+        self.read_at_mode(shard, offset, verify, false)
+    }
+
+    pub(crate) fn read_at_mode(
+        &self,
+        shard: &Arc<Shard>,
+        offset: u64,
+        verify: bool,
+        point: bool,
+    ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
         if offset >= shard.file_len() {
             // The offset is virtual — still inside the append buffer. Write
             // the pending frames so the mmap can serve it.
             self.flush_shard(shard).map_err(StorageError::Io)?;
         }
-        Self::read_at_committed(shard, offset, verify)
+        Self::read_at_committed_mode(shard, offset, verify, point)
     }
 
     /// Read only a record's collection and content hash from its frame.
@@ -3275,10 +3379,24 @@ impl ShardPool {
         offset: u64,
         verify: bool,
     ) -> Result<Record, crate::storage::StorageError> {
+        Self::read_at_committed_mode(shard, offset, verify, false)
+    }
+
+    fn read_at_committed_mode(
+        shard: &Arc<Shard>,
+        offset: u64,
+        verify: bool,
+        point: bool,
+    ) -> Result<Record, crate::storage::StorageError> {
         use crate::storage::StorageError;
 
         for attempt in 0..2 {
-            let guard = shard.mmap().map_err(StorageError::Io)?;
+            let guard = if point {
+                shard.point_mmap()
+            } else {
+                shard.mmap()
+            }
+            .map_err(StorageError::Io)?;
             let Some(mapping) = guard.as_ref().cloned() else {
                 return Err(StorageError::Unsupported(
                     "shard could not be mapped".to_owned(),
@@ -3486,10 +3604,22 @@ impl ShardPool {
             }
         }
         let mut guard = shard.mmap.write();
-        if guard.as_ref().is_none_or(|m| (m.len() as u64) < file_len) {
+        if guard.as_ref().is_some_and(|m| (m.len() as u64) < file_len) {
             *guard = Some(Arc::new(
                 packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?,
             ));
+        }
+        drop(guard);
+        let mut point_guard = shard.point_mmap.write();
+        if point_guard
+            .as_ref()
+            .is_some_and(|mapping| (mapping.len() as u64) < file_len)
+        {
+            let mapping =
+                packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?;
+            #[cfg(unix)]
+            let _ = mapping.advise(memmap2::Advice::Random);
+            *point_guard = Some(Arc::new(mapping));
         }
         // A read-only pool can observe an append made by another process. Its
         // local atomic is only a steady-state fast-path cache, so publish the
@@ -3509,6 +3639,22 @@ impl ShardPool {
     fn rotate(&self) -> io::Result<()> {
         let _guard = self.rotation_lock.lock();
         self.rotate_locked()
+    }
+
+    /// Start a new physical generation for a collection after it was deleted.
+    /// The returned creation sequence is a durable-scan fence: records in
+    /// older packs belong to the deleted generation and must not be restored
+    /// when the collection is rebuilt from packfiles.
+    pub(crate) fn start_collection_generation(&self, collection_id: &[u8; 16]) -> io::Result<u32> {
+        let _guard = self.rotation_lock.lock();
+        let previous = *self.active_write.lock();
+        self.rotate_locked()?;
+        let slot = *self.active_write.lock();
+        self.collection_home.write().insert(*collection_id, slot);
+        self.maybe_seal_pack(previous);
+        self.get_shard(slot)
+            .map(|shard| shard.creation_seq)
+            .ok_or_else(|| io::Error::other("new collection generation shard disappeared"))
     }
 
     /// Stop future appends before indexing the old pack. The sidecar is

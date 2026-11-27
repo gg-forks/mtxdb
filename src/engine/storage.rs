@@ -268,6 +268,11 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `StorageError::Io` on I/O failure.
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError>;
 
+    /// Mark a collection as an ordered-index collection, so storage that
+    /// separates index and body mappings can route its node reads
+    /// differently. Engines that do not distinguish mapping kinds ignore this.
+    fn mark_index_collection(&self, _collection_id: &[u8; 16]) {}
+
     /// Fetch multiple nodes by their structural hashes within a collection.
     /// Returns results in the same order as the input keys.
     ///
@@ -403,6 +408,13 @@ pub trait StorageEngine: Send + Sync {
     /// # Errors
     /// Returns [`StorageError::Io`] on I/O failure.
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError>;
+
+    /// Return live record IDs without materializing their payloads.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot enumerate a consistent
+    /// collection snapshot.
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError>;
 
     /// Atomically establish a collection or append to it if already established.
     ///
@@ -919,6 +931,15 @@ impl StorageEngine for InMemoryStorage {
             .read()
             .get(collection_id)
             .map(std::collections::HashMap::len))
+    }
+
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError> {
+        Ok(self
+            .collections
+            .read()
+            .get(collection_id)
+            .map(|collection| collection.keys().copied().collect())
+            .unwrap_or_default())
     }
 
     fn create_or_put_established(

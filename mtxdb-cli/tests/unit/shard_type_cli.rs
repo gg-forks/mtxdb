@@ -6,7 +6,7 @@ mod tests {
 
     #[test]
     fn server_info_shard_type_selects_the_server_info_pool() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_scratch::root().join(format!(
             "mtxdb-shard-type-cli-{}-{}",
             std::process::id(),
             std::thread::current()
@@ -27,7 +27,7 @@ mod tests {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/mtxdb-export/server-keys-v1.jsonl");
         let import = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
-            .args(["-t", "server-info", "import", "--dir"])
+            .args(["import", "-t", "server-info", "--dir"])
             .arg(&root)
             .arg(&fixture)
             .output()
@@ -35,7 +35,7 @@ mod tests {
         assert!(import.status.success(), "stderr: {:?}", import.stderr);
 
         let server_info = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
-            .args(["-t", "server-info", "collections", "--dir"])
+            .args(["collections", "-t", "server-info", "--dir"])
             .arg(&root)
             .output()
             .expect("run mtxdb collections for server-info");

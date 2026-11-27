@@ -1,27 +1,29 @@
 use super::{
     all_verdicts_present, base_is_incomplete, build_event_dag, canonical_column_width,
-    cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows,
-    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
-    compile_import_template, compute_state_groups_partial, decode_event_json_record,
-    decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
-    direct_import_enabled, display_collection_role, event_id, event_room_id, event_short_id,
+    cmd_auth_check, cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import,
+    cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
+    cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
+    collection_canonical_id, committed_through, compile_import_template,
+    compute_state_groups_partial, decode_event_json_record, decode_hamt_node, decode_hamt_root,
+    default_matrix_import_template, derive_template_key, direct_import_enabled,
+    dirty_closure_exceeds_half, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
-    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, json_string,
-    keys_first, listing_shard_types, load_collection_events, load_state_groups,
-    matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
-    meta_checkpoints, meta_lock_line, meta_pools, meta_raw, overlay_auth_projection, pack_identity,
-    parse_federation_input, parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag,
-    prepare_state_collection, pretty_print_payload, raw_auth_projection,
-    raw_auth_projection_collection_id, record_csr_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, search_record_matches, search_template,
-    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
-    topological_event_order, valid_json_pointer, valid_state_group_id, verify_auth_chain_edges,
-    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    ImportRunCache, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting,
-    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    format_canonical_display, format_id, forward_short_id_present, glob_pack_files, import_data,
+    import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
+    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
+    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -275,7 +277,7 @@ fn canonical_collection_display_aligns_roles_and_reserves_total_column() {
 fn unique_temp_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     crate::sweep_stale_test_dirs();
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb-cli-test-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -688,6 +690,54 @@ fn collections_rebuilds_after_a_corrupt_shard_collections_sidecar() {
 }
 
 #[test]
+fn info_falls_back_when_sidecar_predates_a_collection() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::State).unwrap();
+    let old_collection = [0x11; 16];
+    let new_collection = [0x22; 16];
+    {
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        store
+            .put(
+                &old_collection,
+                &[0x01; 16],
+                &NodeData::new(Bytes::from_static(b"old")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+        let stale_sidecar = std::fs::read(pool_dir.join("shard_collections.bin")).unwrap();
+
+        store
+            .put(
+                &new_collection,
+                &[0x02; 16],
+                &NodeData::new(Bytes::from_static(b"new")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Simulate a live writer whose collection directory has not been
+        // republished since `new_collection` was first written, while the pack
+        // and index already contain it.
+        std::fs::write(pool_dir.join("shard_collections.bin"), stale_sidecar).unwrap();
+    }
+
+    assert!(
+        super::collection_exists_in_dir(&pool_dir, &new_collection),
+        "a sidecar miss must fall back to the store index"
+    );
+    assert!(
+        super::inspect_collection_in_dir(&pool_dir, &new_collection, false, None),
+        "info must not report a collection absent just because the sidecar is stale"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
     let dir = unique_temp_dir();
     DatabaseLayout::open(dir.clone()).unwrap();
@@ -696,10 +746,12 @@ fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -790,9 +842,11 @@ fn info_explains_a_malformed_hex_selector() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(String::new()),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", None, false).unwrap_err();
@@ -810,9 +864,11 @@ fn info_selector_boundary_between_pack_and_collection() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     let digits = |n: usize| format!("0x{}", "a".repeat(n));
@@ -867,9 +923,11 @@ fn info_selector_32_hex_disambiguation() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -1002,9 +1060,11 @@ fn info_pack_flag_reports_same_id_in_multiple_pools() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -1028,9 +1088,11 @@ fn only_the_canonical_lowercase_prefix_is_accepted() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     // A short 0x-prefixed prefix is a filename-prefix selector.
@@ -1185,7 +1247,11 @@ fn packs_dump_writes_decoded_jsonl_for_a_pack() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let out_file = dir.join("dump.jsonl");
@@ -1244,7 +1310,11 @@ fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: true },
+            action: super::PacksAction::List {
+                all: true,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let error = super::cmd_packs_dump(&cli, "0xab", None, None).unwrap_err();
@@ -1262,7 +1332,11 @@ fn packs_dump_errors_when_the_pack_is_absent() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
@@ -1323,7 +1397,11 @@ fn packs_extract_slices_target_collection_into_valid_pack() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -1383,7 +1461,11 @@ fn one_record_pack_fixture() -> (PathBuf, Cli, PackId) {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     (dir, cli, pack_id)
@@ -1644,6 +1726,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -1661,6 +1744,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -1687,9 +1771,11 @@ fn info_dash_t_all_finds_collection_across_pools() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(col_hex.clone()),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -1731,7 +1817,7 @@ fn scan_dash_t_all_finds_collection_across_pools() {
     };
 
     cmd_scan(
-        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false,
+        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false, None,
     )
     .unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1821,6 +1907,7 @@ fn live_collection_scan_excludes_superseded_versions() {
         None,
         false,
         true,
+        None,
     )
     .unwrap();
 
@@ -2655,6 +2742,7 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
     let auth_arrived: HashSet<String> = ["$both".to_owned(), "$auth-only".to_owned()].into();
     waiting.observe_written(
         &HashSet::new(),
+        &HashSet::new(),
         &auth_arrived,
         [],
         &no_timeline,
@@ -2671,13 +2759,32 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
     let timeline_arrived: HashSet<String> = ["$both".to_owned()].into();
     waiting.observe_written(
         &timeline_arrived,
+        &timeline_arrived,
         &HashSet::new(),
         [],
         &no_timeline,
         &no_anywhere,
     );
-    assert!(waiting.prev.is_empty());
-    assert!(waiting.auth.is_empty());
+    assert!(waiting.prev.is_empty(), "value should be empty");
+    assert!(waiting.auth.is_empty(), "value should be empty");
+}
+
+/// A room that starts empty must still report its growing size, or the direct
+/// path's half-room bail (`stored_events > 0`) can never fire.
+#[test]
+fn waiting_set_room_size_hint_grows_with_written_files() {
+    let none = HashSet::new();
+    let mut waiting = RoomWaiting::from_scratch("!room", [], [], &none, &none);
+    assert_eq!(waiting.stored_events, 0);
+    let arrived: HashSet<String> = ["$a".to_owned(), "$b".to_owned()].into();
+    waiting.observe_written(&arrived, &arrived, &arrived, [], &none, &none);
+    assert_eq!(waiting.stored_events, 2);
+    let more: HashSet<String> = ["$c".to_owned()].into();
+    waiting.observe_written(&more, &more, &more, [], &none, &none);
+    assert_eq!(waiting.stored_events, 3);
+    // Repeating an already stored body is not a new arrival.
+    waiting.observe_written(&more, &HashSet::new(), &more, [], &none, &none);
+    assert_eq!(waiting.stored_events, 3);
 }
 
 /// Adding references uses the canonical presence predicate per family: an id
@@ -2693,6 +2800,7 @@ fn waiting_set_adds_references_against_the_canonical_presence() {
     let mut waiting = RoomWaiting::default();
     let auth_arrived: HashSet<String> = ["$auth-body".to_owned()].into();
     waiting.observe_written(
+        &HashSet::new(),
         &HashSet::new(),
         &auth_arrived,
         [
@@ -2869,6 +2977,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
                     &collection_id,
                     FIXTURE_ROOM,
                     &arrived,
+                    &arrived,
                     &auth_arrived,
                     events.iter().chain(auth_chain.iter()),
                 )
@@ -2897,8 +3006,8 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
         let waiting = &cache.waiting[&collection_id];
         match index {
             0 => {
-                assert!(waiting.prev.is_empty());
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.prev.is_empty(), "value should be empty");
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
             1 => {
                 assert!(waiting.prev.contains("$later-prev"));
@@ -2924,12 +3033,12 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             }
             3 => {
                 assert!(waiting.prev.contains("$later-auth"));
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
             _ => {
                 assert!(waiting.prev.contains("$still-later"));
                 assert!(!waiting.prev.contains("$later-auth"));
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
         }
     }
@@ -3539,6 +3648,21 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             r#"["$child"]"#,
             r#"["$create","$join"]"#,
         );
+        // Filler keeps the room larger than twice the late file's closure, so
+        // the half-room bail stays out of the way and this test still exercises
+        // the direct dirty-closure path rather than the whole-room fallback.
+        let filler = |number: u32| {
+            event(
+                &format!("$filler{number}"),
+                "m.room.message",
+                "",
+                r#"{"body":"filler"}"#,
+                r#"["$base"]"#,
+                r#"["$create","$join"]"#,
+            )
+        };
+        let (filler1, filler2) = (filler(1), filler(2));
+        let (filler3, filler4) = (filler(3), filler(4));
 
         let write = |name: &str, events: &[&OwnedValue]| {
             let path = dir.join(name);
@@ -3572,11 +3696,81 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             &mut established,
             &mut cache,
         );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(
+                hint, 3,
+                "the stored-event hint must track the bodies this run wrote"
+            );
+            assert!(
+                !dirty_closure_exceeds_half(1, hint),
+                "one dirty event of three is below the half-room threshold"
+            );
+        }
         import_file(
-            &write("second.jsonl", &[&early, &later, &child, &grandchild]),
+            &write(
+                "second.jsonl",
+                &[
+                    &early,
+                    &later,
+                    &child,
+                    &grandchild,
+                    &filler1,
+                    &filler2,
+                    &filler3,
+                    &filler4,
+                ],
+            ),
             &mut established,
             &mut cache,
         );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 11, "the hint keeps up with every written body");
+            assert!(
+                dirty_closure_exceeds_half(6, hint),
+                "six of eleven is over half; the bail must be armed once the room has filled"
+            );
+            assert!(
+                !dirty_closure_exceeds_half(5, hint),
+                "five of eleven is not over half"
+            );
+        }
+        // An overlapping file repeats stored events and adds one new body; only
+        // the new body may grow the room-size hint.
+        let filler5 = filler(5);
+        import_file(
+            &write("overlap.jsonl", &[&base, &filler4, &filler5]),
+            &mut established,
+            &mut cache,
+        );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 12, "repeated bodies must not inflate the hint");
+        }
+        // A duplicate-only replay has nothing new to store, so the hint and the
+        // room-size estimate must not move.
+        import_file(
+            &write("repeat.jsonl", &[&base, &filler4, &filler5]),
+            &mut established,
+            &mut cache,
+        );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 12, "a duplicate-only replay must not grow the hint");
+        }
 
         let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
         let mapped = |id: &str| {
@@ -3616,8 +3810,8 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
     let (on_files, on_rows) = &snapshots[1];
     assert_eq!(*off_files, 0, "the whole-room run never uses the gate");
     assert_eq!(
-        *on_files, 2,
-        "the late-body file must re-judge its dirty closure directly"
+        *on_files, 3,
+        "the overlap file and the late-body file must each take the direct path"
     );
     assert_eq!(
         off_rows, on_rows,
@@ -3666,6 +3860,14 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
         outlier_flag: bool,
         soft_failed: bool,
     }
+
+    type Snapshot = (
+        usize,
+        bool,
+        usize,
+        usize,
+        std::collections::BTreeMap<String, Row>,
+    );
 
     let room = "!permutations:test";
     let template = default_matrix_import_template();
@@ -3828,8 +4030,7 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
         ])],
     ];
 
-    let mut snapshots: Vec<(usize, bool, usize, std::collections::BTreeMap<String, Row>)> =
-        Vec::new();
+    let mut snapshots: Vec<Snapshot> = Vec::new();
     for (plan_index, plan) in plans.iter().enumerate() {
         for direct in [false, true] {
             let dir = unique_temp_dir().join(format!("permutation_{plan_index}_{direct}"));
@@ -3909,12 +4110,18 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
                     },
                 );
             }
-            snapshots.push((plan_index, direct, cache.direct_files, rows));
+            snapshots.push((
+                plan_index,
+                direct,
+                cache.direct_files,
+                cache.half_room_bails,
+                rows,
+            ));
         }
     }
 
-    let (base_plan, base_direct, _, baseline) = &snapshots[0];
-    for (plan_index, direct, _, rows) in &snapshots {
+    let (base_plan, base_direct, _, _, baseline) = &snapshots[0];
+    for (plan_index, direct, _, _, rows) in &snapshots {
         assert_eq!(
             rows, baseline,
             "plan {plan_index} direct={direct} diverged from plan {base_plan} direct={base_direct}"
@@ -3922,14 +4129,28 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
     }
     let direct_files: usize = snapshots
         .iter()
-        .filter(|(_, direct, _, _)| *direct)
-        .map(|(_, _, files, _)| files)
+        .filter(|(_, direct, _, _, _)| *direct)
+        .map(|(_, _, files, _, _)| files)
         .sum();
-    assert!(
-        direct_files >= 8,
-        "the multi-file plans should exercise the direct path, got {direct_files} direct files"
+    let half_room_bails: usize = snapshots
+        .iter()
+        .filter(|(_, direct, _, _, _)| *direct)
+        .map(|(_, _, _, bails, _)| bails)
+        .sum();
+    // Two late files in the small fixture exceed half the room's stored events
+    // (4 of 6, 6 of 8) and correctly take the whole-room path instead of the
+    // direct one, so the count is 7 rather than the 9 it would be while the
+    // room-size hint stayed at 0. The convergence check above still covers
+    // every plan, bailing or not.
+    assert_eq!(
+        direct_files, 7,
+        "over-half late closures must take the whole-room path; got {direct_files} direct files"
     );
-    for (plan_index, direct, files, _) in &snapshots {
+    assert_eq!(
+        half_room_bails, 2,
+        "the production import path must actually arm the whole-room bail for each over-half file"
+    );
+    for (plan_index, direct, files, _, _) in &snapshots {
         if !*direct {
             assert_eq!(*files, 0, "the whole-room run never uses the gate");
         } else if *plan_index == plans.len() - 1 {
@@ -6797,7 +7018,7 @@ fn compute_state_groups_assigns_groups_per_event() {
 #[test]
 fn compute_state_groups_empty_input() {
     let groups = compute_state_groups_partial(&[], &[], "!r:x").groups;
-    assert!(groups.is_empty());
+    assert!(groups.is_empty(), "value should be empty");
 }
 
 #[test]
@@ -6927,7 +7148,7 @@ fn partial_state_groups_report_cycles() {
         r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
     );
     let result = compute_state_groups_partial(&[first, second], &[], "!r:x");
-    assert!(result.groups.is_empty());
+    assert!(result.groups.is_empty(), "value should be empty");
     assert_eq!(result.unresolved.len(), 2);
 }
 
@@ -7288,10 +7509,12 @@ fn multi_dir_shards_iterates_all_databases() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -7328,6 +7551,7 @@ fn mutating_command_rejects_multi_dir() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn coalesced_shards_and_collections_and_stats() {
     let dir1 = unique_temp_dir();
     let dir2 = unique_temp_dir();
@@ -7352,10 +7576,12 @@ fn coalesced_shards_and_collections_and_stats() {
         shard_type: None,
         coalesce: true,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: Some("bytes".to_owned()),
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: Some("bytes".to_owned()),
+            },
         },
     };
     cmd_shards(&cli_shards, false, false, Some("bytes")).unwrap();
@@ -7495,7 +7721,7 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             id: "$event:example.org".to_owned(),
             data: "{}".to_owned(),
         },
-        Commands::Delete {
+        Commands::Drop {
             collections: vec!["0x00000000000000000000000000000000".to_owned()],
             yes: true,
         },
@@ -7692,9 +7918,11 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(format_id(&col1)),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     cmd_info(&cli_info, &format_id(&col1), None, false).unwrap();
@@ -7718,27 +7946,14 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
             live: false,
         },
     };
-    cmd_scan(
-        &cli_scan,
-        &format_id(&col1),
-        false,
-        false,
-        None,
-        10,
-        None,
-        None,
-        false,
-        None,
-        false,
-        false,
-    )
-    .unwrap();
+    run(&cli_scan).unwrap();
 
-    let missing = format_id(&[0x99; 16]);
-    assert!(cmd_scan(
-        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
-    )
-    .is_err());
+    let mut missing_cli = cli_scan.clone();
+    let Commands::Scan { selector, .. } = &mut missing_cli.command else {
+        unreachable!("the constructed command is a scan");
+    };
+    *selector = format_id(&[0x99; 16]);
+    assert!(run(&missing_cli).is_err());
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
@@ -7813,10 +8028,12 @@ fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     cmd_shards(&inspect, false, false, None).unwrap();
@@ -8240,18 +8457,21 @@ fn remove_hides_records_and_tombstones_reports_them() {
 
     let report = state_cli(
         &dir,
-        Commands::Tombstones {
-            collection: collection_hex.clone(),
+        Commands::Info {
+            selector: Some(collection_hex.clone()),
+            stats: false,
+            tombstones: true,
             keys: true,
             detail: true,
+            json: false,
         },
     );
     // Counts only (index), counts plus frame totals, and the key listing.
-    cmd_tombstones(&report, &collection_hex, false, false).unwrap();
-    cmd_tombstones(&report, &collection_hex, false, true).unwrap();
-    cmd_tombstones(&report, &collection_hex, true, true).unwrap();
+    cmd_tombstones(&report, &collection_hex, false, false, false).unwrap();
+    cmd_tombstones(&report, &collection_hex, false, true, false).unwrap();
+    cmd_tombstones(&report, &collection_hex, true, true, false).unwrap();
     // An unknown collection is an error, not an empty report.
-    assert!(cmd_tombstones(&report, &format_id(&[0x77u8; 16]), false, false).is_err());
+    assert!(cmd_tombstones(&report, &format_id(&[0x77u8; 16]), false, false, false).is_err());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -8925,7 +9145,8 @@ fn a_room_export_without_a_create_event_is_refused() {
 #[test]
 fn a_room_import_populates_timeline_index() {
     use crate::interchange::parse_room;
-    use mtxdb::timeline::*;
+    use mtxdb::ordered_timeline::EventTopoIndex;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -8937,7 +9158,10 @@ fn a_room_import_populates_timeline_index() {
     assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
-    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
     assert_eq!(page.entries.len(), 6);
 
@@ -9098,8 +9322,9 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
 
 #[test]
 fn stale_auth_events_are_rejected_against_state_before() {
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9143,9 +9368,12 @@ fn stale_auth_events_are_rejected_against_state_before() {
         3
     );
 
-    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9161,8 +9389,9 @@ fn stale_auth_events_are_rejected_against_state_before() {
 #[test]
 fn rejected_state_event_does_not_change_later_state() {
     use mtxdb::export_schema::RejectionCode;
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9227,9 +9456,12 @@ fn rejected_state_event_does_not_change_later_state() {
         4
     );
 
-    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9267,8 +9499,9 @@ fn rejected_state_event_does_not_change_later_state() {
 
 #[test]
 fn partial_base_state_is_left_unchecked() {
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9321,9 +9554,12 @@ fn partial_base_state_is_left_unchecked() {
         5
     );
 
-    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9497,8 +9733,9 @@ fn exported_rejected_flag_is_not_trusted_for_state() {
 #[test]
 fn flag_index_timeline_count_matches_timeline_index() {
     use crate::interchange::parse_room;
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9530,7 +9767,10 @@ fn flag_index_timeline_count_matches_timeline_index() {
     assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
@@ -9542,8 +9782,9 @@ fn flag_index_timeline_count_matches_timeline_index() {
 #[test]
 fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     use crate::interchange::parse_room;
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9583,7 +9824,10 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     // The two non-outliers make it in; the soft-failed outlier stays out even
@@ -9617,8 +9861,9 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
 fn stream_and_arrival_order_survive_import() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9653,7 +9898,10 @@ fn stream_and_arrival_order_survive_import() {
     assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     // Live and backfilled positions are preserved exactly; the soft-failed
@@ -9708,8 +9956,9 @@ fn stream_and_arrival_order_survive_import() {
 fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
+    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
-    use mtxdb::timeline::*;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9759,9 +10008,12 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
         "--flag soft-failed selects the imported event"
     );
 
-    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
     assert_eq!(
         streams,
@@ -9889,7 +10141,8 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
 #[test]
 fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     use crate::interchange::parse_room;
-    use mtxdb::timeline::*;
+    use mtxdb::ordered_timeline::EventTopoIndex;
+    use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
     let root = unique_temp_dir();
@@ -9926,7 +10179,10 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
 
     // Only the 4 timeline events should be present ($notimeline and $outlier excluded)
@@ -11592,7 +11848,7 @@ fn gap_commands_edit_and_list_a_stored_manifest() {
         gap_manifest::read(&db, room).unwrap().gaps["$gap"].status()
     };
 
-    cmd_gap_list(&cli, room, None, true).unwrap();
+    cmd_gap_list(&cli, room, None, true, 0).unwrap();
     assert_eq!(status(), GapStatus::Open);
 
     // An id the manifest does not track is refused, and nothing is created.
@@ -11612,7 +11868,7 @@ fn gap_commands_edit_and_list_a_stored_manifest() {
     })
     .unwrap();
     assert_eq!(status(), GapStatus::Anchored);
-    cmd_gap_list(&cli, room, Some("anchored"), false).unwrap();
+    cmd_gap_list(&cli, room, Some("anchored"), false, 0).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -11851,4 +12107,814 @@ fn the_strict_check_covers_every_room_the_run_touched() {
         check_complete_prevs(&db, &cache.gap_rooms, PrevGate::Require).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+#[test]
+fn room_selector_expands_per_pool() {
+    let room = "!roomid:example.org";
+    let event = super::parse_collection_selectors_for_pool(room, ShardType::EventDag).unwrap();
+    assert_eq!(event, vec![super::matrix_room_collection_id(room)]);
+    let state = super::parse_collection_selectors_for_pool(room, ShardType::State).unwrap();
+    assert_eq!(
+        state,
+        vec![
+            mtxdb::room_state_collection_id(room.as_bytes()),
+            mtxdb::room_roots_collection_id(room.as_bytes()),
+            derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes()),
+        ]
+    );
+    assert!(!state.contains(&event[0]));
+    let hex = super::parse_collection_selectors_for_pool(
+        "0xA3C8003F0854283F22C5C115DB3F0BD6",
+        ShardType::State,
+    )
+    .unwrap();
+    assert_eq!(hex.len(), 1);
+}
+
+#[test]
+fn room_stats_scan_packs_missing_from_a_stale_collection_sidecar() {
+    let dir = unique_temp_dir();
+    let source_dir = unique_temp_dir();
+    let room = "!sidecar-room:test";
+    let collection = mtxdb::interop::room_event_collection_id(room.as_bytes());
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let source_layout = DatabaseLayout::open(source_dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
+    let source_pool_dir = source_layout.pool_dir(ShardType::EventDag).unwrap();
+
+    let write_event = |path: &Path, node: [u8; 16], body: &str, persist_sidecar: bool| {
+        let store = PackfileStorage::open(path.to_path_buf()).unwrap();
+        store
+            .put(&collection, &node, &NodeData::from_slice(body.as_bytes()))
+            .unwrap();
+        store.sync_all().unwrap();
+        if persist_sidecar {
+            store.persist_shard_collections().unwrap();
+        }
+    };
+    write_event(
+        &pool_dir,
+        [1; 16],
+        r#"{"event_id":"$old","room_id":"!sidecar-room:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":1000,"content":{"membership":"join"}}"#,
+        true,
+    );
+    write_event(
+        &source_pool_dir,
+        [2; 16],
+        r#"{"event_id":"$new","room_id":"!sidecar-room:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":2000,"content":{"membership":"leave"}}"#,
+        false,
+    );
+    let new_pack = glob_pack_files(&source_pool_dir).unwrap()[0].0;
+    std::fs::copy(
+        source_pool_dir.join(new_pack.filename()),
+        pool_dir.join(new_pack.filename()),
+    )
+    .unwrap();
+
+    let sidecar = PackfileStorage::collection_shards_from_disk(&pool_dir).unwrap();
+    assert_eq!(sidecar[&collection].len(), 1);
+    assert!(!sidecar[&collection].contains(&new_pack));
+
+    let stats = super::scan_room_event_stats(&pool_dir, &collection).unwrap();
+    assert_eq!(
+        stats.members.get("@alice:test"),
+        Some(&(2000, "leave".to_owned()))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(source_dir).unwrap();
+}
+
+#[test]
+fn room_stats_ignores_stale_body_after_latest_removal() {
+    let dir = unique_temp_dir();
+    let room = "!removed-join:test";
+    let collection = mtxdb::interop::room_event_collection_id(room.as_bytes());
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
+    let stale_body = r#"{"event_id":"$join","room_id":"!removed-join:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":2000,"content":{"membership":"join"}}"#;
+    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let id = [0x91; 16];
+    store
+        .put(
+            &collection,
+            &id,
+            &NodeData::from_slice(stale_body.as_bytes()),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let collection_hex = format_id(&collection);
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Remove {
+            collection: collection_hex.clone(),
+            ids: vec![format_id(&id)],
+            yes: true,
+        },
+    };
+    cmd_remove(&cli, &collection_hex, &[format_id(&id)], true).unwrap();
+
+    let stats = super::scan_room_event_stats(&pool_dir, &collection).unwrap();
+    assert_eq!(stats.records, 0);
+    assert!(stats.members.is_empty(), "value should be empty");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn raw_scan_note_does_not_claim_truncation_at_the_limit() {
+    let at_limit = super::raw_scan_note(5, 5, true).unwrap();
+    assert!(at_limit.contains("stopped after 5"), "{at_limit}");
+    assert!(!at_limit.contains("showing first"), "{at_limit}");
+    // A streaming scan that stopped at the limit may not know the full count.
+    assert!(super::raw_scan_note(6, 5, true)
+        .unwrap()
+        .contains("stopped after 5"));
+    assert_eq!(super::raw_scan_note(5, 5, false), None);
+    assert!(super::raw_scan_note(6, 5, false)
+        .unwrap()
+        .contains("only showing top 5"));
+}
+
+#[test]
+fn sorted_scan_count_marks_only_actual_truncation() {
+    assert_eq!(super::sorted_scan_display(5, 5), (5, false));
+    assert_eq!(super::sorted_scan_display(6, 5), (5, true));
+    assert_eq!(super::sorted_scan_display(4, 5), (4, false));
+}
+
+#[test]
+fn committed_through_reports_reclaimed_history_for_a_reopened_segment() {
+    // A fresh segment starts at base 1; nothing has been committed.
+    assert_eq!(committed_through(0, 1), 0);
+    // A populated segment keeps its live watermark.
+    assert_eq!(committed_through(42, 7), 42);
+    // A header-only reopened segment has no live groups, so its base is the
+    // only evidence of the history already reclaimed before it.
+    assert_eq!(committed_through(0, 7), 6);
+    assert_eq!(committed_through(3, 7), 6);
+}
+
+#[test]
+fn forward_short_id_is_present_only_for_a_four_byte_record() {
+    assert!(!forward_short_id_present(None));
+    assert!(!forward_short_id_present(Some(&[])));
+    assert!(!forward_short_id_present(Some(&[0, 1, 2])));
+    assert!(!forward_short_id_present(Some(&[0, 1, 2, 3, 4])));
+    assert!(forward_short_id_present(Some(&[0, 1, 2, 3])));
+}
+
+#[test]
+fn state_member_lookup_reports_missing_and_malformed_auth_forward_records() {
+    let dir = unique_temp_dir();
+    let room = "!state-members:test";
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let entries = vec![
+        (
+            "m.room.member".to_owned(),
+            "@mapped:test".to_owned(),
+            "$mapped".to_owned(),
+        ),
+        (
+            "m.room.member".to_owned(),
+            "@unmapped:test".to_owned(),
+            "$unmapped".to_owned(),
+        ),
+        (
+            "m.room.member".to_owned(),
+            "@malformed:test".to_owned(),
+            "$malformed".to_owned(),
+        ),
+    ];
+    let built = crate::state_hamt::build_state_hamt(
+        room,
+        &crate::state_hamt::room_hamt_prefix(room),
+        &entries,
+    )
+    .unwrap();
+    let stat_collection = crate::state_hamt::state_hamt_collection_id(room).unwrap();
+    for (hash, bytes) in &built.nodes {
+        store
+            .put(
+                &stat_collection,
+                &mtxdb::state_hamt_node_id(hash),
+                &NodeData::from_slice(bytes),
+            )
+            .unwrap();
+    }
+    let root_id = crate::state_hamt::state_hamt_root_node_id(room, &built.state_group_id);
+    store
+        .put(
+            &stat_collection,
+            &root_id,
+            &NodeData::from_slice(&built.root_record),
+        )
+        .unwrap();
+    let group_id = [0x51; 16];
+    let group = mtxdb::StateGroupInstance {
+        parents: Vec::new(),
+        lthash: built.state_group_id,
+        root_id,
+        derivation: mtxdb::StateGroupDerivation::new(
+            mtxdb::StateGroupResolver::V2,
+            mtxdb::StateGroupTrust::TrustedImport,
+        ),
+    };
+    store
+        .put(
+            &mtxdb::state_group_collection_id(room).unwrap(),
+            &group_id,
+            &NodeData::from_slice(&mtxdb::encode_state_group_record(&group)),
+        )
+        .unwrap();
+    let auth_collection = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    store
+        .put(
+            &auth_collection,
+            &crate::auth_check::forward_node_id("$mapped"),
+            &NodeData::from_slice(&[0, 0, 0, 1]),
+        )
+        .unwrap();
+    store
+        .put(
+            &auth_collection,
+            &crate::auth_check::forward_node_id("$malformed"),
+            &NodeData::from_slice(&[0, 1, 2]),
+        )
+        .unwrap();
+
+    let missing = super::collect_missing_state_members(&store, room, &auth_collection).unwrap();
+    assert_eq!(missing.len(), 2);
+    assert_eq!(missing[0].event_id, "$malformed");
+    assert_eq!(missing[0].groups, vec![group_id]);
+    assert_eq!(missing[1].event_id, "$unmapped");
+    assert_eq!(missing[1].groups, vec![group_id]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reports_empty_event_payloads_as_unreadable() {
+    let dir = unique_temp_dir();
+    let room = "!empty-event:test";
+    let collection = matrix_room_collection_id(room);
+    let node_id = [0xA5; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &node_id, &NodeData::from_slice(&[]))
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let entry = &scanned[&format!("<node {}>", hex::encode(node_id))];
+    assert!(matches!(
+        entry.auth,
+        crate::auth_check::EventAuth::Unreadable(_)
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reads_plain_json_event_records() {
+    let dir = unique_temp_dir();
+    let room = "!plain-json:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"11"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.member","state_key":"@a:test","room_id":"!plain-json:test","content":{"membership":"join"},"auth_events":["$body"],"prev_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xD3; 16],
+            &NodeData::from_slice(create.as_bytes()),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xD4; 16],
+            &NodeData::from_slice(message.as_bytes()),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert!(
+        !scanned
+            .keys()
+            .any(|event_id| event_id.starts_with("<node ")),
+        "plain JSON records must derive their event IDs, not fall back to node labels"
+    );
+    let entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xD4; 16])
+        .unwrap();
+    match &entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$body".to_owned()]);
+        }
+        other => panic!("plain JSON record did not use its body auth list: {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn open_auth_test_graph(dir: &Path) -> (DatabaseLayout, mtxdb::short_id::ReadOnlyGraph) {
+    let layout = DatabaseLayout::open_read_only(dir.to_path_buf()).unwrap();
+    let pools: Vec<_> = ShardType::ALL
+        .into_iter()
+        .map(|shard_type| {
+            std::sync::Arc::new(
+                PackfileStorage::open_read_committed_shared(
+                    layout.pool_path(shard_type),
+                    layout.shared_wal_path(),
+                    shard_type,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
+        pools.try_into().ok().expect("three shard pools");
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(layout.clone(), pools);
+    (layout, graph)
+}
+
+#[test]
+fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
+    let dir = unique_temp_dir();
+    let room = "!homeserver-csr:test";
+    // The homeserver derives the room's EVNT member collection from the
+    // group id and records edges under `for_collection` of that id.
+    let homeserver_collection = mtxdb::derive_member_collection_id_from_group(
+        mtxdb::MEMBER_NAMESPACE_EVNT,
+        mtxdb::derive_group_full_id(room.as_bytes()),
+    )
+    .unwrap();
+    assert_eq!(homeserver_collection, matrix_room_collection_id(room));
+    let (create_id, child_id) =
+        write_homeserver_auth_check_events(&dir, room, &homeserver_collection);
+
+    let db = Database::open(dir.clone()).unwrap();
+    mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection)
+        .record_events(
+            &db,
+            &[
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &create_id,
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &child_id,
+                    prev: &[],
+                    auth: &[&create_id],
+                    relation: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let (_, graph) = open_auth_test_graph(&dir);
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
+    assert!(adjacency
+        .events_index()
+        .lookup(&graph, create_id.as_bytes())
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        adjacency.auth_of(&graph, &child_id).unwrap(),
+        Some(vec![create_id.clone()])
+    );
+
+    let cli = state_cli(
+        &dir,
+        Commands::Info {
+            selector: None,
+            stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
+        },
+    );
+    let report = cmd_auth_check(&cli, room, false, 0).unwrap();
+    assert_eq!(report.allocated, 2);
+    assert_eq!(report.with_edges, 2);
+    assert_eq!(report.mismatched.len(), 0);
+    assert_eq!(report.no_record.len(), 0);
+    assert_eq!(report.bad_records.len(), 0);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reports_a_stored_auth_owner_without_an_event_body() {
+    let dir = unique_temp_dir();
+    let room = "!homeserver-csr-owner:test";
+    let homeserver_collection = matrix_room_collection_id(room);
+    let (create_id, child_id) =
+        write_homeserver_auth_check_events(&dir, room, &homeserver_collection);
+    let edge_only = "$edge-only".to_owned();
+
+    let db = Database::open(dir.clone()).unwrap();
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
+    adjacency
+        .record_events(
+            &db,
+            &[
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &create_id,
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &child_id,
+                    prev: &[],
+                    auth: &[&create_id],
+                    relation: None,
+                },
+                // An AUTH owner whose event body is deliberately absent from
+                // the event collection.
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &edge_only,
+                    prev: &[],
+                    auth: &[&create_id],
+                    relation: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let (_, graph) = open_auth_test_graph(&dir);
+    let records = super::auth_check_records_from_csr(&adjacency, &graph).unwrap();
+    let owner_id = adjacency
+        .events_index()
+        .lookup(&graph, edge_only.as_bytes())
+        .unwrap();
+    assert!(
+        records.contains_key(&crate::auth_check::edge_node_id(owner_id.unwrap())),
+        "the stored AUTH owner must get an edge record even without a body"
+    );
+
+    let cli = state_cli(
+        &dir,
+        Commands::Info {
+            selector: None,
+            stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
+        },
+    );
+    let report = cmd_auth_check(&cli, room, false, 0).unwrap();
+    assert_eq!(report.with_edges, 3);
+    assert_eq!(report.no_record, vec![edge_only]);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_excludes_rows_above_the_reported_counter() {
+    let dir = unique_temp_dir();
+    let room = "!auth-counter-filter:test";
+    let collection = matrix_room_collection_id(room);
+    let db = Database::open(dir.clone()).unwrap();
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&collection);
+    adjacency
+        .record_event(&db, "$allocated", &[], &[], None)
+        .unwrap();
+    let store = mtxdb::csr::store::CsrStore::open(db.layout(), ShardType::State);
+    let mut event_index = b"matrix-adjacency-c:".to_vec();
+    event_index.extend_from_slice(&collection);
+    let event_index = mtxdb::derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), &event_index);
+    let mut scope_name = b"matrix-csr:".to_vec();
+    scope_name.extend_from_slice(&event_index);
+    let scope = mtxdb::csr::store::ScopeId(mtxdb::derive_collection_id(
+        Some(mtxdb::MEMBER_NAMESPACE_INTL),
+        &scope_name,
+    ));
+    store
+        .writer(&db)
+        .unwrap()
+        .append_rows(
+            scope,
+            &[mtxdb::csr::store::RowRecord {
+                family: mtxdb::csr_adjacency::AUTH,
+                owner: 10_000,
+                edges: vec![mtxdb::csr::Edge { target: 1, kind: 0 }],
+            }],
+        )
+        .unwrap();
+
+    let (_, graph) = open_auth_test_graph(&dir);
+    let records = super::auth_check_records_from_csr(&adjacency, &graph).unwrap();
+    assert!(records.contains_key(&crate::auth_check::counter_node_id()));
+    assert!(!records.contains_key(&crate::auth_check::edge_node_id(10_000)));
+
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn write_homeserver_auth_check_events(
+    dir: &Path,
+    room: &str,
+    collection: &[u8; 16],
+) -> (String, String) {
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#.to_owned();
+    let child = format!(
+        r#"{{"type":"m.room.message","room_id":"{room}","content":{{"body":"hello"}},"prev_state_events":[]}}"#
+    );
+    let create_id = msc4242_event_id(&create);
+    let child_id = msc4242_event_id(&child);
+    let layout = DatabaseLayout::open(dir.to_path_buf()).unwrap();
+    let store = PackfileStorage::open(layout.pool_path(ShardType::EventDag)).unwrap();
+    let events = [
+        (
+            [1; 16],
+            r#"{"calculated_auth_event_ids":[]}"#.to_owned(),
+            create,
+        ),
+        (
+            [2; 16],
+            format!(r#"{{"calculated_auth_event_ids":["{create_id}"]}}"#),
+            child,
+        ),
+    ];
+    for (node_id, metadata, json) in &events {
+        store
+            .put(
+                collection,
+                node_id,
+                &NodeData::from_slice(&encode_event_json_record(5, metadata, json)),
+            )
+            .unwrap();
+    }
+    assert_eq!(store.scan_collection(collection).unwrap().count(), 2);
+    store.sync().unwrap();
+    (create_id, child_id)
+}
+
+#[test]
+fn auth_check_marks_msc4242_without_metadata_auth_ids_as_unreadable() {
+    let dir = unique_temp_dir();
+    let room = "!msc4242:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"auth_events":[],"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.message","room_id":"!msc4242:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xC1; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, "{}", create)),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xC2; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, "{}", message)),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert!(scanned.values().all(|event| matches!(
+        &event.auth,
+        crate::auth_check::EventAuth::Unreadable(reason)
+            if reason.contains("MSC4242") && reason.contains("internal metadata")
+    )));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_compares_msc4242_metadata_auth_ids() {
+    let dir = unique_temp_dir();
+    let room = "!msc4242-ok:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.message","room_id":"!msc4242-ok:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xC3; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":[]}"#,
+                create,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xC4; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":["$evt"]}"#,
+                message,
+            )),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    // The metadata ids are compared only after the event id is derived.
+    assert!(scanned.keys().all(|event_id| event_id.starts_with('$')));
+
+    let create_entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xC3; 16])
+        .unwrap();
+    assert!(matches!(
+        &create_entry.auth,
+        crate::auth_check::EventAuth::Ids(ids) if ids.is_empty()
+    ));
+    let message_entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xC4; 16])
+        .unwrap();
+    match &message_entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$evt".to_owned()]);
+        }
+        other => panic!("MSC4242 metadata auth ids were not compared: {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_compares_msc4242_metadata_ids_with_auth_edges() {
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let report = check_msc4242_metadata_against_auth_edges(&[&create_id]);
+    assert_eq!(report.allocated, 2);
+    assert_eq!(report.with_edges, 2);
+    assert_eq!(
+        report.mismatched,
+        Vec::new(),
+        "metadata ids should match the edges"
+    );
+    assert_eq!(report.bad_records, Vec::new());
+}
+
+#[test]
+fn auth_check_reports_msc4242_metadata_ids_that_disagree_with_auth_edges() {
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let report = check_msc4242_metadata_against_auth_edges(&["$unrelated"]);
+    assert_eq!(report.mismatched.len(), 1, "{:?}", report.mismatched);
+    let mismatch = &report.mismatched[0];
+    assert_eq!(mismatch.event_id, msc4242_event_id(MSC4242_MESSAGE));
+    assert_eq!(mismatch.missing, vec!["$unrelated".to_owned()]);
+    assert_eq!(mismatch.extra, vec![create_id]);
+}
+
+const MSC4242_CREATE: &str = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#;
+const MSC4242_MESSAGE: &str = r#"{"type":"m.room.message","room_id":"!msc4242-edges:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+
+fn msc4242_event_id(json: &str) -> String {
+    let hash = rezzy::reference_hash(&owned_value(json), "org.matrix.msc4242.12")
+        .expect("MSC4242 event ids are reference hashes");
+    format!("${hash}")
+}
+
+fn auth_edge_record(targets: &[u32]) -> Vec<u8> {
+    let mut buf = vec![1u8];
+    buf.extend_from_slice(
+        &u32::try_from(targets.len())
+            .expect("test edge list fits in u32")
+            .to_be_bytes(),
+    );
+    for target in targets {
+        buf.extend_from_slice(&target.to_be_bytes());
+    }
+    buf
+}
+
+/// Scan a format-5 room whose message event records `metadata_ids` as its auth
+/// list, then run the whole check against an AUTH edge table where short id 1
+/// is the create event (no auth) and 2 is the message (auth: create).
+fn check_msc4242_metadata_against_auth_edges(metadata_ids: &[&str]) -> crate::auth_check::Report {
+    let dir = unique_temp_dir();
+    let room = "!msc4242-edges:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let message_id = msc4242_event_id(MSC4242_MESSAGE);
+    let metadata = format!(
+        r#"{{"calculated_auth_event_ids":[{}]}}"#,
+        metadata_ids
+            .iter()
+            .map(|id| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    store
+        .put(
+            &collection,
+            &[0xE1; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":[]}"#,
+                MSC4242_CREATE,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xE2; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, &metadata, MSC4242_MESSAGE)),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let mut auth = HashMap::new();
+    auth.insert(
+        crate::auth_check::counter_node_id(),
+        2u64.to_be_bytes().to_vec(),
+    );
+    auth.insert(crate::auth_check::edge_node_id(1), auth_edge_record(&[]));
+    auth.insert(crate::auth_check::edge_node_id(2), auth_edge_record(&[1]));
+    auth.insert(
+        crate::auth_check::reverse_node_id(1),
+        create_id.as_bytes().to_vec(),
+    );
+    auth.insert(
+        crate::auth_check::reverse_node_id(2),
+        message_id.as_bytes().to_vec(),
+    );
+
+    let report = crate::auth_check::check(
+        |id| Ok::<_, std::convert::Infallible>(auth.get(id).cloned()),
+        |event_id| {
+            Ok(match scanned.get(event_id) {
+                Some(entry) => match &entry.auth {
+                    crate::auth_check::EventAuth::Ids(ids) => {
+                        crate::auth_check::EventAuth::Ids(ids.clone())
+                    }
+                    crate::auth_check::EventAuth::Unreadable(reason) => {
+                        crate::auth_check::EventAuth::Unreadable(reason.clone())
+                    }
+                    crate::auth_check::EventAuth::Absent => crate::auth_check::EventAuth::Absent,
+                },
+                None => crate::auth_check::EventAuth::Absent,
+            })
+        },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    report
+}
+
+#[test]
+fn auth_check_keeps_using_the_body_for_non_msc4242_records() {
+    let dir = unique_temp_dir();
+    let room = "!v11-body:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"11"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.member","state_key":"@a:test","room_id":"!v11-body:test","content":{"membership":"join"},"auth_events":["$body"],"prev_events":[]}"#;
+    // A metadata copy must not override the body for formats that carry
+    // `auth_events` themselves.
+    store
+        .put(
+            &collection,
+            &[0xD1; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                3,
+                r#"{"calculated_auth_event_ids":["$meta"]}"#,
+                create,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xD2; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                3,
+                r#"{"calculated_auth_event_ids":["$meta"]}"#,
+                message,
+            )),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xD2; 16])
+        .unwrap();
+    match &entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$body".to_owned()]);
+        }
+        other => panic!("v11 record did not use its body auth list: {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

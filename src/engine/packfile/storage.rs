@@ -28,6 +28,93 @@ use crate::storage::{
     validate_established_upsert_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
     StorageEngine, StorageError,
 };
+
+const INDEX_RESIDENCY_FILE: &str = "index.residency";
+const INDEX_RESIDENCY_MAGIC: &[u8; 8] = b"MTXRES1\0";
+const INDEX_RESIDENCY_RECORD_LEN: usize = 13;
+
+fn index_residency_marker_path(base_dir: &Path) -> std::io::Result<PathBuf> {
+    if let Some(root) = crate::layout::enclosing_root(base_dir)? {
+        let pool = base_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                crate::layout::ShardType::ALL
+                    .into_iter()
+                    .find(|shard| shard.as_str() == name)
+            });
+        if let Some(pool) = pool {
+            return Ok(root.join(format!("{INDEX_RESIDENCY_FILE}.{}", pool.as_str())));
+        }
+        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
+    } else {
+        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
+    }
+}
+
+fn read_index_residency_marker(base_dir: &Path) -> std::io::Result<crate::index::IndexResidency> {
+    let path = index_residency_marker_path(base_dir)?;
+    let bytes = fs::read(&path)?;
+    if bytes.len() != INDEX_RESIDENCY_RECORD_LEN || bytes.get(..8) != Some(INDEX_RESIDENCY_MAGIC) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a valid index-residency record", path.display()),
+        ));
+    }
+    let expected_crc = u32::from_le_bytes(
+        bytes[9..13]
+            .try_into()
+            .expect("record length was checked above"),
+    );
+    if crc32fast::hash(&bytes[..9]) != expected_crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} has an invalid index-residency checksum", path.display()),
+        ));
+    }
+    match bytes[8] {
+        0 => Ok(crate::index::IndexResidency::Resident),
+        1 => Ok(crate::index::IndexResidency::Paged),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} has an unknown index-residency value", path.display()),
+        )),
+    }
+}
+
+fn persist_index_residency_marker(
+    base_dir: &Path,
+    residency: crate::index::IndexResidency,
+) -> std::io::Result<()> {
+    let path = index_residency_marker_path(base_dir)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    match read_index_residency_marker(base_dir) {
+        Ok(existing) if existing == residency => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut bytes = Vec::with_capacity(INDEX_RESIDENCY_RECORD_LEN);
+    bytes.extend_from_slice(INDEX_RESIDENCY_MAGIC);
+    bytes.push(match residency {
+        crate::index::IndexResidency::Resident => 0,
+        crate::index::IndexResidency::Paged => 1,
+    });
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    let temp_path = path.with_file_name(format!("{INDEX_RESIDENCY_FILE}.tmp"));
+    let mut temp = fs::File::create(&temp_path)?;
+    std::io::Write::write_all(&mut temp, &bytes)?;
+    temp.sync_all()?;
+    fs::rename(&temp_path, &path)?;
+    crate::shard::sync_directory(parent)?;
+    Ok(())
+}
 use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
@@ -51,6 +138,9 @@ thread_local! {
 /// Callback that rewrites a node's child references given resolved child data,
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
+
+/// `(node id, shard slot, frame offset, frame length)` for a live record.
+pub type LiveRecordLocation = (NodeId, u16, u64, u64);
 
 /// Lowercase hex rendering of a 32-byte digest, for error messages.
 fn hex32(digest: &Digest32) -> String {
@@ -1017,6 +1107,12 @@ struct StreamingOpenScan {
     residency: crate::index::IndexResidency,
 }
 
+struct ScanInsertConfig<'a> {
+    deleted_collections: &'a HashSet<[u8; 16]>,
+    generation_fences: &'a HashMap<[u8; 16], u32>,
+    index_config: crate::index::IndexConfig,
+}
+
 impl StreamingOpenScan {
     fn new(collection_order: Vec<[u8; 16]>, residency: crate::index::IndexResidency) -> Self {
         let known_collections = collection_order.iter().copied().collect();
@@ -1037,15 +1133,22 @@ impl StreamingOpenScan {
         entry: packfile::ScanEntryWithRemoval,
         slot: u16,
         pack_id: PackId,
-        deleted_collections: &HashSet<[u8; 16]>,
-        index_config: crate::index::IndexConfig,
+        creation_seq: u32,
+        config: &ScanInsertConfig<'_>,
     ) -> Result<(), StorageError> {
         let collection_id = entry.collection_id;
         self.seen_collections.insert(collection_id);
         if self.known_collections.insert(collection_id) {
             self.collection_order.push(collection_id);
         }
-        if deleted_collections.contains(&collection_id) {
+        if config.deleted_collections.contains(&collection_id) {
+            return Ok(());
+        }
+        if config
+            .generation_fences
+            .get(&collection_id)
+            .is_some_and(|floor| creation_seq < *floor)
+        {
             return Ok(());
         }
 
@@ -1063,7 +1166,7 @@ impl StreamingOpenScan {
             entry.offset,
             entry.removed,
             slot,
-            index_config,
+            config.index_config,
         )
     }
 
@@ -1109,8 +1212,7 @@ impl StreamingOpenScan {
         slot: u16,
         pack_id: PackId,
         creation_seq: u64,
-        deleted_collections: &HashSet<[u8; 16]>,
-        index_config: crate::index::IndexConfig,
+        config: &ScanInsertConfig<'_>,
     ) -> Result<(), StorageError> {
         let mut error = None;
         sidecar.for_each_collection(|collection_id, disk_bytes| {
@@ -1121,7 +1223,14 @@ impl StreamingOpenScan {
             if self.known_collections.insert(collection_id) {
                 self.collection_order.push(collection_id);
             }
-            if deleted_collections.contains(&collection_id) {
+            if config.deleted_collections.contains(&collection_id) {
+                return;
+            }
+            if config
+                .generation_fences
+                .get(&collection_id)
+                .is_some_and(|floor| creation_seq < u64::from(*floor))
+            {
                 return;
             }
             let bytes = self
@@ -1164,7 +1273,7 @@ impl StreamingOpenScan {
                         offset,
                         removed,
                         slot,
-                        index_config,
+                        config.index_config,
                     ) {
                         error = Some(failure);
                     }
@@ -1216,6 +1325,7 @@ impl StreamingOpenScan {
         mut self,
         shards: &ShardPool,
         cache_capacity: usize,
+        cache_budget: Option<&Arc<crate::cache::CacheBudget>>,
     ) -> (RoomScanOutput, Vec<[u8; 16]>) {
         self.collection_order
             .retain(|collection_id| self.seen_collections.contains(collection_id));
@@ -1279,7 +1389,10 @@ impl StreamingOpenScan {
                     index,
                     sealed,
                     paged: self.residency == crate::index::IndexResidency::Paged,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation: 1,
                 }),
             );
@@ -1561,6 +1674,14 @@ pub struct ReadPlanPolicy {
     /// scan/compaction reads. Measurements are from one rotational HDD and one
     /// cheap SATA SSD; `NVMe` and other drives are untested.
     pub random_advice: bool,
+    /// Use a separate `MADV_RANDOM` mapping for single-record point reads.
+    /// Sequential scans and multi-record reads keep the normal mapping.
+    pub point_random_mmap: bool,
+    /// Use the separate `MADV_RANDOM` mapping for ordered-index node reads
+    /// only, leaving event bodies and other single-record reads on the normal
+    /// mapping. Index collections register themselves via
+    /// [`crate::storage::StorageEngine::mark_index_collection`].
+    pub point_random_mmap_index: bool,
 }
 
 impl Default for ReadPlanPolicy {
@@ -1583,6 +1704,8 @@ impl ReadPlanPolicy {
             max_extent_bytes: 0,
             min_batch_candidates: usize::MAX,
             random_advice: false,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -1597,6 +1720,8 @@ impl ReadPlanPolicy {
             max_extent_bytes: 0,
             min_batch_candidates: usize::MAX,
             random_advice: true,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -1614,6 +1739,8 @@ impl ReadPlanPolicy {
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 16,
             random_advice: false,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -2230,6 +2357,10 @@ pub struct PackfileStorage {
     /// protect a collection's lifecycle, but distinct collections may be
     /// recreated or deleted concurrently, hence the separate lock here.
     deleted_collections: parking_lot::Mutex<HashSet<[u8; 16]>>,
+    /// First pack creation sequence belonging to each collection's current
+    /// generation. Older pack frames are remnants of a deleted generation and
+    /// must be excluded from checkpoint-less scans.
+    collection_generation_fences: parking_lot::Mutex<HashMap<[u8; 16], u32>>,
     /// Cache of the deleted collections file: `(length, mtime_secs) -> parsed set`.
     /// Readers call `refresh_collection` on misses, which reparsed the file each
     /// time until the writer deleted or re-created a collection (changing the
@@ -2238,6 +2369,8 @@ pub struct PackfileStorage {
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
+    /// Shared process/database byte budget for decoded node payloads.
+    cache_budget: Option<Arc<crate::cache::CacheBudget>>,
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
@@ -2247,6 +2380,9 @@ pub struct PackfileStorage {
     /// Read once per batch; settable at runtime via
     /// [`Self::set_read_plan_policy`].
     read_plan: parking_lot::RwLock<ReadPlanPolicy>,
+    /// Collections that hold ordered-index nodes; their reads may use the
+    /// index-specific point mapping instead of the body one.
+    index_collections: parking_lot::RwLock<std::collections::HashSet<[u8; 16]>>,
     /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
@@ -2622,6 +2758,10 @@ pub struct PackfileStorage {
     read_refreshes: AtomicU64,
     /// Journal bytes scanned by read-only worker refreshes.
     read_refresh_bytes: AtomicU64,
+    /// Backoff sleeps taken by journal refresh retries.
+    read_refresh_sleeps: AtomicU64,
+    /// Total microseconds slept in those backoffs.
+    read_refresh_sleep_micros: AtomicU64,
 }
 
 /// Per-collection state for incremental repack.
@@ -2666,6 +2806,103 @@ pub(crate) const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 const NEW_COLLECTION_INDEX_FLOOR: usize = 64;
 
 impl PackfileStorage {
+    /// Rebuild a Paged reader's collection tables from durable packs after a
+    /// shared-WAL reclaim overtakes its current overlay. Paged mode has no
+    /// checkpoint image, so the only safe reload is the same sidecar/frame
+    /// walk used by a cold open.
+    pub(super) fn reload_paged_index_from_packs(&self) -> Option<u64> {
+        let covered = Self::read_journal_lsn(&self.base_dir);
+        if self.shards.discover_shards().is_err() {
+            return None;
+        }
+        let deleted = Self::load_deleted_collections(&self.base_dir);
+        let Ok(fences) = Self::load_collection_generation_fences(&self.base_dir) else {
+            return None;
+        };
+        let collection_order = persisted_collection_order(&self.base_dir).unwrap_or_default();
+        let index_config = crate::index::IndexConfig {
+            seed: self.shards.bucket_seed(),
+            ..Default::default()
+        };
+        let insert_config = ScanInsertConfig {
+            deleted_collections: &deleted,
+            generation_fences: &fences,
+            index_config,
+        };
+        let mut scan =
+            StreamingOpenScan::new(collection_order, crate::index::IndexResidency::Paged);
+        let mut shards = self.shards.all_shards();
+        shards.sort_by_key(|(_, shard)| shard.creation_seq);
+        for (slot, shard) in shards {
+            if !shard.is_current.load(Ordering::Acquire) {
+                continue;
+            }
+            let sidecar = if shard.sealed.load(Ordering::Acquire) {
+                shard
+                    .take_sealed_index()
+                    .or_else(|| crate::index::packidx::open_for_pack(&shard.path).map(Arc::new))
+            } else {
+                None
+            };
+            if let Some(sidecar) = sidecar {
+                if scan
+                    .insert_sidecar(
+                        &sidecar,
+                        slot,
+                        shard.pack_id,
+                        u64::from(shard.creation_seq),
+                        &insert_config,
+                    )
+                    .is_err()
+                {
+                    return None;
+                }
+                continue;
+            }
+            let mut scan_error = None;
+            let mut visit = |entry| {
+                if scan_error.is_none() {
+                    if let Err(error) = scan.insert(
+                        entry,
+                        slot,
+                        shard.pack_id,
+                        shard.creation_seq,
+                        &insert_config,
+                    ) {
+                        scan_error = Some(error);
+                    }
+                }
+            };
+            if packfile::scan_packfile_from_with_removal_visit(
+                &shard.path,
+                0,
+                self.shards.checksum_policy().verifies_reads(),
+                &mut visit,
+            )
+            .is_err()
+                || scan_error.is_some()
+            {
+                return None;
+            }
+        }
+        let (scan_out, collection_order) = scan.finish(
+            &self.shards,
+            self.cache_capacity,
+            self.cache_budget.as_ref(),
+        );
+        {
+            let mut tables = self.index_tables.write();
+            tables.collections = scan_out.collections;
+            tables.collection_order = collection_order;
+            tables.shard_collections = scan_out.shard_collections;
+            tables.collection_shards = scan_out.collection_shards;
+            tables.collection_disk_bytes = scan_out.collection_disk_bytes;
+        }
+        *self.deleted_collections.lock() = deleted;
+        *self.collection_generation_fences.lock() = fences;
+        Some(covered)
+    }
+
     fn refresh_lock(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
         let mut locks = self.refresh_locks.lock();
         locks
@@ -2764,6 +3001,9 @@ impl PackfileStorage {
         let store = Self::open_with_options_and_residency(
             base_dir,
             config.cache_capacity,
+            config
+                .cache_bytes
+                .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes))),
             None,
             true,
             None,
@@ -2772,6 +3012,8 @@ impl PackfileStorage {
             residency,
         )?;
         store.set_stats_enabled(config.stats_enabled);
+        store.set_point_random_mmap(config.point_random_mmap);
+        store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
         Ok(store)
     }
 
@@ -2793,6 +3035,9 @@ impl PackfileStorage {
         let store = Self::open_with_options_and_residency(
             base_dir,
             config.cache_capacity,
+            config
+                .cache_bytes
+                .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes))),
             None,
             false,
             None,
@@ -2801,6 +3046,8 @@ impl PackfileStorage {
             residency,
         )?;
         store.set_stats_enabled(config.stats_enabled);
+        store.set_point_random_mmap(config.point_random_mmap);
+        store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
         Ok(store)
     }
 
@@ -3008,10 +3255,16 @@ impl PackfileStorage {
     /// only frames tagged with `pool`, so a worker reading the state pool does
     /// not observe event-DAG or edges mutations that share the same
     /// segment. `wal_path` is the database root's shared `wal.bin`, not a
-    /// per-pool segment.
+    /// per-pool segment. This uses the default resident index configuration.
+    /// If the writer uses paged residency, use
+    /// [`Self::open_read_committed_shared_with_config`] with the matching
+    /// runtime configuration so coverage reloads rebuild the same locator
+    /// representation.
     ///
     /// # Errors
-    /// Same as [`Self::open_read_committed`].
+    /// Returns [`StorageError`] if the store or journal cannot be opened, the
+    /// residency record is missing or invalid, or this reader's residency
+    /// differs from the writer's persisted residency.
     #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared(
         base_dir: PathBuf,
@@ -3019,8 +3272,57 @@ impl PackfileStorage {
         pool: crate::layout::ShardType,
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only(base_dir)?;
+        store.validate_shared_reader_reload_mode()?;
         store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
+    }
+
+    /// Open a read-only worker on one pool of a shared WAL, using explicit
+    /// runtime settings such as paged index residency.
+    ///
+    /// Use this when the writer's index residency is not the default. In
+    /// particular, paged writers require paged readers so WAL coverage reloads
+    /// rebuild the same locator representation.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if opening the read-only store fails, runtime
+    /// settings are invalid, the residency record is missing or invalid, this
+    /// reader's residency differs from the writer's, or shared-WAL recovery
+    /// fails.
+    #[cfg(feature = "multi-reader")]
+    pub fn open_read_committed_shared_with_config(
+        base_dir: PathBuf,
+        wal_path: impl AsRef<Path>,
+        pool: crate::layout::ShardType,
+        config: &RuntimeConfig,
+    ) -> Result<Self, StorageError> {
+        let store = Self::open_read_only_with_config(base_dir, config)?;
+        store.validate_shared_reader_reload_mode()?;
+        store.enable_read_journal_shared(wal_path, pool)?;
+        Ok(store)
+    }
+
+    /// Require this reader to match the durable mode published by the writer.
+    /// Otherwise reclaimed shared-WAL coverage may be impossible to reload
+    /// from this reader's index representation.
+    fn validate_shared_reader_reload_mode(&self) -> Result<(), StorageError> {
+        let writer_residency = read_index_residency_marker(&self.base_dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StorageError::Unsupported(format!(
+                    "{} has no persisted index-residency record; reopen its writer with this mtxdb version before attaching shared-WAL readers",
+                    self.base_dir.display()
+                ))
+            } else {
+                StorageError::Corrupt(error.to_string())
+            }
+        })?;
+        if writer_residency != self.index_residency {
+            return Err(StorageError::Unsupported(format!(
+                "{} writer uses {:?} index residency but this reader uses {:?}; open the reader with open_read_committed_shared_with_config and matching index residency",
+                self.base_dir.display(), writer_residency, self.index_residency
+            )));
+        }
+        Ok(())
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.
@@ -3075,6 +3377,7 @@ impl PackfileStorage {
         Self::open_with_options_and_residency(
             base_dir,
             cache_capacity,
+            None,
             swizzle,
             writable,
             max_shard_bytes,
@@ -3102,6 +3405,7 @@ impl PackfileStorage {
             base_dir,
             DEFAULT_CACHE_CAPACITY,
             None,
+            None,
             true,
             None,
             true,
@@ -3126,6 +3430,7 @@ impl PackfileStorage {
             base_dir,
             DEFAULT_CACHE_CAPACITY,
             None,
+            None,
             true,
             Some(max_shard_bytes),
             true,
@@ -3138,6 +3443,7 @@ impl PackfileStorage {
     fn open_with_options_and_residency(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         swizzle: Option<SwizzleFn>,
         writable: bool,
         max_shard_bytes: Option<u64>,
@@ -3148,6 +3454,7 @@ impl PackfileStorage {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
+            cache_budget,
             swizzle,
             writable,
             max_shard_bytes,
@@ -3163,6 +3470,8 @@ impl PackfileStorage {
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
+        max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
         residency: crate::index::IndexResidency,
@@ -3170,9 +3479,10 @@ impl PackfileStorage {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
+            cache_budget,
             None,
             true,
-            None,
+            max_shard_bytes,
             compress,
             checksum_policy,
             residency,
@@ -3185,6 +3495,7 @@ impl PackfileStorage {
     fn open_with_options_locked(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         swizzle: Option<SwizzleFn>,
         writable: bool,
         max_shard_bytes: Option<u64>,
@@ -3193,37 +3504,39 @@ impl PackfileStorage {
         residency: crate::index::IndexResidency,
         take_writer_lock: bool,
     ) -> Result<Self, std::io::Error> {
-        // A writable paged open retires `index.checkpoint` and sweeps the
-        // delta logs. That is correct for a genuinely standalone store, but a
-        // pool inside a database root belongs to the shared-WAL representation,
-        // which requires Resident residency. Reject before any directory or
-        // on-disk mutation so an environment variable cannot silently convert
-        // a root through a maintenance command.
-        if writable && residency == crate::index::IndexResidency::Paged {
+        // Standalone maintenance opens must not silently convert one member
+        // of an existing shared-WAL root. The Database path opens members
+        // under its root lock (`take_writer_lock == false`) and applies one
+        // residency policy to the whole root.
+        if writable && take_writer_lock && residency == crate::index::IndexResidency::Paged {
             if let Some(root) = crate::layout::enclosing_root(&base_dir)? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "{} is inside database root {}; a writable paged pool would convert the root's on-disk index representation; use Resident residency",
+                        "{} is inside database root {}; open the database root to change index residency",
                         base_dir.display(),
                         root.display()
                     ),
                 ));
             }
         }
-        // Only a standalone writer creates its directory here. A member of a
-        // shared database creates it with its first pack, and a reader never
-        // creates anything.
+        // A standalone writer creates its directory here. Shared members
+        // create theirs when publishing the residency marker; readers never
+        // create anything.
         if writable && take_writer_lock {
             fs::create_dir_all(&base_dir)?;
         }
-
         let started = std::time::Instant::now();
         let mut timings = OpenTimings::default();
 
         let shard_open_started = std::time::Instant::now();
         let shards = if writable && !take_writer_lock {
-            ShardPool::open_shared_member(base_dir.clone(), compress, checksum_policy)?
+            ShardPool::open_shared_member(
+                base_dir.clone(),
+                max_shard_bytes,
+                compress,
+                checksum_policy,
+            )?
         } else if writable {
             match max_shard_bytes {
                 // Custom rotation thresholds are only used by benchmarks/
@@ -3245,6 +3558,13 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
+        if writable {
+            // The standalone shard open above holds the pool writer lock, and
+            // shared members are opened under Database's root lock. Publish
+            // the mode only after acquiring that lock, but before a paged open
+            // retires a resident checkpoint or the writer can publish WAL.
+            persist_index_residency_marker(&base_dir, residency)?;
+        }
         let shard_open_time = shard_open_started.elapsed();
         timings.shard_open = shard_open_time;
         let index_config = crate::index::IndexConfig {
@@ -3289,12 +3609,20 @@ impl PackfileStorage {
         // rescan and index rebuild entirely. It is only trusted when every
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
+        let collection_generation_fences = Self::load_collection_generation_fences(&base_dir)?;
         // Paged mode persists no primary index: sealed packs are served from
         // their sidecars and the resident table is rebuilt from the active
         // pack. Delete any checkpoint and delta epoch left by an earlier
         // resident session *before* this session's first write, so a later
         // resident open cannot load an image that predates those writes (and
         // cannot replay a delta this session never wrote).
+        // Every writable open that can delete a delta log (this paged branch,
+        // the pack-set and fingerprint gates, and the rescan below) must first
+        // make the log's version table durable elsewhere. Do it once, up front,
+        // so no deletion site can run ahead of it.
+        if writable {
+            Self::promote_delta_versions(&base_dir)?;
+        }
         let mut versions_valid = true;
         if residency == crate::index::IndexResidency::Paged && writable {
             // The checkpoint is not the primary index in paged mode, but it
@@ -3369,6 +3697,7 @@ impl PackfileStorage {
             Self::checkpoint_scan_out(
                 &base_dir,
                 cache_capacity,
+                cache_budget.as_ref(),
                 &shards,
                 &open_shards,
                 &deleted_collections,
@@ -3395,9 +3724,11 @@ impl PackfileStorage {
                 scan_out,
                 collection_order,
                 deleted_collections,
+                collection_generation_fences,
                 base_dir,
                 swizzle,
                 cache_capacity,
+                cache_budget,
                 residency,
                 delta_state,
                 checkpoint_covered,
@@ -3410,20 +3741,31 @@ impl PackfileStorage {
             return Ok(store);
         }
         timings.path = OpenPath::FullScan;
-        // The checkpoint/log gates rejected the persisted index state; never
-        // carry forward a stale log into the rescanned session — a writable
-        // open can delete it outright (read-only opens leave the file alone
-        // but will re-rescan, since the damaged bases can never trust it).
-        if writable {
-            Self::sweep_orphan_delta_logs(&base_dir, None);
-        }
+        // The checkpoint/log gates rejected the persisted index state, but do
+        // not sweep the delta epochs here: this open returns to the caller,
+        // and a shared-WAL caller runs `enable_shared_journal` only afterwards.
+        // That check reads a matching delta epoch as the pool's durable
+        // collection-version baseline for history the WAL has already
+        // reclaimed. Deleting it first would destroy the only bridge between
+        // an old checkpoint and the reclaimed LSN and turn a recoverable open
+        // into a permanent refusal, even though the epoch was valid. The
+        // epoch is inert for the rescanned index; the first successful
+        // checkpoint rotates a fresh one and sweeps the old epochs.
 
         let scan_started = std::time::Instant::now();
         let mut scan_state = StreamingOpenScan::new(collection_order, residency);
         // Runs replace their covered packs' sidecars in Paged mode only. A
         // resident build still reads each covered pack through its sidecar or
         // a frame scan below.
-        let pool_runs = shards.take_open_runs();
+        // A merged run may span a collection's generation fence. Until runs
+        // carry per-collection generation boundaries, use source pack sidecars
+        // when any fence exists so pre-delete packs can be skipped.
+        let pool_runs = if collection_generation_fences.is_empty() {
+            shards.take_open_runs()
+        } else {
+            drop(shards.take_open_runs());
+            Vec::new()
+        };
         let mut sealed_runs: Vec<Arc<crate::index::sealed::SealedRun>> = Vec::new();
         let mut run_of_pack: HashMap<PackId, usize> = HashMap::new();
         if residency == crate::index::IndexResidency::Paged {
@@ -3489,8 +3831,11 @@ impl PackfileStorage {
                         slot,
                         shard.pack_id,
                         u64::from(shard.creation_seq),
-                        &deleted_collections,
-                        index_config,
+                        &ScanInsertConfig {
+                            deleted_collections: &deleted_collections,
+                            generation_fences: &collection_generation_fences,
+                            index_config,
+                        },
                     );
                     timings.pack_index_build = timings
                         .pack_index_build
@@ -3514,8 +3859,12 @@ impl PackfileStorage {
                         entry,
                         slot,
                         shard.pack_id,
-                        &deleted_collections,
-                        index_config,
+                        shard.creation_seq,
+                        &ScanInsertConfig {
+                            deleted_collections: &deleted_collections,
+                            generation_fences: &collection_generation_fences,
+                            index_config,
+                        },
                     )
                 })
                 .map_err(|error| {
@@ -3534,8 +3883,12 @@ impl PackfileStorage {
                                 entry,
                                 slot,
                                 shard.pack_id,
-                                &deleted_collections,
-                                index_config,
+                                shard.creation_seq,
+                                &ScanInsertConfig {
+                                    deleted_collections: &deleted_collections,
+                                    generation_fences: &collection_generation_fences,
+                                    index_config,
+                                },
                             ) {
                                 scan_error = Some(error);
                             }
@@ -3572,7 +3925,8 @@ impl PackfileStorage {
         // The frames themselves built the indexes; this final pass only turns
         // them into the shared generation and shard-accounting structures.
         let materialization_started = std::time::Instant::now();
-        let (scan_out, collection_order) = scan_state.finish(&shards, cache_capacity);
+        let (scan_out, collection_order) =
+            scan_state.finish(&shards, cache_capacity, cache_budget.as_ref());
         shards.set_sealed_runs(sealed_runs);
         timings.index_materialization = materialization_started.elapsed();
 
@@ -3581,9 +3935,11 @@ impl PackfileStorage {
             scan_out,
             collection_order,
             deleted_collections,
+            collection_generation_fences,
             base_dir,
             swizzle,
             cache_capacity,
+            cache_budget,
             residency,
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
@@ -3621,9 +3977,11 @@ impl PackfileStorage {
         scan_out: RoomScanOutput,
         collection_order: Vec<[u8; 16]>,
         deleted_collections: HashSet<[u8; 16]>,
+        collection_generation_fences: HashMap<[u8; 16], u32>,
         base_dir: PathBuf,
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         residency: crate::index::IndexResidency,
         delta_state: DeltaLogState,
         read_covered: u64,
@@ -3663,13 +4021,16 @@ impl PackfileStorage {
             initial_durable_fingerprint: initial_durable_fp,
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
+            collection_generation_fences: parking_lot::Mutex::new(collection_generation_fences),
             deleted_collections_cache: parking_lot::Mutex::new(None),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
+            cache_budget,
             index_config,
             index_residency: residency,
             read_plan: RwLock::new(ReadPlanPolicy::default()),
+            index_collections: RwLock::new(std::collections::HashSet::new()),
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
@@ -3707,6 +4068,8 @@ impl PackfileStorage {
             read_reload_failures: AtomicU64::new(0),
             read_refreshes: AtomicU64::new(0),
             read_refresh_bytes: AtomicU64::new(0),
+            read_refresh_sleeps: AtomicU64::new(0),
+            read_refresh_sleep_micros: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -3811,6 +4174,64 @@ impl PackfileStorage {
             checkpoint.covered_lsn,
         )
         .is_ok()
+    }
+
+    /// Persist the collection-version table a delta log carries into
+    /// `index.versions` before a writable open can delete that log.
+    ///
+    /// A coverage batch lets the journal be reclaimed past the checkpoint's
+    /// own coverage, and the version table it carries is then the only durable
+    /// copy of the versions for the reclaimed groups. The open path deletes
+    /// delta logs in several places (a log that no longer matches the pack set,
+    /// a checkpoint rejected into a rescan, a paged conversion), and every one
+    /// of them runs before [`Self::enable_shared_journal`] checks that the
+    /// baseline covers the reclaimed history. Deleting the log first leaves
+    /// nothing for that check to find, and every retry fails the same way.
+    /// Moving the table into its own file first makes the baseline independent
+    /// of what happens to the log.
+    ///
+    /// Only a table the reader already trusts is moved (see
+    /// [`Self::delta_version_table`]), and it is merged with `max` into any
+    /// existing file so neither a newer coverage nor a collection that only the
+    /// file knows is lost. A no-op when there is no such table or the file
+    /// already covers it.
+    ///
+    /// # Errors
+    /// Returns the write error. The caller must refuse the open rather than
+    /// continue: the log may be the only copy of those versions.
+    fn promote_delta_versions(base_dir: &std::path::Path) -> std::io::Result<()> {
+        let Some(table) = Self::delta_version_table(base_dir) else {
+            return Ok(());
+        };
+        if table.covered_lsn == 0 {
+            return Ok(());
+        }
+        let versions_path = Self::index_versions_path(base_dir);
+        // A missing file means this is the first promotion. A file that exists
+        // but cannot be read or decoded is not an empty baseline: writing the
+        // older delta table over it would destroy whatever versions it held.
+        let existing = crate::index::versions::read_versions_strict(&versions_path)?;
+        if existing
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.covered_lsn >= table.covered_lsn)
+        {
+            // A previous attempt may have renamed the file and then failed its
+            // directory sync; make that rename durable before the caller
+            // reclaims the log.
+            if let Some(dir) = versions_path.parent() {
+                crate::shard::sync_directory(dir)?;
+            }
+            return Ok(());
+        }
+        let mut merged: std::collections::BTreeMap<[u8; 16], u64> = existing
+            .map(|snapshot| snapshot.versions.into_iter().collect())
+            .unwrap_or_default();
+        for (collection, version) in table.entries {
+            let entry = merged.entry(collection).or_insert(0);
+            *entry = (*entry).max(version);
+        }
+        let merged: Vec<([u8; 16], u64)> = merged.into_iter().collect();
+        crate::index::versions::write_versions(&versions_path, &merged, table.covered_lsn)
     }
 
     /// Path of one *epoch* of this store's incremental index delta log.
@@ -3986,7 +4407,6 @@ impl PackfileStorage {
     /// one referencing packs that aren't live open shards) fall through to
     /// `BookkeepingSource::SlotScan` with empty maps: correctness never
     /// depends on the sidecar, it only accelerates.
-    #[allow(clippy::type_complexity)]
     fn gated_sidecar_bookkeeping(
         base_dir: &std::path::Path,
         local_fingerprint: u64,
@@ -4179,6 +4599,7 @@ impl PackfileStorage {
     fn checkpoint_scan_out(
         base_dir: &std::path::Path,
         cache_capacity: usize,
+        cache_budget: Option<&Arc<crate::cache::CacheBudget>>,
         shards: &ShardPool,
         open_shards: &[(u16, PackId, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
@@ -4216,6 +4637,17 @@ impl PackfileStorage {
             .collect();
 
         let delta_path = Self::delta_path(base_dir, checkpoint.fingerprint);
+        // A delta epoch rejected below is deliberately left on disk. A
+        // shared-WAL caller runs `enable_shared_journal` only after this open
+        // returns, and that check reads a matching epoch's version table as the
+        // pool's durable baseline for history the WAL has already reclaimed.
+        // Deleting a rejected epoch here would destroy that baseline before the
+        // check can use it and turn a recoverable open into a permanent
+        // refusal. A rejected epoch cannot be appended to later (a rescan
+        // starts a fresh epoch), and the next successful checkpoint sweeps it.
+        // Only the `!replay_needed` case below removes it eagerly: there the
+        // packs still match the checkpoint, so there is no reclaimed history to
+        // bridge, and the next append would reuse this exact path.
         // Only the epoch named for this exact checkpoint can ever be trusted
         // (see `delta_path`); anything else on disk — a stale predecessor
         // epoch left by a crash between checkpoint rename and retirement, or
@@ -4269,9 +4701,6 @@ impl PackfileStorage {
                     || log.tail_fingerprint != local_fingerprint
                 {
                     timings.delta_replay = delta_started.elapsed();
-                    if writable {
-                        let _ = std::fs::remove_file(&delta_path);
-                    }
                     timings.checkpoint_reject = Some(CheckpointReject::DeltaFingerprintMismatch);
                     return None;
                 }
@@ -4280,9 +4709,6 @@ impl PackfileStorage {
                 replay_operations = log.operations;
             } else {
                 timings.delta_replay = delta_started.elapsed();
-                if writable {
-                    let _ = std::fs::remove_file(&delta_path);
-                }
                 timings.checkpoint_reject = Some(CheckpointReject::DeltaLogMissing);
                 return None;
             }
@@ -4355,17 +4781,11 @@ impl PackfileStorage {
             .collect();
         let mut redo_by_collection: HashMap<[u8; 16], Vec<RedoRecord>> = HashMap::new();
         let mut last_delta_seq = checkpoint.base_delta_seq;
-        let reject_log = || {
-            if writable {
-                let _ = std::fs::remove_file(&delta_path);
-            }
-        };
         for operation in replay_operations {
             match operation {
                 DeltaOperation::Redo(record) => {
                     // Strictly increasing above the checkpoint's base sequence.
                     if record.delta_seq <= last_delta_seq {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     }
@@ -4380,7 +4800,6 @@ impl PackfileStorage {
                         ..
                     } = record.op
                     else {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     };
@@ -4392,7 +4811,6 @@ impl PackfileStorage {
                     if live_generations.get(&record.collection_id) != Some(&record.base_generation)
                         || !extent_ok
                     {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
@@ -4406,17 +4824,11 @@ impl PackfileStorage {
                         continue;
                     }
                     if live_generations.get(&frame.collection_id) != Some(&frame.generation) {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
                     if let Some((_, index)) = snapshot_indexes.get(&frame.collection_id) {
                         if index.replay_frames(std::slice::from_ref(&frame)).is_err() {
-                            if writable {
-                                let _ = std::fs::remove_file(&delta_path);
-                            }
                             timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                             return None;
                         }
@@ -4437,9 +4849,6 @@ impl PackfileStorage {
                         continue;
                     }
                     let Some(capacity_bytes) = index_blob.get(..8) else {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
@@ -4452,17 +4861,11 @@ impl PackfileStorage {
                         .checked_mul(8)
                         .and_then(|bytes| bytes.checked_add(8));
                     if Some(index_blob.len()) != slots_len {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     }
                     let Ok(index) = LossyIndex::deserialize_with_config(&index_blob, index_config)
                     else {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
@@ -4481,9 +4884,6 @@ impl PackfileStorage {
                         continue;
                     }
                     if live_generations.get(&collection_id) != Some(&generation) {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
@@ -4507,7 +4907,6 @@ impl PackfileStorage {
         // names a freshly appended record, so this is a sequential pass over
         // pages the pack recovery has just read.
         if !Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup) {
-            reject_log();
             timings.checkpoint_reject = Some(CheckpointReject::RedoLocatorUnverified);
             return None;
         }
@@ -4586,9 +4985,6 @@ impl PackfileStorage {
                 let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
                     let owned = mmap_index.clone();
                     if owned.replay_frames(frames).is_err() {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                         return None;
                     }
@@ -4636,7 +5032,10 @@ impl PackfileStorage {
                     sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     // Checkpoint loading is resident-only under strategy 1.
                     paged: false,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation,
                 }),
             );
@@ -4684,7 +5083,10 @@ impl PackfileStorage {
                     sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     // Checkpoint loading is resident-only under strategy 1.
                     paged: false,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation,
                 }),
             );
@@ -4998,6 +5400,41 @@ impl PackfileStorage {
             .transpose()
     }
 
+    /// Return live collection records with their physical frame locations.
+    ///
+    /// Each item is `(node_id, shard slot, frame offset, frame length)`. This
+    /// diagnostic helper scans pack metadata to recover node IDs alongside
+    /// the live locations. It is intended for offline measurement; callers
+    /// should avoid concurrent writes or repacks while using it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if a pack cannot be scanned and
+    /// [`StorageError::Io`] for underlying filesystem errors.
+    pub fn collection_live_record_locations(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<Vec<LiveRecordLocation>>, StorageError> {
+        let Some(locations) = self.collection_live_locations(collection_id)? else {
+            return Ok(None);
+        };
+        let live: HashSet<(u16, u64)> = locations.into_iter().collect();
+        let mut records = Vec::with_capacity(live.len());
+        for (slot, shard) in self.shards.all_shards() {
+            let mut scanner =
+                packfile::scan_packfile_iter(&shard.path, false).map_err(StorageError::Io)?;
+            while let Some(entry) = scanner.next_with_removal() {
+                let entry = entry.map_err(StorageError::Io)?;
+                if entry.collection_id == *collection_id
+                    && !entry.removed
+                    && live.contains(&(slot, entry.offset))
+                {
+                    records.push((entry.hash, slot, entry.offset, entry.disk_bytes));
+                }
+            }
+        }
+        Ok(Some(records))
+    }
+
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
     /// for every known collection, sorted by collection ID, in a single pass
     /// over the collection map.
@@ -5052,6 +5489,26 @@ impl PackfileStorage {
         *self.read_plan.read()
     }
 
+    /// Select a separate random-advised mapping for single-record reads.
+    /// Sequential readers keep their normal mapping.
+    pub fn set_point_random_mmap(&self, enabled: bool) {
+        self.read_plan.write().point_random_mmap = enabled;
+    }
+
+    /// Use the separate mapping for ordered-index node reads only.
+    pub fn set_point_random_mmap_index(&self, enabled: bool) {
+        self.read_plan.write().point_random_mmap_index = enabled;
+    }
+
+    /// The point-mapping choice for a collection: ordered-index collections
+    /// use the index flag, everything else the body flag.
+    fn point_for(&self, collection_id: &[u8; 16]) -> bool {
+        let plan = self.read_plan.read();
+        plan.point_random_mmap
+            || (plan.point_random_mmap_index
+                && self.index_collections.read().contains(collection_id))
+    }
+
     /// Whether this storage attempts zstd compression on written records.
     #[must_use]
     pub fn is_compression_enabled(&self) -> bool {
@@ -5085,7 +5542,12 @@ impl PackfileStorage {
     /// The collection-scoped node cache for `collection_id`, or a fresh empty one if the collection is unknown.
     pub fn collection_cache(&self, collection_id: &[u8; 16]) -> Arc<NodeCache> {
         self.generation(collection_id).map_or_else(
-            || Arc::new(NodeCache::new(self.cache_capacity)),
+            || {
+                Arc::new(NodeCache::with_budget(
+                    self.cache_capacity,
+                    self.cache_budget.clone(),
+                ))
+            },
             |g| g.cache.clone(),
         )
     }
@@ -5099,6 +5561,7 @@ impl PackfileStorage {
             };
             stats.collections = stats.collections.saturating_add(1);
             stats.entries = stats.entries.saturating_add(generation.cache.len());
+            stats.bytes = stats.bytes.saturating_add(generation.cache.bytes());
             stats.hits = stats.hits.saturating_add(generation.cache.hits());
             stats.misses = stats.misses.saturating_add(generation.cache.misses());
         }
@@ -5117,6 +5580,81 @@ impl PackfileStorage {
             generation.cache.clear();
         }
         evicted
+    }
+
+    /// Unmap both sequential and point mappings on every shard so file-level
+    /// cache eviction advice can target pages they previously pinned. Returns
+    /// the unmapped file span: each shard contributes the larger of its two
+    /// mapping lengths, so one file is not counted twice.
+    #[must_use]
+    pub fn unmap_shards(&self) -> u64 {
+        self.shards
+            .all_shards()
+            .into_iter()
+            .fold(0u64, |total, (_, shard)| {
+                total.saturating_add(shard.unmap())
+            })
+    }
+
+    /// Advise every mapped shard `MADV_RANDOM` and return how many mappings
+    /// were advised.
+    ///
+    /// Diagnostic hook for the cold-page readahead A/B. Single-record `get`
+    /// faults through these mappings without the advice that
+    /// [`ReadPlanPolicy::random_advice`] applies to a `get_many` batch, so a
+    /// benchmark can apply the same suppression to a page read and compare
+    /// the bytes it loads. The advice is persistent mapping state and is never
+    /// reset here; nothing calls this by default. Non-Unix builds advise
+    /// nothing and return zero.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn advise_random_shards(&self) -> u64 {
+        let mut advised = 0u64;
+        for (_, shard) in self.shards.all_shards() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    if mapping.advise(memmap2::Advice::Random).is_ok() {
+                        advised = advised.saturating_add(1);
+                    }
+                }
+            }
+        }
+        advised
+    }
+
+    /// Non-Unix builds have no `madvise`; readahead advice is a no-op.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn advise_random_shards(&self) -> u64 {
+        0
+    }
+
+    /// Touch one byte from every 4 KiB page of every mapped shard and return
+    /// the number of pages visited.
+    ///
+    /// Sequential-mapping control for the cold-page readahead A/B: run it
+    /// after [`Self::advise_random_shards`] to check whether suppression
+    /// slows access through the same mappings. Diagnostic only; the query
+    /// path never calls it.
+    #[must_use]
+    pub fn touch_mapped_pages(&self) -> u64 {
+        const PAGE_BYTES: usize = 4096;
+        let mut pages = 0u64;
+        let mut sink = 0u8;
+        for (_, shard) in self.shards.all_shards() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    for offset in (0..mapping.len()).step_by(PAGE_BYTES) {
+                        if let Some(byte) = mapping.get(offset) {
+                            sink ^= *byte;
+                            pages = pages.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        pages
     }
 
     fn put_mutex(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
@@ -5595,7 +6133,7 @@ impl PackfileStorage {
             .map(|(_, shard)| {
                 // Scan the physical file: a newly created pack may still be
                 // staged until its first durability barrier publishes it.
-                let file = std::fs::File::open(shard.data_path())?;
+                let file = shard.open_data_file()?;
                 let end = shard.file_len();
                 let scanner = packfile::scan_packfile_iter_from_file(file, false)?;
                 Ok((end, scanner))
@@ -5674,10 +6212,12 @@ impl PackfileStorage {
     ) -> Result<Vec<TestScannedRecord>, StorageError> {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
-            for entry in packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )? {
+            for entry in shard.scan_data_path(|path| {
+                packfile::scan_packfile_with_removal(
+                    path,
+                    self.shards.checksum_policy().verifies_reads(),
+                )
+            })? {
                 if entry.collection_id == *collection_id {
                     scanned.push((slot, entry.hash, entry.offset, shard.pack_id, entry.removed));
                 }
@@ -5692,19 +6232,29 @@ impl PackfileStorage {
     ) -> Result<Vec<ScannedRepackShard>, StorageError> {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
-            let entries = packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?
-            .into_iter()
-            .filter(|entry| entry.collection_id == *collection_id)
-            .map(|entry| (entry.hash, entry.offset, entry.removed))
-            .collect::<Vec<_>>();
+            let entries = shard
+                .scan_data_path(|path| {
+                    packfile::scan_packfile_with_removal(
+                        path,
+                        self.shards.checksum_policy().verifies_reads(),
+                    )
+                })?
+                .into_iter()
+                .filter(|entry| entry.collection_id == *collection_id)
+                .map(|entry| (entry.hash, entry.offset, entry.removed))
+                .collect::<Vec<_>>();
             if !entries.is_empty() {
                 scanned.push((slot, entries));
             }
         }
         Ok(scanned)
+    }
+
+    fn collection_generation_floor(&self, collection_id: &[u8; 16]) -> Option<u32> {
+        self.collection_generation_fences
+            .lock()
+            .get(collection_id)
+            .copied()
     }
 
     /// Scan every open shard once and build deduplicated record maps for the
@@ -5716,17 +6266,26 @@ impl PackfileStorage {
         collection_ids: &[[u8; 16]],
     ) -> Result<BatchRepackRecordMaps, StorageError> {
         let wanted: HashSet<[u8; 16]> = collection_ids.iter().copied().collect();
+        let generation_fences = self.collection_generation_fences.lock().clone();
         let mut maps: BatchRepackRecordMaps = wanted
             .iter()
             .copied()
             .map(|collection_id| (collection_id, (HashMap::new(), HashMap::new())))
             .collect();
         for (slot, shard) in self.shards.all_shards() {
-            for entry in packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )? {
+            for entry in shard.scan_data_path(|path| {
+                packfile::scan_packfile_with_removal(
+                    path,
+                    self.shards.checksum_policy().verifies_reads(),
+                )
+            })? {
                 if wanted.contains(&entry.collection_id) {
+                    if generation_fences
+                        .get(&entry.collection_id)
+                        .is_some_and(|floor| shard.creation_seq < *floor)
+                    {
+                        continue;
+                    }
                     let (live, removed) = maps.entry(entry.collection_id).or_default();
                     self.update_repack_record_map(
                         live,
@@ -5788,10 +6347,131 @@ impl PackfileStorage {
     fn write_deleted_collections_atomic(&self, bytes: &[u8]) -> Result<(), StorageError> {
         let path = Self::deleted_collections_path(&self.base_dir);
         let temp_path = path.with_extension("tmp");
-        fs::write(&temp_path, bytes).map_err(StorageError::Io)?;
+        let mut temp = fs::File::create(&temp_path).map_err(StorageError::Io)?;
+        std::io::Write::write_all(&mut temp, bytes).map_err(StorageError::Io)?;
+        temp.sync_data().map_err(StorageError::Io)?;
         fs::rename(&temp_path, &path).map_err(StorageError::Io)?;
+        crate::shard::sync_directory(&self.base_dir).map_err(StorageError::Io)?;
         // Invalidate the cache on write so the next read picks up the change.
         *self.deleted_collections_cache.lock() = None;
+        Ok(())
+    }
+
+    fn collection_generation_fences_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join("collection.generations")
+    }
+
+    fn load_collection_generation_fences(
+        base_dir: &std::path::Path,
+    ) -> Result<HashMap<[u8; 16], u32>, StorageError> {
+        const HEADER_LEN: usize = 12;
+        const ENTRY_LEN: usize = 20;
+        let path = Self::collection_generation_fences_path(base_dir);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        if bytes.len() < HEADER_LEN + 4 || &bytes[..8] != b"MTXGEN1\0" {
+            return Err(StorageError::Corrupt(format!(
+                "{} has an invalid collection-generation header",
+                path.display()
+            )));
+        }
+        let count = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed header")) as usize;
+        let entries_len = count.checked_mul(ENTRY_LEN).ok_or_else(|| {
+            StorageError::Corrupt("collection-generation entry count overflow".into())
+        })?;
+        let expected_len = HEADER_LEN
+            .checked_add(entries_len)
+            .and_then(|length| length.checked_add(4))
+            .ok_or_else(|| {
+                StorageError::Corrupt("collection-generation file length overflow".into())
+            })?;
+        if bytes.len() != expected_len {
+            return Err(StorageError::Corrupt(format!(
+                "{} has an invalid collection-generation length",
+                path.display()
+            )));
+        }
+        let crc_offset = bytes.len().checked_sub(4).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "{} has an invalid collection-generation checksum length",
+                path.display()
+            ))
+        })?;
+        let expected_crc = u32::from_le_bytes(
+            bytes[crc_offset..]
+                .try_into()
+                .expect("fixed checksum width"),
+        );
+        if crc32fast::hash(&bytes[..crc_offset]) != expected_crc {
+            return Err(StorageError::Corrupt(format!(
+                "{} has an invalid collection-generation checksum",
+                path.display()
+            )));
+        }
+        let mut fences = HashMap::with_capacity(count);
+        for entry in bytes[HEADER_LEN..crc_offset].as_chunks::<ENTRY_LEN>().0 {
+            let collection_id: [u8; 16] = entry[..16].try_into().expect("fixed id width");
+            let creation_seq = u32::from_le_bytes(entry[16..20].try_into().expect("fixed seq"));
+            if creation_seq == 0 || fences.insert(collection_id, creation_seq).is_some() {
+                return Err(StorageError::Corrupt(format!(
+                    "{} has an invalid or duplicate collection-generation entry",
+                    path.display()
+                )));
+            }
+        }
+        Ok(fences)
+    }
+
+    fn persist_collection_generation_fence(
+        &self,
+        collection_id: &[u8; 16],
+        creation_seq: u32,
+    ) -> Result<(), StorageError> {
+        let mut fences = self.collection_generation_fences.lock();
+        let previous = fences.insert(*collection_id, creation_seq);
+        let mut entries: Vec<_> = fences.iter().collect();
+        entries.sort_unstable_by_key(|(id, _)| **id);
+        let count = u32::try_from(entries.len())
+            .map_err(|_| StorageError::Internal("too many collection-generation fences".into()))?;
+        let capacity = entries
+            .len()
+            .checked_mul(20)
+            .and_then(|entries_len| 16usize.checked_add(entries_len))
+            .ok_or_else(|| {
+                StorageError::Internal("collection-generation file is too large".into())
+            })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(b"MTXGEN1\0");
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (id, seq) in entries {
+            bytes.extend_from_slice(id);
+            bytes.extend_from_slice(&seq.to_le_bytes());
+        }
+        let crc = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        let path = Self::collection_generation_fences_path(&self.base_dir);
+        let temp_path = path.with_extension("generations.tmp");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut temp = fs::File::create(&temp_path)?;
+            std::io::Write::write_all(&mut temp, &bytes)?;
+            temp.sync_data()?;
+            fs::rename(&temp_path, &path)?;
+            crate::shard::sync_directory(&self.base_dir)?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if let Some(previous) = previous {
+                fences.insert(*collection_id, previous);
+            } else {
+                fences.remove(collection_id);
+            }
+            return Err(StorageError::Io(error));
+        }
         Ok(())
     }
 
@@ -5870,6 +6550,24 @@ impl PackfileStorage {
     /// one serialized disk read per collection.
     fn is_deleted_collection(&self, collection_id: &[u8; 16]) -> bool {
         self.deleted_collections.lock().contains(collection_id)
+    }
+
+    fn prepare_recreated_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        if self.generation(collection_id).is_some() || !self.is_deleted_collection(collection_id) {
+            return Ok(());
+        }
+        let creation_seq = self
+            .shards
+            .start_collection_generation(collection_id)
+            .map_err(StorageError::Io)?;
+        // The fence is durable before store_generation clears the deletion
+        // marker. A crash can therefore either keep the collection deleted,
+        // or reopen only records from this new physical generation.
+        self.persist_collection_generation_fence(collection_id, creation_seq)?;
+        // A repack cursor can contain records from the deleted incarnation.
+        // Force its next scan to rebuild under the new durable floor.
+        self.repack_incremental.write().remove(collection_id);
+        Ok(())
     }
 
     fn clear_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -6454,6 +7152,50 @@ impl PackfileStorage {
         );
     }
 
+    /// Persist a Paged pool's pack data and collection versions before making
+    /// a newer shared-WAL coverage claim. Paged has no index checkpoint, so
+    /// the versions file is its durable recovery baseline.
+    fn persist_paged_coverage(&self) -> Result<(), StorageError> {
+        let Some(initial_covered) = self.checkpoint_covered_lsn() else {
+            self.persist_versions_file();
+            return Ok(());
+        };
+
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
+        collection_ids.sort_unstable();
+        let mut lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let create_guard = self.collection_creation.write();
+        let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
+        for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
+            lock_arcs.push(self.put_mutex(id));
+        }
+        let guards: Vec<_> = lock_arcs.iter().map(|lock| lock.lock()).collect();
+
+        // Re-sample only after all collection publications are quiescent, then
+        // fsync every pack before writing the matching versions/coverage file.
+        let covered = self
+            .checkpoint_covered_lsn()
+            .unwrap_or(initial_covered)
+            .max(initial_covered);
+        self.shards.sync_all().map_err(StorageError::Io)?;
+        versions_crash_point("after-paged-packs-fsync");
+        let versions = self.checkpoint_logical_versions(Some(covered));
+        crate::index::versions::write_versions(
+            &Self::index_versions_path(&self.base_dir),
+            &versions,
+            covered,
+        )
+        .map_err(StorageError::Io)?;
+        versions_crash_point("after-paged-versions-fsync");
+        self.durable_coverage.fetch_max(covered, Ordering::AcqRel);
+
+        drop(guards);
+        drop(create_guard);
+        let _ = self.report_coverage_and_reclaim(covered);
+        versions_crash_point("after-paged-wal-reclaim");
+        Ok(())
+    }
+
     /// Persist the full per-collection index state to `index.checkpoint`, so
     /// the next open can load it instead of rescanning every packfile.
     ///
@@ -6631,11 +7373,11 @@ impl PackfileStorage {
         let snapshots = self.checkpoint_snapshots();
         let serialize_started = std::time::Instant::now();
 
-        // Rotate the delta epoch while still locked: `old_base_fingerprint`
-        // (D0's name, if any) is retired below only after `fingerprint`'s
-        // checkpoint (C1) is durable; every collection's writers already
-        // target the new epoch (D1) by the time the locks drop next.
-        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        // Rotate the delta epoch while still locked. Every collection's
+        // writers target the new fingerprint by the time the locks drop; the
+        // tail preserves that epoch and retires all others after the checkpoint
+        // is durable, including rejected epochs from a full rescan.
+        self.rotate_delta_epoch(fingerprint, &snapshots);
         // Every put mutex is held, so no redo record is in flight: the sequence
         // reached so far is exactly what this checkpoint incorporates.
         let base_delta_seq = self.delta_state.lock().delta_seq_high;
@@ -6686,7 +7428,6 @@ impl PackfileStorage {
             logical_versions,
             blobs,
             pack_table,
-            old_base_fingerprint,
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
             durable_coverage: Arc::clone(&self.durable_coverage),
@@ -6851,7 +7592,13 @@ impl PackfileStorage {
     }
 
     /// Block until any background checkpoint has finished.
+    ///
+    /// Holds `index_persist_lock` while the tail is joined: the worker slot is
+    /// emptied before the join, so without the lock a sync could see no worker
+    /// and capture a new checkpoint while this one's tail is still sweeping.
+    /// Must not be called with that lock already held.
     pub fn wait_for_checkpoint(&self) {
+        let _persist_guard = self.index_persist_lock.lock();
         self.finish_checkpoint_worker(true);
     }
 
@@ -6866,6 +7613,8 @@ impl PackfileStorage {
     /// [`Self::persist_index_checkpoint_best_effort`].
     fn persist_index_checkpoint_for_sync(&self) {
         if !self.background_checkpoint.load(Ordering::Relaxed) {
+            // `persist_index_checkpoint_or_delta` already holds
+            // `index_persist_lock` across this call.
             self.persist_index_checkpoint_best_effort();
             return;
         }
@@ -7464,6 +8213,10 @@ impl PackfileStorage {
     /// and swallows a failure rather than turning it into a hard error. The
     /// checkpoint is an acceleration structure; packfiles remain
     /// authoritative, so a failed persist only costs the next open a rescan.
+    ///
+    /// The caller must hold `index_persist_lock`. Repack takes it before marking
+    /// the index dirty; the sync path already holds it around the whole
+    /// checkpoint/delta decision.
     fn persist_index_checkpoint_best_effort(&self) {
         if let Err(e) = self.persist_index_checkpoint() {
             eprintln!("mtxdb: failed to persist index checkpoint: {e}");
@@ -7743,7 +8496,12 @@ impl PackfileStorage {
         cache: Option<Arc<NodeCache>>,
         bump_generation: bool,
     ) -> Result<(), StorageError> {
-        let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
+        let cache = cache.unwrap_or_else(|| {
+            Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            ))
+        });
         let is_new = self.collections_read().get(collection_id).is_none();
         let structural = bump_generation || is_new;
         if structural {
@@ -7776,7 +8534,10 @@ impl PackfileStorage {
                         index: LossyIndex::new(0),
                         sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                         paged: self.index_residency == crate::index::IndexResidency::Paged,
-                        cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                        cache: Arc::new(NodeCache::with_budget(
+                            self.cache_capacity,
+                            self.cache_budget.clone(),
+                        )),
                         generation: 1,
                     })
                 })
@@ -7800,7 +8561,10 @@ impl PackfileStorage {
                             index: LossyIndex::new(0),
                             sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                             paged: self.index_residency == crate::index::IndexResidency::Paged,
-                            cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                            cache: Arc::new(NodeCache::with_budget(
+                                self.cache_capacity,
+                                self.cache_budget.clone(),
+                            )),
                             generation: 1,
                         })
                     })
@@ -7908,6 +8672,10 @@ impl PackfileStorage {
         {
             return Ok(());
         }
+        // Read-only workers may have been opened before a writer recreated
+        // this collection. Refresh the durable fence before rescanning packs.
+        let disk_fences = Self::load_collection_generation_fences(&self.base_dir)?;
+        self.collection_generation_fences.lock().extend(disk_fences);
         // A refresh that publishes a *newly discovered* collection must be
         // excluded from a concurrent checkpoint's fingerprint→snapshot
         // window, exactly like a new-collection `put`/`put_many` (see the
@@ -7963,21 +8731,23 @@ impl PackfileStorage {
     ///
     /// A sealed pack with no usable sidecar is scanned into the resident
     /// index instead, so a missing sidecar costs memory, never correctness.
-    fn rebuild_tail(
+    fn ingest_current_sealed_runs(
         &self,
         collection_id: &[u8; 16],
-    ) -> Result<(LossyIndex, crate::index::sealed::SealedLocators), StorageError> {
-        self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
-        self.shards.flush_all()?;
-        let mut shards = self.shards.all_shards();
-        shards.sort_by_key(|(_, shard)| shard.creation_seq);
-        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
-        let mut sealed = crate::index::sealed::SealedLocators::new();
+        generation_floor: Option<u32>,
+        sealed: &mut crate::index::sealed::SealedLocators,
+    ) -> HashSet<PackId> {
         // Reuse this session's runs for the packs they cover. A run with a
         // pack that is no longer current stops serving; its remaining packs
-        // are read through their sidecars below.
-        let mut run_covered: HashSet<PackId> = HashSet::new();
-        for run in self.shards.sealed_runs() {
+        // are read through their sidecars below. A recreated collection must
+        // ignore runs from its previous generation.
+        let runs = if generation_floor.is_some() {
+            Vec::new()
+        } else {
+            self.shards.sealed_runs()
+        };
+        let mut run_covered = HashSet::new();
+        for run in runs {
             let current = run.packs().iter().all(|pack| {
                 self.shards.get_shard(pack.slot).is_some_and(|shard| {
                     shard.pack_id == pack.pack_id && shard.is_current.load(Ordering::Acquire)
@@ -7997,6 +8767,26 @@ impl PackfileStorage {
                 sealed.insert_run(run);
             }
         }
+        run_covered
+    }
+
+    fn rebuild_tail(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<(LossyIndex, crate::index::sealed::SealedLocators), StorageError> {
+        self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
+        self.shards.flush_all()?;
+        let mut shards = self.shards.all_shards();
+        shards.sort_by_key(|(_, shard)| shard.creation_seq);
+        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
+        let mut sealed = crate::index::sealed::SealedLocators::new();
+        let generation_floor = self
+            .collection_generation_fences
+            .lock()
+            .get(collection_id)
+            .copied();
+        let run_covered =
+            self.ingest_current_sealed_runs(collection_id, generation_floor, &mut sealed);
         // Sidecars this session already opened and verified, from every
         // collection's generation: a sealed pack is immutable, so reopening
         // and re-verifying it on each refresh (about 0.5 ms a pack) only adds
@@ -8004,6 +8794,9 @@ impl PackfileStorage {
         let loaded = self.loaded_sidecars();
         for (slot, shard) in shards {
             if !shard.is_current.load(Ordering::Acquire) || run_covered.contains(&shard.pack_id) {
+                continue;
+            }
+            if generation_floor.is_some_and(|floor| shard.creation_seq < floor) {
                 continue;
             }
             if shard.sealed.load(Ordering::Acquire) {
@@ -8033,10 +8826,9 @@ impl PackfileStorage {
                     continue;
                 }
             }
-            let mut scanner = packfile::scan_packfile_iter(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
+            let mut scanner = shard.scan_data_path(|path| {
+                packfile::scan_packfile_iter(path, self.shards.checksum_policy().verifies_reads())
+            })?;
             while let Some(record) = scanner.next_with_removal() {
                 let record = record?;
                 if record.collection_id != *collection_id {
@@ -8102,10 +8894,18 @@ impl PackfileStorage {
         let mut shards = self.shards.all_shards();
         shards.sort_by_key(|(_, shard)| shard.creation_seq);
         let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
+        let generation_floor = self
+            .collection_generation_fences
+            .lock()
+            .get(collection_id)
+            .copied();
         for (slot, shard) in shards {
             // A retired shard has no live records; its pack may already be
             // gone, leaving only a stale sidecar. Never let it contribute.
             if !shard.is_current.load(Ordering::Acquire) {
+                continue;
+            }
+            if generation_floor.is_some_and(|floor| shard.creation_seq < floor) {
                 continue;
             }
             // A sealed pack's sidecar already holds every frame's newest
@@ -8151,10 +8951,9 @@ impl PackfileStorage {
                 }
             }
 
-            let mut scanner = packfile::scan_packfile_iter(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
+            let mut scanner = shard.scan_data_path(|path| {
+                packfile::scan_packfile_iter(path, self.shards.checksum_policy().verifies_reads())
+            })?;
             while let Some(record) = scanner.next_with_removal() {
                 let record = record?;
                 if record.collection_id != *collection_id {
@@ -8334,8 +9133,19 @@ impl PackfileStorage {
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
+        self.resolve_from_pinned_mode(id, candidates, pinned, track, false)
+    }
+
+    fn resolve_from_pinned_mode(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+        point: bool,
+    ) -> Result<Option<NodeData>, StorageError> {
         Ok(self
-            .resolve_with_lsn_from_pinned(id, candidates, pinned, track)?
+            .resolve_with_lsn_from_pinned_mode(id, candidates, pinned, track, point)?
             .and_then(|(data, _, removed)| (!removed).then_some(data)))
     }
 
@@ -8343,12 +9153,13 @@ impl PackfileStorage {
     /// per-record write LSN. Only a record decoded from disk carries one; a
     /// caller using it to seed an optimistic token must consult the coordinator
     /// for records served from the in-memory cache.
-    fn resolve_with_lsn_from_pinned(
+    fn resolve_with_lsn_from_pinned_mode(
         &self,
         id: &NodeId,
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
+        point: bool,
     ) -> Result<Option<(NodeData, Option<u64>, bool)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
@@ -8358,15 +9169,16 @@ impl PackfileStorage {
 
             if track {
                 self.candidate_reads.fetch_add(1, Ordering::Relaxed);
-                if let Ok(len) = Self::record_disk_len_at(shard.as_ref(), offset) {
+                if let Ok(len) = ShardPool::record_disk_len_at_mode(shard.as_ref(), offset, point) {
                     self.candidate_frame_bytes.fetch_add(len, Ordering::Relaxed);
                 }
             }
 
-            match self.read_at(
+            match self.shards.read_at_mode(
                 shard,
                 offset,
                 self.shards.checksum_policy().verifies_reads(),
+                point,
             ) {
                 Ok(record) => {
                     if record.hash != *id {
@@ -8425,7 +9237,13 @@ impl PackfileStorage {
         }
         let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
         Ok(self
-            .resolve_with_lsn_from_pinned(id, &candidates, &pinned, false)?
+            .resolve_with_lsn_from_pinned_mode(
+                id,
+                &candidates,
+                &pinned,
+                false,
+                self.point_for(collection_id),
+            )?
             .and_then(|(_, lsn, _)| lsn))
     }
 
@@ -8653,10 +9471,12 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure scanning a shard.
+    #[allow(clippy::too_many_lines)]
     fn repack_scan_incremental(
         &self,
         collection_id: &[u8; 16],
     ) -> Result<RepackScanResult, StorageError> {
+        let generation_floor = self.collection_generation_floor(collection_id);
         // Check for existing state under a read lock, then move it out under a
         // write lock if present — O(1) ownership transfer, no clone.
         let has_prev = self.repack_incremental.read().contains_key(collection_id);
@@ -8685,6 +9505,13 @@ impl PackfileStorage {
                 let mut map = HashMap::new();
                 let mut removed = HashMap::new();
                 for (slot, entries) in scanned {
+                    if generation_floor.is_some_and(|floor| {
+                        self.shards
+                            .get_shard(slot)
+                            .is_some_and(|shard| shard.creation_seq < floor)
+                    }) {
+                        continue;
+                    }
                     for (hash, offset, is_removed) in entries {
                         self.update_repack_record_map(
                             &mut map,
@@ -8710,14 +9537,19 @@ impl PackfileStorage {
                     .get(&slot)
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
-                let entries = packfile::scan_packfile_from_with_removal(
-                    &shard.data_path(),
-                    start,
-                    self.shards.checksum_policy().verifies_reads(),
-                )
-                .map_err(StorageError::Io)?;
+                let entries = shard
+                    .scan_data_path(|path| {
+                        packfile::scan_packfile_from_with_removal(
+                            path,
+                            start,
+                            self.shards.checksum_policy().verifies_reads(),
+                        )
+                    })
+                    .map_err(StorageError::Io)?;
                 for entry in entries {
-                    if entry.collection_id == *collection_id {
+                    if entry.collection_id == *collection_id
+                        && generation_floor.is_none_or(|floor| shard.creation_seq >= floor)
+                    {
                         self.update_repack_record_map(
                             &mut map,
                             &mut removed,
@@ -8737,6 +9569,13 @@ impl PackfileStorage {
             let mut map = HashMap::new();
             let mut removed = HashMap::new();
             for (slot, entries) in &scanned {
+                if generation_floor.is_some_and(|floor| {
+                    self.shards
+                        .get_shard(*slot)
+                        .is_some_and(|shard| shard.creation_seq < floor)
+                }) {
+                    continue;
+                }
                 for (hash, offset, is_removed) in entries {
                     self.update_repack_record_map(
                         &mut map,
@@ -9523,6 +10362,7 @@ impl PackfileStorage {
         // here shouldn't be reported as a repack failure — the packfiles
         // stay authoritative and the dirty flag (left set on failure, see
         // `persist_index_checkpoint`) means the next sync retries it.
+        let _persist_guard = self.index_persist_lock.lock();
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
         self.persist_shard_collections_best_effort();
@@ -9734,6 +10574,16 @@ impl PackfileStorage {
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let collection_guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
 
+        // A deleted collection's frames are historical. Repacking them would
+        // copy them into a new pack past the tombstone, and a later rebuild
+        // would resurrect records the delete removed. Drop those IDs only after
+        // the put mutexes are held, so a concurrent delete cannot slip between
+        // this check and the scan.
+        collection_ids.retain(|id| !self.is_deleted_collection(id));
+        if collection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Same scan visibility requirement as the single-collection repack:
         // every selected collection's buffered frames must be on disk before
         // `scan_collection_record_maps` reads packfiles, or those records
@@ -9834,6 +10684,7 @@ impl PackfileStorage {
         // Best-effort for the same reason: the batch's shard writes are
         // already durable, so a checkpoint-write failure here costs the
         // next sync a retry, not correctness.
+        let _persist_guard = self.index_persist_lock.lock();
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
         self.persist_shard_collections_best_effort();
@@ -11184,6 +12035,7 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
         cache: &Arc<NodeCache>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -11204,21 +12056,15 @@ impl PackfileStorage {
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
 
-        // Apply cache mutations only after all fallible generation publication
-        // succeeds, so a failed batch does not leak partial state into the
-        // shared cache. Resolve and insert one entry at a time: retaining a
-        // prepared clone of the entire batch here would defeat the cache's
-        // size bound.
-        for (id, data) in entries {
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
+        // Populate the decoded cache only after all fallible generation
+        // publication succeeds, so a failed batch does not leak partial state.
+        // The shared byte budget bounds what a bulk import can retain.
+        for (index, (id, data)) in entries.iter().enumerate() {
+            let removed = metadatas
+                .and_then(|items| items.get(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|metadata| metadata.removed);
+            self.update_record_cache_for(cache, id, data, removed);
         }
 
         // All fallible work is complete. Only now make the batch visible to
@@ -11324,18 +12170,14 @@ impl PackfileStorage {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
             .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
-        // New-collection puts must not interleave their record flush with a
-        // concurrent checkpoint's fingerprint→snapshot window (see
-        // `persist_index_checkpoint`). Existing collections are already gated
-        // by their `put_mutex`; a brand-new one isn't in that set yet, so we
-        // hold the publication lock shared for the whole put instead — the
-        // checkpoint holds it exclusive, excluding this put from the window.
+        // Keep a new collection's first put out of a concurrent checkpoint's
+        // fingerprint→snapshot window; existing collections hold `put_mutex`.
         let _create_guard = if self.generation(collection_id).is_none() {
             Some(self.collection_creation.read())
         } else {
             None
         };
-
+        self.prepare_recreated_collection(collection_id)?;
         let (slot, offset, disk_bytes, published) =
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
@@ -11360,92 +12202,104 @@ impl PackfileStorage {
                     } else {
                         self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                     }
-
-                    self.update_record_cache(&gen, id, data, removed);
+                    // Keep a live record resident under the shared byte
+                    // budget, but never cache a removal marker: readers would
+                    // otherwise decode an empty payload as the deleted value.
+                    if removed {
+                        gen.cache.remove(id);
+                    } else {
+                        self.update_record_cache_for(&gen.cache, id, data, removed);
+                    }
                     self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
                     self.note_published_materialized(published);
                     return Ok(());
                 }
             }
         }
-        let (index, cache) = {
-            let old_gen = self.generation(collection_id);
-            let generation = old_gen.as_ref().map_or(1, |g| g.generation);
-            let mut index = match &old_gen {
-                Some(g) => g.index.clone(),
-                // A brand-new collection's first insert: no count hint to
-                // size from (unlike `put_many`, which knows `entries.len()`),
-                // so start at a small fixed floor and let `grow()` size it
-                // up as real entries land. Previously this was a flat
-                // 4096-slot (32 KiB) floor per collection regardless of how
-                // many records it would ever hold -- workloads with many
-                // small/near-empty collections (e.g. per-room collections
-                // holding a handful of records each) paid that 32 KiB up
-                // front per collection, dwarfing the actual data by orders
-                // of magnitude.
-                //
-                // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
-                // index's own smaller hard floor.
-                None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
-            };
-            let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
-            if let Ok((_bucket, _entry, is_new)) = inserted {
-                self.record_redo(
-                    collection_id,
-                    generation,
-                    id,
-                    RecordLocator {
-                        slot,
-                        offset,
-                        len: disk_bytes,
-                    },
-                    removed,
-                );
-                let pack_id = self.pack_id_for_slot(slot)?;
-                if is_new {
-                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
-                } else {
-                    self.record_disk_bytes(pack_id, collection_id, disk_bytes);
-                }
-            } else {
-                index = self.recover_index_after_failed_insert(
-                    collection_id,
-                    id,
-                    generation,
-                    RecordLocator {
-                        slot,
-                        offset,
-                        len: disk_bytes,
-                    },
-                    index,
-                    removed,
-                )?;
-            }
-            let cache = match &old_gen {
-                Some(g) => g.cache.clone(),
-                None => Arc::new(NodeCache::new(self.cache_capacity)),
-            };
+        let (index, cache) =
+            self.rebuild_put_index(collection_id, id, slot, offset, disk_bytes, removed)?;
 
-            self.update_record_cache_for(&cache, id, data, removed);
-
-            (index, cache)
-        };
-
+        let cache_to_fill = Arc::clone(&cache);
         self.store_generation(collection_id, index, Some(cache), false)?;
+        if removed {
+            cache_to_fill.remove(id);
+        } else {
+            self.update_record_cache_for(&cache_to_fill, id, data, removed);
+        }
         self.note_published_materialized(published);
 
         Ok(())
     }
 
-    /// Keep cached reads aligned with the latest record version.
-    fn update_record_cache(
+    fn rebuild_put_index(
         &self,
-        generation: &RoomGeneration,
+        collection_id: &[u8; 16],
         id: &NodeId,
-        data: &NodeData,
+        slot: u16,
+        offset: u64,
+        disk_bytes: u64,
         removed: bool,
-    ) {
-        self.update_record_cache_for(&generation.cache, id, data, removed);
+    ) -> Result<(LossyIndex, Arc<NodeCache>), StorageError> {
+        let old_gen = self.generation(collection_id);
+        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
+        let mut index = match &old_gen {
+            Some(g) => g.index.clone(),
+            // A brand-new collection's first insert: no count hint to
+            // size from (unlike `put_many`, which knows `entries.len()`),
+            // so start at a small fixed floor and let `grow()` size it
+            // up as real entries land. Previously this was a flat
+            // 4096-slot (32 KiB) floor per collection regardless of how
+            // many records it would ever hold -- workloads with many
+            // small/near-empty collections (e.g. per-room collections
+            // holding a handful of records each) paid that 32 KiB up
+            // front per collection, dwarfing the actual data by orders
+            // of magnitude.
+            //
+            // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
+            // index's own smaller hard floor.
+            None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
+        };
+        let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
+        if let Ok((_bucket, _entry, is_new)) = inserted {
+            self.record_redo(
+                collection_id,
+                generation,
+                id,
+                RecordLocator {
+                    slot,
+                    offset,
+                    len: disk_bytes,
+                },
+                removed,
+            );
+            let pack_id = self.pack_id_for_slot(slot)?;
+            if is_new {
+                self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+            } else {
+                self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+            }
+        } else {
+            index = self.recover_index_after_failed_insert(
+                collection_id,
+                id,
+                generation,
+                RecordLocator {
+                    slot,
+                    offset,
+                    len: disk_bytes,
+                },
+                index,
+                removed,
+            )?;
+        }
+        let cache = match &old_gen {
+            Some(g) => g.cache.clone(),
+            None => Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            )),
+        };
+        Ok((index, cache))
     }
 
     fn update_record_cache_for(
@@ -11524,11 +12378,15 @@ impl PackfileStorage {
         } else {
             None
         };
+        self.prepare_recreated_collection(collection_id)?;
 
         let old_gen = self.generation(collection_id);
         let cache = match &old_gen {
             Some(g) => g.cache.clone(),
-            None => Arc::new(NodeCache::new(self.cache_capacity)),
+            None => Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            )),
         };
 
         let mut progress = self.prepare_put_many_progress(
@@ -11562,7 +12420,7 @@ impl PackfileStorage {
             rollback_and_fail!(error);
         }
         if let Err(error) =
-            self.publish_put_many_state(collection_id, entries, &cache, &mut progress)
+            self.publish_put_many_state(collection_id, entries, metadatas, &cache, &mut progress)
         {
             rollback_and_fail!(error);
         }
@@ -11624,6 +12482,54 @@ impl PackfileStorage {
         }
     }
 
+    /// The physical `(shard slot, byte offset)` of the durable frame `id`
+    /// resolves to, using the same candidate selection and pin/retry path as
+    /// [`StorageEngine::get`]. Returns `None` if `id` is not live.
+    ///
+    /// Unlike [`Self::get_location`] this reports the shard slot instead of
+    /// the pack id, so callers can order a set of records by physical
+    /// position. Pack ids are random; slots follow pack creation, and offsets
+    /// within a slot follow append order.
+    ///
+    /// This deliberately returns only a **durable pack location**, with the
+    /// same overlay caveat as [`Self::get_location`].
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a candidate frame cannot be read, or
+    /// [`StorageError::Internal`] while a transaction overlay is active.
+    pub fn get_slot_location(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+    ) -> Result<Option<(u16, u64)>, StorageError> {
+        if self.overlay_reads_active() {
+            return Err(StorageError::Internal(
+                "get_slot_location does not resolve transaction-overlay reads".to_owned(),
+            ));
+        }
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(gen) = gen_guard.as_deref() else {
+                return Ok(None);
+            };
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            #[cfg(test)]
+            Self::run_test_before_pin();
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+            return self.resolve_slot_from_pinned(id, &candidates, &pinned);
+        }
+    }
+
     /// Resolve an `id` to its winning `(PackId, offset)` from already-pinned
     /// candidates, retaining the last read error rather than reporting a
     /// missing record. Mirrors [`Self::resolve_from_pinned`]'s candidate
@@ -11634,6 +12540,22 @@ impl PackfileStorage {
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
     ) -> Result<Option<(PackId, u64)>, StorageError> {
+        let Some((slot, offset)) = self.resolve_slot_from_pinned(id, candidates, pinned)? else {
+            return Ok(None);
+        };
+        Ok(pinned.get(&slot).map(|shard| (shard.pack_id, offset)))
+    }
+
+    /// Resolve an `id` to its winning `(shard slot, offset)` from already
+    /// pinned candidates. Same candidate semantics as
+    /// [`Self::resolve_location_from_pinned`], but the slot is what orders
+    /// records physically: pack ids are random, while slots follow creation.
+    fn resolve_slot_from_pinned(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+    ) -> Result<Option<(u16, u64)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
             let Some(shard) = pinned.get(&slot) else {
@@ -11646,7 +12568,7 @@ impl PackfileStorage {
             ) {
                 Ok(record) => {
                     if record.hash == *id {
-                        return Ok(Some((shard.pack_id, offset)));
+                        return Ok(Some((slot, offset)));
                     }
                 }
                 Err(error) => last_err = Some(error),
@@ -11659,6 +12581,76 @@ impl PackfileStorage {
     }
 }
 
+impl PackfileStorage {
+    fn get_internal(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        point: bool,
+    ) -> Result<Option<NodeData>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get)
+        } else {
+            OperationTimer::disabled()
+        };
+        if self.overlay_reads_active() {
+            return Ok(self
+                .get_read_committed(collection_id, std::slice::from_ref(id))?
+                .into_iter()
+                .next()
+                .flatten());
+        }
+        // A concurrent repack can swap the generation and retire the shard ids
+        // its index pointed at. Pin the candidate shards and confirm the
+        // generation did not change between the index lookup and the pin
+        // (retirement only follows a swap); retry against the new generation if
+        // it did.
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(gen) = gen_guard.as_deref() else {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(None);
+            };
+            if let Some(data) = gen.cache.get(id) {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Some((*data).clone()));
+            }
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            #[cfg(test)]
+            Self::run_test_before_pin();
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+            if track {
+                self.index_candidates
+                    .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+            }
+            let result = self.resolve_from_pinned_mode(id, &candidates, &pinned, track, point);
+            if track {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                if result.as_ref().is_ok_and(Option::is_none) {
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return result;
+        }
+    }
+}
+
 impl StorageEngine for PackfileStorage {
     fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
         self.try_collection_exists(collection_id)
@@ -11666,6 +12658,41 @@ impl StorageEngine for PackfileStorage {
 
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
         self.try_collection_len(collection_id)
+    }
+
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError> {
+        let put_lock = self.put_mutex(collection_id);
+        let put_guard = put_lock.lock();
+        let generation = self
+            .generation(collection_id)
+            .map(|guard| Arc::clone(&*guard));
+        let shards = self.shards.all_shards();
+        let scanners = Self::open_collection_scan_shards(&shards)?;
+        drop(put_guard);
+
+        let keys = Self::scan_collection_keys(scanners, collection_id)?;
+        let Some(generation) = generation else {
+            return Ok(Vec::new());
+        };
+        let mut live = Vec::with_capacity(keys.len());
+        for id in keys {
+            if generation.index.lookup_removed(&id) == Some(true) {
+                continue;
+            }
+            if generation.index.lookup_removed(&id) == Some(false) {
+                live.push(id);
+                continue;
+            }
+            if generation
+                .sealed
+                .lookup(collection_id, &id)
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?
+                .is_some_and(|hit| !hit.removed())
+            {
+                live.push(id);
+            }
+        }
+        Ok(live)
     }
 
     fn create_or_put_established(
@@ -11850,68 +12877,17 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        let track = self.stats_enabled.load(Ordering::Relaxed);
-        let _latency = if track {
-            OperationTimer::new(&self.operation_timings.get)
-        } else {
-            OperationTimer::disabled()
-        };
-        if self.overlay_reads_active() {
-            return Ok(self
-                .get_read_committed(collection_id, std::slice::from_ref(id))?
-                .into_iter()
-                .next()
-                .flatten());
-        }
-        // A concurrent repack can swap the generation and retire the shard ids
-        // its index pointed at. Pin the candidate shards and confirm the
-        // generation did not change between the index lookup and the pin
-        // (retirement only follows a swap); retry against the new generation if
-        // it did.
-        loop {
-            let gen_guard = self.generation(collection_id);
-            let Some(gen) = gen_guard.as_deref() else {
-                if track {
-                    self.get_calls.fetch_add(1, Ordering::Relaxed);
-                    self.get_misses.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(None);
-            };
-            if let Some(data) = gen.cache.get(id) {
-                if track {
-                    self.get_calls.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(Some((*data).clone()));
-            }
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
-            #[cfg(test)]
-            Self::run_test_before_pin();
-            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
-            let still_current = match gen_guard.as_ref() {
-                Some(loaded) => {
-                    let current = self.generation(collection_id);
-                    Self::same_generation(current.as_ref(), loaded)
-                }
-                None => true,
-            };
-            if !still_current {
-                continue;
-            }
-            if track {
-                self.index_candidates
-                    .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-            }
-            let result = self.resolve_from_pinned(id, &candidates, &pinned, track);
-            if track {
-                self.get_calls.fetch_add(1, Ordering::Relaxed);
-                if result.as_ref().is_ok_and(Option::is_none) {
-                    self.get_misses.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            return result;
-        }
+        self.get_internal(collection_id, id, self.point_for(collection_id))
     }
 
+    fn mark_index_collection(&self, collection_id: &[u8; 16]) {
+        self.index_collections.write().insert(*collection_id);
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate pinning, read planning, and stats share one retry loop"
+    )]
     fn get_many(
         &self,
         collection_id: &[u8; 16],
@@ -11973,6 +12949,10 @@ impl StorageEngine for PackfileStorage {
             to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
             let policy = self.read_plan_policy();
+            let point_one = ids.len() == 1
+                && (policy.point_random_mmap
+                    || (policy.point_random_mmap_index
+                        && self.index_collections.read().contains(collection_id)));
             let plan_wanted = policy.wants(usize::try_from(candidates_seen).unwrap_or(usize::MAX));
 
             // Suppress readahead for a scattered batch when asked. This is
@@ -12028,7 +13008,13 @@ impl StorageEngine for PackfileStorage {
             }
 
             for (i, candidates) in &to_fetch {
-                results[*i] = self.resolve_from_pinned(&ids[*i], candidates, &pinned, track)?;
+                results[*i] = self.resolve_from_pinned_mode(
+                    &ids[*i],
+                    candidates,
+                    &pinned,
+                    track,
+                    ids.len() == 1 && point_one,
+                )?;
             }
 
             if track {
@@ -12118,7 +13104,7 @@ impl StorageEngine for PackfileStorage {
         let pending_generation = self.mark_sync_pending_age(&mut timings);
         let result = self
             .sync_durability(true, &mut timings)
-            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+            .and_then(|()| self.persist_index_checkpoint_or_delta(&mut timings));
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
         // Remediation runs after the journal barrier and is part of what the
@@ -12474,7 +13460,7 @@ impl PackfileStorage {
         let pending_generation = self.mark_sync_pending_age(&mut timings);
         let result = self
             .sync_durability(false, &mut timings)
-            .map(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+            .and_then(|()| self.persist_index_checkpoint_or_delta(&mut timings));
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
         if result.is_ok() {
@@ -12527,12 +13513,11 @@ impl PackfileStorage {
     /// Propagates any shard-fsync or checkpoint-write failure.
     pub fn force_index_checkpoint(&self) -> Result<(), StorageError> {
         // No primary-index checkpoint exists to force in paged mode; still
-        // honour the caller's durability request by flushing the packs.
+        // honour the caller's durability request by flushing packs and
+        // recording versions before shared-WAL reclaim.
         if self.index_residency == crate::index::IndexResidency::Paged {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-            self.shards.sync_dirty().map_err(StorageError::Io)?;
-            self.persist_versions_file();
-            return Ok(());
+            return self.persist_paged_coverage();
         }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
@@ -12643,18 +13628,15 @@ impl PackfileStorage {
     /// fsyncs and the index checkpoint then become acceleration-only: a crash
     /// that loses them replays the journal instead of rescanning every pack.
     ///
-    /// This is opt-in and off by default (the store's historical behavior —
+    /// This is opt-in for standalone stores (the store's historical behavior —
     /// packfiles are the sync point — is unchanged until it is called).
     ///
     /// # Errors
     /// Returns [`StorageError::Internal`] for a pool inside a database root;
-    /// such pools must use `enable_shared_journal`. Returns
-    /// [`StorageError::Unsupported`] for Paged residency, which does not yet
-    /// advance journal coverage during sync.
+    /// such pools must use `enable_shared_journal`.
     /// Propagates root-inspection, journal-open, recovery, and publish-signal
     /// setup errors, including OS entropy failures, as [`StorageError::Io`].
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
-        self.reject_journaling_in_paged()?;
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
@@ -12686,19 +13668,6 @@ impl PackfileStorage {
         }
     }
 
-    /// Paged sync persists the packs and collection versions but does not yet
-    /// publish a newer journal coverage anchor. Refuse every journal mode so
-    /// the WAL cannot grow to its limit while this pool is unable to advance
-    /// reclaim.
-    fn reject_journaling_in_paged(&self) -> Result<(), StorageError> {
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            return Err(StorageError::Unsupported(
-                "Paged index residency cannot use WAL journaling until sync can advance durable journal coverage; use Resident residency".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Route durability through a journal whose group sequence is drawn from a
     /// shared, cross-pool counter.
     ///
@@ -12715,7 +13684,6 @@ impl PackfileStorage {
         path: impl AsRef<std::path::Path>,
         sequence: Arc<AtomicU64>,
     ) -> Result<(), StorageError> {
-        self.reject_journaling_in_paged()?;
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
@@ -12750,8 +13718,7 @@ impl PackfileStorage {
     /// already covered).
     ///
     /// # Errors
-    /// Returns [`StorageError::Unsupported`] for Paged residency, or
-    /// [`StorageError::Internal`] if a journal is already enabled, or
+    /// Returns [`StorageError::Internal`] if a journal is already enabled, or
     /// [`StorageError::Io`] if publish-signal setup fails, including OS entropy
     /// failures.
     pub fn enable_shared_journal(
@@ -12759,7 +13726,6 @@ impl PackfileStorage {
         journal: Arc<JournalCoordinator>,
         pool: crate::layout::ShardType,
     ) -> Result<(), StorageError> {
-        self.reject_journaling_in_paged()?;
         let mut slot = self.journal.lock();
         if slot.is_some() {
             return Err(StorageError::Internal(
@@ -13623,19 +14589,21 @@ impl PackfileStorage {
     /// regenerated even on an otherwise clean barrier, because that is a rare
     /// recovery path rather than a steady-state write.
     #[allow(clippy::too_many_lines)]
-    fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
+    fn persist_index_checkpoint_or_delta(
+        &self,
+        timings: &mut SyncTimings,
+    ) -> Result<(), StorageError> {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.settle_checkpoint_worker() {
-            return;
+            return Ok(());
         }
-        // Strategy 1: paged stores persist no primary index. The
-        // shard→collection inspection sidecar is separate metadata and is
-        // still worth refreshing at a sync anchor.
+        // Paged stores persist no primary index. Their versions file is the
+        // recovery baseline, and must be durable before shared-WAL reclaim.
         if self.index_residency == crate::index::IndexResidency::Paged {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-            // The packs were flushed before this call, so committed versions
-            // in the journal are durable in their frames.
-            self.persist_versions_file();
+            let coverage_started = std::time::Instant::now();
+            self.persist_paged_coverage()?;
+            timings.checkpoint = coverage_started.elapsed();
             if self.shard_collections_dirty.load(Ordering::Relaxed)
                 || self.shard_collections_stale.load(Ordering::Relaxed)
             {
@@ -13643,7 +14611,7 @@ impl PackfileStorage {
                 self.persist_shard_collections_best_effort();
                 timings.sidecar = sidecar_started.elapsed();
             }
-            return;
+            return Ok(());
         }
         // A delta append does not advance the journal coverage, so on its own it
         // never lets the segment shrink and the journal would fill to its hard
@@ -13668,7 +14636,7 @@ impl PackfileStorage {
                 self.persist_shard_collections_best_effort();
                 timings.sidecar = sidecar_started.elapsed();
             }
-            return;
+            return Ok(());
         }
         // Only a full checkpoint rewrite re-pins the sidecar to the pack
         // fingerprint the checkpoint just became. Every other dirty path
@@ -13761,7 +14729,7 @@ impl PackfileStorage {
                 // budget still rewrites.
                 self.checkpoint_skips.fetch_add(1, Ordering::Relaxed);
                 self.shard_collections_stale.store(true, Ordering::Relaxed);
-                return;
+                return Ok(());
             }
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_for_sync();
@@ -13802,6 +14770,7 @@ impl PackfileStorage {
             self.persist_shard_collections_best_effort();
             timings.sidecar = sidecar_started.elapsed();
         }
+        Ok(())
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each
@@ -13989,10 +14958,6 @@ impl PackfileStorage {
     /// reset semantics — `shards`/`cache`/`repack` reflect persisted state and
     /// are deliberately excluded from the reset.
     #[must_use]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a hit-rate is inherently an approximate floating-point presentation; counters retain their exact u64 values"
-    )]
     pub fn stats(&self) -> RuntimeStats {
         let (cache, index_bytes, collection_count, max_index_probe_len) =
             self.stats_collection_summary();
@@ -14042,6 +15007,8 @@ impl PackfileStorage {
             read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
             read_refreshes: self.read_refreshes.load(Ordering::Relaxed),
             read_refresh_bytes: self.read_refresh_bytes.load(Ordering::Relaxed),
+            read_refresh_sleeps: self.read_refresh_sleeps.load(Ordering::Relaxed),
+            read_refresh_sleep_micros: self.read_refresh_sleep_micros.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             replay_pages_resumed: self
@@ -14193,6 +15160,8 @@ impl PackfileStorage {
             &self.read_reload_failures,
             &self.read_refreshes,
             &self.read_refresh_bytes,
+            &self.read_refresh_sleeps,
+            &self.read_refresh_sleep_micros,
             &self.sidecar_writes,
             &self.sync_calls,
         ] {
@@ -14258,6 +15227,8 @@ pub struct ResidentCacheStats {
     pub collections: usize,
     /// Number of decoded nodes currently held by those caches.
     pub entries: usize,
+    /// Approximate resident bytes held by those decoded nodes.
+    pub bytes: usize,
     /// Cumulative cache hits across those collections.
     pub hits: u64,
     /// Cumulative cache misses across those collections.
@@ -14382,6 +15353,10 @@ pub struct RuntimeStats {
     pub read_refreshes: u64,
     /// Journal bytes scanned by read-only worker refreshes.
     pub read_refresh_bytes: u64,
+    /// Backoff sleeps taken by journal refresh retries.
+    pub read_refresh_sleeps: u64,
+    /// Total microseconds slept in those backoffs.
+    pub read_refresh_sleep_micros: u64,
     /// Writes of the shard→collection inspection sidecar (every one counts,
     /// whichever caller triggered it).
     pub sidecar_writes: u64,
@@ -14517,6 +15492,10 @@ fn write_journal_lsn_file(
 /// Remove the superseded delta-log epoch once the checkpoint that makes it safe
 /// to discard is durably renamed. Best-effort: a leftover file names a
 /// fingerprint no future checkpoint carries, so it is inert.
+///
+/// The production checkpoint tail now sweeps every non-live epoch, so this
+/// narrower helper is retained only for the test mirror that predates it.
+#[cfg(test)]
 fn retire_delta_epoch_file(
     base_dir: &Path,
     old_base_fingerprint: Option<u64>,
@@ -14535,9 +15514,9 @@ fn retire_delta_epoch_file(
     let path = PackfileStorage::delta_path(base_dir, old_base_fingerprint);
     // No directory sync after the unlink: if a crash restores the file it is
     // inert. Its name and header carry a fingerprint no future checkpoint will
-    // match, and `sweep_orphan_delta_logs` removes it at the next open. The
-    // checkpoint rename's durability is already covered by the directory sync
-    // in `CheckpointTail::run`, before this runs.
+    // match, and `sweep_orphan_delta_logs` removes it at the next successful
+    // checkpoint. The checkpoint rename's durability is already covered by the
+    // directory sync in `CheckpointTail::run`, before this runs.
     let _ = fs::remove_file(&path);
 }
 
@@ -14589,7 +15568,6 @@ struct CheckpointTail {
     logical_versions: Vec<([u8; 16], u64)>,
     blobs: Vec<([u8; 16], u64, Vec<u8>)>,
     pack_table: Vec<(u16, PackId)>,
-    old_base_fingerprint: Option<u64>,
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
     durable_coverage: Arc<AtomicU64>,
@@ -14683,7 +15661,12 @@ impl CheckpointTail {
             done.reclaim = reclaim_started.elapsed();
         }
         let retire_started = std::time::Instant::now();
-        retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint, self.fingerprint);
+        // The replacement checkpoint is durable. Keep its live epoch, which
+        // may have received batches while this tail ran, and retire every
+        // other (now rejected) delta epoch, even when the prior in-memory
+        // state had no base fingerprint.
+        let live_epoch = PackfileStorage::delta_path(&self.base_dir, self.fingerprint);
+        PackfileStorage::sweep_orphan_delta_logs(&self.base_dir, Some(&live_epoch));
         done.retire = retire_started.elapsed();
         done.total = tail_started.elapsed();
         Ok(done)
@@ -14759,6 +15742,8 @@ impl Default for RuntimeStats {
             read_reload_failures: 0,
             read_refreshes: 0,
             read_refresh_bytes: 0,
+            read_refresh_sleeps: 0,
+            read_refresh_sleep_micros: 0,
             sidecar_writes: 0,
             sync_calls: 0,
             replay_pages_resumed: 0,

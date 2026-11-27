@@ -233,7 +233,7 @@ fn iteration_yields_newest_pack_first() {
 #[test]
 fn empty_set_has_no_packs() {
     let set = SealedLocators::new();
-    assert!(set.is_empty());
+    assert!(set.is_empty(), "value should be empty");
     assert_eq!(set.len(), 0);
     assert_eq!(set.mapped_bytes(), 0);
     assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());
@@ -317,7 +317,8 @@ fn sample_run(
 }
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mtxdb-sealed-{name}-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb-sealed-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

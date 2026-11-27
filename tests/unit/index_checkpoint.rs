@@ -50,34 +50,6 @@ mod tests {
         paths.pop().expect("the live pack path was just validated")
     }
 
-    fn assert_delete_then_recreate_in_log(
-        operations: &[mtxdb::index::delta::DeltaOperation],
-        collection: [u8; 16],
-    ) {
-        use mtxdb::index::delta::DeltaOperation;
-        let tombstone = operations
-            .iter()
-            .position(|operation| {
-                matches!(
-                    operation,
-                    DeltaOperation::CollectionTombstone { collection_id, .. }
-                        if *collection_id == collection
-                )
-            })
-            .expect("delete tombstone is present");
-        let snapshot = operations
-            .iter()
-            .rposition(|operation| {
-                matches!(
-                    operation,
-                    DeltaOperation::CollectionSnapshot { collection_id, .. }
-                        if *collection_id == collection
-                )
-            })
-            .expect("recreation snapshot is present");
-        assert!(tombstone < snapshot);
-    }
-
     fn collection_id(seed: u8) -> [u8; 16] {
         let mut id = [0u8; 16];
         id[15] = seed;
@@ -139,14 +111,23 @@ mod tests {
         );
     }
 
+    fn assert_collection_records_absent(store: &PackfileStorage, collection: &[u8; 16], seed: u64) {
+        for i in 0..150u64 {
+            assert!(
+                store.get(collection, &node_id(seed, i)).unwrap().is_none(),
+                "collection must not expose old record {i}"
+            );
+        }
+    }
+
     fn checkpoint_path(dir: &Path) -> PathBuf {
         dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE)
     }
 
     #[test]
     fn reopen_from_checkpoint_serves_the_same_data() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -174,7 +155,7 @@ mod tests {
     fn open_and_sync_timings_are_recorded() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_open_timings_{}",
             std::process::id()
         ));
@@ -262,7 +243,7 @@ mod tests {
     fn shard_directory_bookkeeping_gate_and_fallback() {
         use mtxdb::packfile::storage::{BookkeepingSource, OpenPath};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sidecar_{}",
             std::process::id()
         ));
@@ -358,8 +339,8 @@ mod tests {
 
     #[test]
     fn corrupt_or_missing_checkpoint_falls_back_to_rescan() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -384,7 +365,7 @@ mod tests {
     fn unsupported_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_bad_version_{}",
             std::process::id()
         ));
@@ -435,7 +416,7 @@ mod tests {
 
     #[test]
     fn unsynced_append_invalidates_checkpoint_then_recovers() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sync_{}",
             std::process::id()
         ));
@@ -503,7 +484,7 @@ mod tests {
     fn torn_delta_log_falls_back_to_rescan() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_torn_delta_{}",
             std::process::id()
         ));
@@ -576,7 +557,7 @@ mod tests {
     /// both halves independently at the last flushed boundary.
     #[test]
     fn buffered_crash_before_flush_leaves_pack_length_and_fingerprint_at_last_boundary() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_buffered_crash_{}",
             std::process::id()
         ));
@@ -647,8 +628,8 @@ mod tests {
 
     #[test]
     fn deleted_collections_are_not_resurrected_by_stale_checkpoint() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_del_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_del_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -690,7 +671,7 @@ mod tests {
     fn clean_sync_and_v1_replays_incremental_and_structural_changes() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_dirty_{}",
             std::process::id()
         ));
@@ -824,7 +805,7 @@ mod tests {
     fn each_dirty_sync_writes_the_sidecar_exactly_once() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sidecar_once_{}",
             std::process::id()
         ));
@@ -916,7 +897,7 @@ mod tests {
         use mtxdb::index::delta;
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_delta_continue_{}",
             std::process::id()
         ));
@@ -998,7 +979,7 @@ mod tests {
     fn v1_collection_snapshots_and_tombstones_replay_across_reopen() {
         use mtxdb::index::delta::{read_delta_log, DeltaOperation};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_v1_structural_{}",
             std::process::id()
         ));
@@ -1047,6 +1028,16 @@ mod tests {
                 if collection_id == &deleted_collection
         )));
         assert!(!reopened.collection_ids().contains(&deleted_collection));
+        drop(reopened);
+
+        // The tombstone must replay after a reopen, before the collection is
+        // recreated. Its old pack records remain physically present until
+        // reclaim, so this checks the logical deletion rather than mere file
+        // removal.
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert!(!reopened.collection_ids().contains(&deleted_collection));
+        assert_collection_records_absent(&reopened, &deleted_collection, 2);
+
         let restored_node = node_id(2, 901);
         let restored_payload = payload_for(2, 901);
         reopened
@@ -1057,9 +1048,19 @@ mod tests {
             )
             .unwrap();
         reopened.sync_all().unwrap();
-        let path = current_delta_path(&dir).expect("recreation leaves v1 log");
-        let log = read_delta_log(&path).expect("delete and recreation log decodes");
-        assert_delete_then_recreate_in_log(&log.operations, deleted_collection);
+        // Recreating the collection starts a new physical pack generation.
+        // The full checkpoint for that changed pack set can retire the v1 log
+        // that carried the tombstone, so the recreated snapshot need not be
+        // represented by a tombstone-then-snapshot pair in one log.
+        let checkpoint = mtxdb::index::checkpoint::read_checkpoint(&checkpoint_path(&dir))
+            .expect("recreation writes a checkpoint for the new pack generation");
+        assert!(
+            checkpoint
+                .collections
+                .iter()
+                .any(|loaded| loaded.collection_id == deleted_collection),
+            "the replacement checkpoint must include the recreated collection"
+        );
         drop(reopened);
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
@@ -1072,6 +1073,7 @@ mod tests {
                 .as_ref(),
             restored_payload.as_slice()
         );
+        assert_collection_records_absent(&reopened, &deleted_collection, 2);
         assert_eq!(
             reopened
                 .get(&new_collection, &new_node)

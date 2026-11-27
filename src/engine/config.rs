@@ -9,24 +9,36 @@
 
 use std::fmt;
 
+use crate::cache::DEFAULT_CACHE_BYTES;
 use crate::index::IndexResidency;
 use crate::journal::{MAX_RECLAIM_TRIGGER_LEN, MAX_TXN_STAGE_BYTES};
 use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 
 /// Runtime knobs that are not part of a per-pool [`crate::PoolPolicy`].
 ///
-/// The defaults preserve the library's historical behaviour:
-/// - decoded-node cache: 100,000 entries per collection;
+/// The defaults preserve the library's historical behaviour except for the
+/// decoded-node cache byte budget, which is now bounded by default:
+/// - decoded-node cache: 100,000 entries per collection, 16 MiB across the
+///   whole process;
 /// - transaction staging: the full 64 MiB engine ceiling;
 /// - index residency: whatever the constructor or pool policy selected
 ///   (`Resident` in practice);
 /// - read-path statistics: off;
+/// - point-read mapping: off;
 /// - WAL reclaim trigger: the journal's built-in quarter of the segment cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// Decoded-node cache entries, applied independently to each collection.
     /// `0` disables the cache.
     pub cache_capacity: usize,
+    /// Process-wide budget, in bytes, for decoded node payloads across every
+    /// collection and pool opened by one database.
+    ///
+    /// Each collection keeps its own LRU, but admission draws from this shared
+    /// counter, so per-room collections cannot each fill their own cache.
+    /// `None` removes the byte bound (collection entry counts still apply);
+    /// `Some(0)` disables caching entirely.
+    pub cache_bytes: Option<usize>,
     /// Maximum charged payload one transaction may stage. Must be in
     /// `1..=MAX_TXN_STAGE_BYTES`.
     pub txn_stage_limit_bytes: usize,
@@ -35,6 +47,16 @@ pub struct RuntimeConfig {
     pub index_residency: Option<IndexResidency>,
     /// Enable the opt-in read-path counters and latency accounting.
     pub stats_enabled: bool,
+    /// Serve single-record reads from a separate random-advised mapping, in
+    /// every pool the config opens. See
+    /// [`crate::packfile::storage::PackfileStorage::set_point_random_mmap`].
+    /// Setting a read-plan policy afterwards replaces this value.
+    pub point_random_mmap: bool,
+    /// Serve reads from registered ordered-index collections through a
+    /// separate random-advised mapping, leaving payload collections on the
+    /// normal mapping. Unset by default; controlled by
+    /// `MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP`.
+    pub ordered_index_point_random_mmap: bool,
     /// Segment length, in bytes, above which a sync forces a reclaiming
     /// checkpoint. `None` keeps the journal's built-in value. Must be in
     /// `1..=MAX_RECLAIM_TRIGGER_LEN` and below the live segment cap's
@@ -52,9 +74,12 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+            cache_bytes: Some(DEFAULT_CACHE_BYTES),
             txn_stage_limit_bytes: MAX_TXN_STAGE_BYTES,
             index_residency: None,
             stats_enabled: false,
+            point_random_mmap: false,
+            ordered_index_point_random_mmap: false,
             reclaim_trigger_bytes: None,
             replay_lease_max_retained_bytes: None,
         }
@@ -95,6 +120,15 @@ impl RuntimeConfig {
             })?,
         };
 
+        let cache_bytes = match lookup("MTXDB_CACHE_BYTES")? {
+            None => Some(DEFAULT_CACHE_BYTES),
+            Some(value) => Some(value.trim().parse::<usize>().map_err(|_| {
+                ConfigError::new(format!(
+                    "MTXDB_CACHE_BYTES must be a non-negative integer, got {value:?}"
+                ))
+            })?),
+        };
+
         let txn_stage_limit_bytes = match lookup("MTXDB_TXN_STAGE_LIMIT_BYTES")? {
             None => MAX_TXN_STAGE_BYTES,
             Some(value) => {
@@ -130,6 +164,17 @@ impl RuntimeConfig {
             Some(value) => parse_bool("MTXDB_STATS", &value)?,
         };
 
+        let point_random_mmap = match lookup("MTXDB_POINT_RANDOM_MMAP")? {
+            None => false,
+            Some(value) => parse_bool("MTXDB_POINT_RANDOM_MMAP", &value)?,
+        };
+
+        let ordered_index_point_random_mmap = match lookup("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP")?
+        {
+            None => false,
+            Some(value) => parse_bool("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", &value)?,
+        };
+
         let reclaim_trigger_bytes = match lookup("MTXDB_RECLAIM_TRIGGER_BYTES")? {
             None => None,
             Some(value) => {
@@ -154,9 +199,12 @@ impl RuntimeConfig {
 
         Ok(Self {
             cache_capacity,
+            cache_bytes,
             txn_stage_limit_bytes,
             index_residency,
             stats_enabled,
+            point_random_mmap,
+            ordered_index_point_random_mmap,
             reclaim_trigger_bytes,
             replay_lease_max_retained_bytes,
         })
@@ -182,20 +230,10 @@ impl RuntimeConfig {
 
     /// Validate the configuration for a shared-WAL [`crate::Database`].
     ///
-    /// Paged residency is rejected here, before the root lock or WAL is
-    /// opened. The journaling path cannot advance durable coverage from a
-    /// paged sync, so discovering that after modifying on-disk state is
-    /// needlessly destructive.
-    ///
     /// # Errors
-    /// Returns [`ConfigError`] for a bad staging limit or Paged residency.
+    /// Returns [`ConfigError`] for a bad staging limit.
     pub fn validate_for_database(&self) -> Result<(), ConfigError> {
         self.validate()?;
-        if self.index_residency == Some(IndexResidency::Paged) {
-            return Err(ConfigError::new(
-                "MTXDB_INDEX_RESIDENCY=paged cannot be used with Database/shared WAL; use `resident`",
-            ));
-        }
         Ok(())
     }
 }
@@ -274,29 +312,39 @@ mod tests {
         let parsed = config(&[]).unwrap();
         assert_eq!(parsed, RuntimeConfig::default());
         assert_eq!(parsed.cache_capacity, DEFAULT_CACHE_CAPACITY);
+        assert_eq!(parsed.cache_bytes, Some(DEFAULT_CACHE_BYTES));
         assert_eq!(parsed.txn_stage_limit_bytes, MAX_TXN_STAGE_BYTES);
         assert_eq!(parsed.index_residency, None);
         assert!(!parsed.stats_enabled);
+        assert!(!parsed.point_random_mmap);
+        assert!(!parsed.ordered_index_point_random_mmap);
     }
 
     #[test]
     fn parses_the_supported_values() {
         let parsed = config(&[
             ("MTXDB_CACHE_CAPACITY", "0"),
+            ("MTXDB_CACHE_BYTES", "0"),
             ("MTXDB_TXN_STAGE_LIMIT_BYTES", "1048576"),
             ("MTXDB_INDEX_RESIDENCY", "Paged"),
             ("MTXDB_STATS", "yes"),
+            ("MTXDB_POINT_RANDOM_MMAP", "on"),
+            ("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", "true"),
         ])
         .unwrap();
         assert_eq!(parsed.cache_capacity, 0);
+        assert_eq!(parsed.cache_bytes, Some(0));
         assert_eq!(parsed.txn_stage_limit_bytes, 1 << 20);
         assert_eq!(parsed.index_residency, Some(IndexResidency::Paged));
         assert!(parsed.stats_enabled);
+        assert!(parsed.point_random_mmap);
+        assert!(parsed.ordered_index_point_random_mmap);
     }
 
     #[test]
     fn rejects_invalid_values_instead_of_falling_back() {
         assert!(config(&[("MTXDB_CACHE_CAPACITY", "lots")]).is_err());
+        assert!(config(&[("MTXDB_CACHE_BYTES", "lots")]).is_err());
         assert!(config(&[("MTXDB_TXN_STAGE_LIMIT_BYTES", "0")]).is_err());
         assert!(config(&[(
             "MTXDB_TXN_STAGE_LIMIT_BYTES",
@@ -305,6 +353,8 @@ mod tests {
         .is_err());
         assert!(config(&[("MTXDB_INDEX_RESIDENCY", "mmap")]).is_err());
         assert!(config(&[("MTXDB_STATS", "sometimes")]).is_err());
+        assert!(config(&[("MTXDB_POINT_RANDOM_MMAP", "sometimes")]).is_err());
+        assert!(config(&[("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", "sometimes")]).is_err());
     }
 
     #[test]
@@ -348,8 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn database_rejects_paged_before_opening() {
+    fn database_accepts_paged_configuration() {
         let parsed = config(&[("MTXDB_INDEX_RESIDENCY", "paged")]).unwrap();
-        assert!(parsed.validate_for_database().is_err());
+        assert!(parsed.validate_for_database().is_ok());
     }
 }

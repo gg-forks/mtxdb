@@ -1403,6 +1403,7 @@ fn reset_has_coverage_gap_is_a_pure_base_jump() {
         valid_len: 0,
         truncated_tail: false,
         base_lsn: 3,
+        base_sequence: 1,
         consumed_tail: Vec::new(),
         group_ends: Vec::new(),
     };
@@ -1849,8 +1850,12 @@ fn test_cache_hit() {
 
     store.put(&TEST_COLLECTION, &id, &data).unwrap();
 
-    let _ = store.get(&TEST_COLLECTION, &id).unwrap();
+    // Writes populate the decoded cache under the shared byte budget, so a
+    // repeated read is a hit.
     let gen = store.generation(&TEST_COLLECTION).unwrap();
+    assert_eq!(gen.cache.len(), 1);
+
+    let _ = store.get(&TEST_COLLECTION, &id).unwrap();
     assert_eq!(gen.cache.hits(), 1);
 
     let _ = store.get(&TEST_COLLECTION, &id).unwrap();
@@ -2422,6 +2427,74 @@ fn test_get_location_returns_the_winning_frame() {
             .unwrap(),
         None,
         "an unknown id resolves to no location"
+    );
+}
+
+#[test]
+fn test_get_slot_location_agrees_with_get_location_and_orders_appends() {
+    let dir = test_dir("get_slot_location_physical");
+    let store = PackfileStorage::open(dir).unwrap();
+    let mut written = Vec::new();
+    for tag in 0x70u8..0x74 {
+        let id = distinct_id(tag);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from(vec![tag; 32])),
+            )
+            .unwrap();
+        written.push(id);
+    }
+    store.sync().unwrap();
+
+    let shards: std::collections::HashMap<u16, std::sync::Arc<crate::shard::Shard>> =
+        store.shards.all_shards().into_iter().collect();
+    let verifies = store.shards.checksum_policy().verifies_reads();
+    let mut previous: Option<(u16, u64)> = None;
+    for id in &written {
+        let (slot, offset) = store
+            .get_slot_location(&TEST_COLLECTION, id)
+            .unwrap()
+            .expect("a just-written record is live");
+        let shard = shards.get(&slot).expect("the slot is an open shard");
+        let record = store.read_at(shard, offset, verifies).unwrap();
+        assert_eq!(record.hash, *id, "the slot location names this record");
+        assert_eq!(
+            store.get_location(&TEST_COLLECTION, id).unwrap(),
+            Some((shard.pack_id, offset)),
+            "slot and pack locations disagree"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                (slot, offset) > previous,
+                "appends must be ordered by (slot, offset)"
+            );
+        }
+        previous = Some((slot, offset));
+    }
+
+    let physical = store
+        .collection_live_record_locations(&TEST_COLLECTION)
+        .unwrap()
+        .expect("a known collection has physical record locations");
+    assert_eq!(physical.len(), written.len());
+    for (id, slot, offset, frame_len) in physical {
+        assert!(written.contains(&id));
+        assert!(frame_len > 0);
+        assert_eq!(
+            store.get_slot_location(&TEST_COLLECTION, &id).unwrap(),
+            Some((slot, offset)),
+            "metadata scan and live index must agree on physical location"
+        );
+    }
+
+    assert_eq!(
+        store
+            .get_slot_location(&TEST_COLLECTION, &distinct_id(0x7f))
+            .unwrap(),
+        None,
+        "an unknown id resolves to no slot location"
     );
 }
 
@@ -5044,6 +5117,8 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             max_extent_bytes: 10_000_000,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     assert_eq!(
@@ -5078,6 +5153,8 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             max_extent_bytes: 200_000,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     assert_eq!(
@@ -5110,6 +5187,8 @@ fn test_plan_read_extents_orders_by_slot() {
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
@@ -5123,6 +5202,8 @@ fn test_read_plan_policy_wants_gates_on_batch_size_and_cap() {
         max_extent_bytes: 8 * 1024 * 1024,
         min_batch_candidates: 16,
         random_advice: false,
+        point_random_mmap: false,
+        point_random_mmap_index: false,
     };
     assert!(!policy.wants(15));
     assert!(policy.wants(16));
@@ -5165,6 +5246,8 @@ fn test_get_many_prefetch_plan_counters() {
         max_extent_bytes: 8 * 1024 * 1024,
         min_batch_candidates: 1,
         random_advice: false,
+        point_random_mmap: false,
+        point_random_mmap_index: false,
     });
 
     let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
@@ -8134,49 +8217,62 @@ fn checkpoint_growth_recovers_metadata_bearing_frames() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// Two stores attached to one shared coordinator: a single pool's sync
-/// commits both pools' published mutations in one durability barrier, and
-/// a later reopen replays only each pool's own tagged frames.
 #[test]
-fn paged_residency_rejects_wal_journaling_until_coverage_can_advance() {
+fn paged_residency_supports_shared_wal_reopen() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
 
-    let dir = test_dir("paged_rejects_wal");
+    let dir = test_dir("paged_shared_wal_reopen");
+    let wal = dir.join("wal.bin");
+    let collection = [0x57; 16];
+    let id = distinct_id(7);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
     let store = PackfileStorage::open_with_residency(
         dir.clone(),
         packfile::ChecksumPolicy::Full,
         crate::index::IndexResidency::Paged,
     )
     .unwrap();
-    let per_pool = store.enable_journal(dir.join("per-pool.wal")).unwrap_err();
-    assert!(matches!(
-        per_pool,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
-
-    let sequence = Arc::new(AtomicU64::new(1));
-    let sequenced = store
-        .enable_journal_with_sequence(dir.join("sequenced.wal"), sequence)
-        .unwrap_err();
-    assert!(matches!(
-        sequenced,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
-
-    let shared_root = test_dir("paged_rejects_shared_wal");
-    let (journal, scan) = Journal::open_shared(shared_root.join("wal.bin")).unwrap();
-    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
-    let shared = store
-        .enable_shared_journal(coordinator, ShardType::EventDag)
-        .unwrap_err();
-    assert!(matches!(
-        shared,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &id,
+            &NodeData::new(bytes::Bytes::from_static(b"paged shared WAL")),
+        )
+        .unwrap();
+    store.sync().unwrap();
     drop(store);
-    fs::remove_dir_all(dir).ok();
-    fs::remove_dir_all(shared_root).ok();
+    drop(coordinator);
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_residency(
+        dir.clone(),
+        packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(coordinator, ShardType::EventDag)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get(&collection, &id)
+            .unwrap()
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"paged shared WAL"[..])
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -13264,12 +13360,456 @@ fn paged_open(dir: &std::path::Path) -> PackfileStorage {
     .unwrap()
 }
 
-/// A collection version is durable in the checkpoint (or the WAL groups the
-/// checkpoint has not reclaimed), not in the sealed packs' frames. A paged
-/// open deletes the checkpoint, so a version that only lived there must not
-/// come back as zero after the WAL has been reclaimed.
 #[test]
-#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
+fn paged_delete_recreate_does_not_resurrect_old_records_after_reopen() {
+    let dir = test_dir("paged_delete_recreate_generation_fence");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    // Repack must apply the generation floor while building its direct-scan
+    // candidate map, or it can copy old frames into packs beyond that floor.
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "single-collection repack must not copy pre-delete records"
+    );
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "reopening a recreated paged collection must not expose pre-delete records"
+    );
+    assert_eq!(
+        reopened
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_generation_fence_excludes_old_records_after_delete_marker_is_cleared() {
+    let dir = test_dir("paged_generation_fence_before_first_new_record");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+
+    // Model a stop after publishing the durable generation fence but before
+    // clearing the deletion marker.
+    store
+        .prepare_recreated_collection(&TEST_COLLECTION)
+        .unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the delete marker must hide old records while the recreation is incomplete"
+    );
+    // Once the durable fence exists, clearing the marker cannot expose the old
+    // generation, even if the first new-generation append was lost.
+    reopened.clear_deleted_collection(&TEST_COLLECTION).unwrap();
+    drop(reopened);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the generation fence must exclude old records after the marker is cleared"
+    );
+    reopened
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    reopened.sync_all().unwrap();
+    drop(reopened);
+
+    let final_open = paged_open(&dir);
+    assert!(final_open.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    assert_eq!(
+        final_open
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(final_open);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_read_only_refresh_loads_new_generation_fence() {
+    let dir = test_dir("paged_read_only_refresh_generation_fence");
+    let old = distinct_id(8);
+    let new = distinct_id(9);
+    let config = crate::config::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::config::RuntimeConfig::default()
+    };
+
+    let writer = paged_open(&dir);
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+    let reader = PackfileStorage::open_read_only_with_config(dir.clone(), &config).unwrap();
+    assert!(reader.get(&TEST_COLLECTION, &old).unwrap().is_some());
+
+    writer.delete_collection(&TEST_COLLECTION).unwrap();
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+
+    reader.refresh_collection(&TEST_COLLECTION).unwrap();
+    assert!(
+        reader.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a read-only worker must load the writer's generation fence before refresh"
+    );
+    assert_eq!(
+        reader
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+
+    drop(reader);
+    drop(writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_delete_recreate_fence_survives_resident_and_paged_reopen() {
+    let dir = test_dir("resident_delete_recreate_generation_fence");
+    let old = distinct_id(3);
+    let new = distinct_id(4);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &old,
+                &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.delete_collection(&TEST_COLLECTION).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &new,
+                &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+
+    let resident = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(
+        resident.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "resident recovery must honor the durable generation fence"
+    );
+    drop(resident);
+    let paged = paged_open(&dir);
+    assert!(
+        paged.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a resident-written generation must remain fenced in paged mode"
+    );
+    assert!(paged.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(paged);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_repack_does_not_copy_pre_delete_records() {
+    let dir = test_dir("batch_repack_delete_recreate_generation_fence");
+    let old = distinct_id(5);
+    let new = distinct_id(6);
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    store
+        .repack_collections_reachable(&[TEST_COLLECTION], |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "batch repack must not copy pre-delete records"
+    );
+    drop(store);
+    let reopened = paged_open(&dir);
+    assert!(reopened.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A repack scans packfiles directly. It must apply the same generation fence
+/// as an open, or it copies the deleted generation into a newer pack where the
+/// fence no longer excludes it.
+#[test]
+fn paged_repack_does_not_resurrect_deleted_generation() {
+    let dir = test_dir("paged_repack_delete_recreate");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    // Keep the pack alive after the delete so the old bytes are still
+    // physically scannable; otherwise pack retirement hides the bug.
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    assert!(store.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    drop(store);
+
+    // Reopen first: discovery re-adds the retired-but-still-on-disk pack that
+    // holds the deleted generation, which is what a repack would scan.
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the open-time fence should hide the deleted generation"
+    );
+    #[cfg(feature = "logging")]
+    {
+        let _ = crate::logging::init();
+        crate::logging::info!(
+            old_before_repack = ?reopened
+                .get(&TEST_COLLECTION, &old)
+                .unwrap()
+                .map(|data| data.bytes.clone()),
+            deleted_collections = ?fs::read(dir.join("deleted.collections")).ok(),
+            "checking delete/recreate state before repack"
+        );
+    }
+    // Both physical generations must be visible to the repack scan, or this
+    // test would pass without exercising the fence at all.
+    let pack_files = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+        .count();
+    let scanned: usize = reopened
+        .scan_collection_repack_records(&TEST_COLLECTION)
+        .unwrap()
+        .iter()
+        .map(|(_, entries)| entries.len())
+        .sum();
+    assert_eq!(
+        scanned, 2,
+        "repack scan should see both generations (on-disk packs: {pack_files})"
+    );
+    reopened
+        .repack_collection_reachable(&TEST_COLLECTION, |_, _| Vec::new())
+        .unwrap();
+    reopened.sync_all().unwrap();
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "repack copied the deleted generation into a newer pack"
+    );
+    drop(reopened);
+
+    let again = paged_open(&dir);
+    assert!(
+        again.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a recreated collection must not expose pre-delete records after repack"
+    );
+    assert_eq!(
+        again
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(again);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A resident writer's delete/recreate must leave a fence a later paged open
+/// can honor; otherwise switching a room to paged residency resurrects purged
+/// records.
+#[test]
+fn resident_writer_delete_recreate_is_not_resurrected_by_paged_reopen() {
+    let dir = test_dir("resident_write_paged_reopen");
+    let old = distinct_id(3);
+    let new = distinct_id(4);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(8),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a paged reopen must honor a fence written by a resident writer"
+    );
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Resident recovery can fall back to a full pack scan when the checkpoint is
+/// damaged or missing. That scan must also honor the fence.
+#[test]
+fn resident_full_scan_keeps_delete_recreate_fence() {
+    let dir = test_dir("resident_full_scan_fence");
+    let old = distinct_id(5);
+    let new = distinct_id(6);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(9),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a resident full-scan recovery must not resurrect the deleted generation"
+    );
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A collection version is durable in `index.versions` before a paged pool
+/// reports coverage and lets the shared WAL reclaim its group.
+#[test]
 fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -13292,8 +13832,8 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
         fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
         coordinator.sync().unwrap();
         store.sync_all().unwrap();
-        // A full checkpoint is what advances coverage and lets the journal
-        // drop the groups; a delta append would leave them for replay.
+        // Paged sync persists the version baseline before reporting coverage,
+        // which lets the journal drop the groups without an index checkpoint.
         store.force_index_checkpoint().unwrap();
         assert_eq!(
             Journal::scan_read_only(&wal).unwrap().groups.len(),
@@ -13344,6 +13884,391 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+#[cfg(feature = "multi-reader")]
+fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
+    let Err(error) = result else {
+        panic!("a shared reader must reject mismatched writer residency");
+    };
+    assert!(
+        matches!(&error, StorageError::Unsupported(message) if message.contains("matching index residency")),
+        "mismatched shared reader should explain how to open with matching residency: {error:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reader_rejects_missing_or_corrupt_residency_record() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_missing_residency_record");
+    let wal = dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    drop(writer);
+    drop(coordinator);
+
+    let residency_path = dir.join("index.residency");
+    fs::remove_file(&residency_path).unwrap();
+    assert!(matches!(
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State),
+        Err(StorageError::Unsupported(message)) if message.contains("no persisted index-residency record")
+    ));
+
+    fs::write(&residency_path, b"invalid").unwrap();
+    assert!(matches!(
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State),
+        Err(StorageError::Corrupt(message)) if message.contains("not a valid index-residency record")
+    ));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refused_residency_change_does_not_overwrite_marker_before_lock() {
+    let dir = test_dir("refused_residency_change_keeps_marker");
+    let resident_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Resident,
+    )
+    .unwrap();
+
+    let Err(error) = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    ) else {
+        panic!("a second writer must not acquire the held pool lock");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        read_index_residency_marker(&dir).unwrap(),
+        crate::index::IndexResidency::Resident,
+        "a writer refused by the pool lock must not change the persisted mode"
+    );
+
+    drop(resident_writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("paged_worker_reload_after_reclaim");
+    let wal = dir.join("shared.wal");
+    let collection = [0x57u8; 16];
+    let first = distinct_id(1);
+    let second = distinct_id(2);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
+
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+    ));
+    let config = crate::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::RuntimeConfig::default()
+    };
+    let reader = PackfileStorage::open_read_committed_shared_with_config(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(reader.read_covered_lsn.load(Ordering::Acquire), 1);
+
+    writer
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
+
+    let values = reader
+        .get_read_committed(&collection, &[first, second])
+        .unwrap();
+    assert!(
+        reader.stats().read_reloads >= 1,
+        "paged worker should reload after reclaim; coverage={}, journal coverage={}",
+        reader.read_covered_lsn.load(Ordering::Acquire),
+        PackfileStorage::read_journal_lsn(&dir)
+    );
+    assert_eq!(
+        values[0].as_ref().map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    assert_eq!(
+        values[1].as_ref().map(|data| data.bytes.as_ref()),
+        Some(&b"second"[..])
+    );
+    assert!(reader.stats().read_reloads >= 1);
+    assert!(reader.read_covered_lsn.load(Ordering::Acquire) >= 2);
+
+    drop(reader);
+    drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reader_detects_writer_residency_change_before_reload() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_residency_change");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let first = distinct_id(3);
+    let second = distinct_id(4);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+
+    let resident_writer = PackfileStorage::open(dir.clone()).unwrap();
+    resident_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    resident_writer
+        .journal()
+        .unwrap()
+        .set_reclaim_trigger_len(1);
+    resident_writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    resident_writer.sync().unwrap();
+
+    let reader =
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
+    assert_eq!(
+        reader.get_read_committed(&collection, &[first]).unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    drop(resident_writer);
+
+    let paged_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    paged_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    paged_writer.journal().unwrap().set_reclaim_trigger_len(1);
+    paged_writer
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    paged_writer.sync().unwrap();
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
+
+    assert_residency_mismatch(reader.get_read_committed(&collection, &[first, second]));
+
+    drop(reader);
+    drop(paged_writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A writer restart that changes residency must be noticed even when this
+/// reader's next read needs no reload. Without the early check the overlay and
+/// the pinned index still answer the read, so the mismatch would go unreported
+/// until a later reclaim.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reader_rejects_residency_change_without_a_reload() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_residency_change_no_reload");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let first = distinct_id(5);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+
+    let resident_writer = PackfileStorage::open(dir.clone()).unwrap();
+    resident_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    resident_writer
+        .journal()
+        .unwrap()
+        .set_reclaim_trigger_len(1);
+    resident_writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    resident_writer.sync().unwrap();
+
+    let reader =
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
+    assert_eq!(
+        reader.get_read_committed(&collection, &[first]).unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    drop(resident_writer);
+
+    // Opening the paged writer rewrites the residency record but leaves the
+    // WAL and this reader's covered LSN untouched, so the read below would be
+    // served from the pinned index and overlay without the early check.
+    let paged_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    paged_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+
+    assert_residency_mismatch(reader.get_read_committed(&collection, &[first]));
+
+    drop(reader);
+    drop(paged_writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A paged writer records its residency on disk, so a resident reader is
+/// rejected at open even while all writes are still buffered and no WAL
+/// coverage has been reclaimed. The checkpoint/coverage fallback alone cannot
+/// see this case.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn resident_reader_rejects_a_paged_writer_before_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("resident_reader_rejects_paged_writer");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    writer
+        .put(
+            &collection,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    assert_eq!(
+        PackfileStorage::read_journal_lsn(&dir),
+        0,
+        "the writer must have no durable coverage yet"
+    );
+
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+    ));
+
+    drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn paged_reader_rejects_a_resident_writer() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("paged_reader_rejects_resident_writer");
+    let wal = dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+
+    let paged_config = crate::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::RuntimeConfig::default()
+    };
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared_with_config(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+        &paged_config,
+    ));
+
+    drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The coverage cap applies whenever a valid versions file exists, in either
 /// mode. A Resident checkpoint therefore has to refresh that file every time
 /// it writes `journal.lsn`, or a store carrying a stale versions file (from an
@@ -13358,9 +14283,9 @@ fn resident_checkpoint_refreshes_a_stale_versions_file() {
     let store_dir = test_dir("versions_resident_refresh_store");
     let wal = wal_dir.join("shared.wal");
 
-    // Seed the stale versions file directly: Paged journaling is refused, but
-    // a versions file left by an older build (or a Paged store that never
-    // checkpointed) must still not cap a later Resident checkpoint.
+    // Seed the stale versions file directly. A versions file left by an older
+    // build (or a Paged store that never checkpointed) must not cap a later
+    // Resident checkpoint.
     fs::create_dir_all(&store_dir).unwrap();
     crate::index::versions::write_versions(
         &PackfileStorage::index_versions_path(&store_dir),
@@ -13472,8 +14397,8 @@ fn paged_coverage_is_capped_by_the_versions_file() {
     )
     .unwrap();
 
-    // Paged journaling is refused, so read the cap from the open state
-    // instead of attaching a coordinator.
+    // Paged journaling is supported, so read the capped coverage from the
+    // open state after the paged scan.
     let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
         store_dir.clone(),
         48 * 1024,
@@ -13662,9 +14587,8 @@ fn a_failed_publication_does_not_advance_coverage_until_retry() {
     );
 }
 
-/// Child half of [`versions_fsync_precedes_wal_reclaim_crash_safe`]: write,
-/// commit the WAL, then force a checkpoint and die after the versions fsync but
-/// before `journal.lsn` and reclaim.
+/// Child half of the versions/coverage crash tests: write and commit the WAL,
+/// then force a checkpoint and die at the configured durability boundary.
 #[test]
 fn versions_crash_child() {
     use crate::journal::{Journal, JournalCoordinator};
@@ -13680,7 +14604,17 @@ fn versions_crash_child() {
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
         JournalCoordinator::new(journal, &scan)
     });
-    let store = PackfileStorage::open_with_max_shard_bytes(store_dir, 48 * 1024).unwrap();
+    let writer_residency = match std::env::var("MTXDB_VERSIONS_WRITER_RESIDENCY").as_deref() {
+        Ok("paged") => crate::index::IndexResidency::Paged,
+        _ => crate::index::IndexResidency::Resident,
+    };
+    let store = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir,
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        writer_residency,
+    )
+    .unwrap();
     store
         .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
@@ -13691,23 +14625,39 @@ fn versions_crash_child() {
         .unwrap();
     let coverage = coordinator.committed_lsn_for_pool(ShardType::State);
     std::fs::write(root.join("expected.txt"), format!("{version} {coverage}")).unwrap();
-    // The crash point fires inside the checkpoint tail.
+    if let Ok(point) = std::env::var("MTXDB_VERSIONS_CRASH_POINT") {
+        // Arm the injected crash only after the WAL commit. This lets the
+        // Paged writer enter its first pack/version/coverage barrier.
+        std::env::set_var("MTXDB_CRASH_AT", point);
+    }
+    // The selected crash point fires inside the checkpoint tail.
     store.force_index_checkpoint().unwrap();
     unreachable!("the child must exit at the versions crash point");
 }
 
-/// A crash between the versions fsync and the coverage claim leaves the
-/// checkpoint unreclaimed and `journal.lsn` unwritten. A paged reopen retires
-/// the checkpoint, so only `index.versions` can restore the version and
-/// coverage.
-#[test]
-#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
-fn versions_fsync_precedes_wal_reclaim_crash_safe() {
+#[derive(Clone, Copy)]
+enum PagedCrashRecovery {
+    /// Packs may be durable, but without durable versions the WAL must remain
+    /// available to replay the committed write.
+    ReplayFromWal,
+    /// Durable versions or a completed reclaim must preserve the saved
+    /// coverage claim across reopen.
+    KeepSavedCoverage,
+}
+
+fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+    residency: crate::index::IndexResidency,
+    test_name: &str,
+    coverage_message: &str,
+    writer_residency: crate::index::IndexResidency,
+    crash_point: &str,
+    expected_recovery: PagedCrashRecovery,
+) {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
     use std::process::Command;
 
-    let root = test_dir("versions_crash");
+    let root = test_dir(test_name);
     fs::create_dir_all(&root).unwrap();
     let output = Command::new(crate::io::test_binary_path())
         .args([
@@ -13716,7 +14666,15 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
             "--test-threads=1",
         ])
         .env("MTXDB_VERSIONS_CRASH_DIR", &root)
-        .env("MTXDB_CRASH_AT", "after-versions-fsync")
+        .env(
+            "MTXDB_VERSIONS_WRITER_RESIDENCY",
+            if writer_residency == crate::index::IndexResidency::Paged {
+                "paged"
+            } else {
+                "resident"
+            },
+        )
+        .env("MTXDB_VERSIONS_CRASH_POINT", crash_point)
         .output()
         .unwrap();
     assert_eq!(
@@ -13742,12 +14700,13 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
         root.join("store"),
         48 * 1024,
         crate::packfile::ChecksumPolicy::Full,
-        crate::index::IndexResidency::Paged,
+        residency,
     )
     .unwrap();
     reopened
         .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
+    reopened.replay_journal().unwrap();
     let (_, version_after) = reopened
         .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
         .unwrap();
@@ -13755,14 +14714,98 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
         version_after >= version_before,
         "version went backwards after the crash: before={version_before}, after={version_after}"
     );
-    assert_eq!(
-        reopened.durable_coverage(),
-        coverage_before,
-        "coverage must come from index.versions when journal.lsn was never written"
-    );
+    match expected_recovery {
+        PagedCrashRecovery::ReplayFromWal => {
+            assert!(
+                reopened.durable_coverage() < coverage_before,
+                "coverage must not advance before index.versions is durable"
+            );
+            assert!(
+                !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+                "the WAL must retain records not yet represented by index.versions"
+            );
+        }
+        PagedCrashRecovery::KeepSavedCoverage => {
+            assert_eq!(
+                reopened.durable_coverage(),
+                coverage_before,
+                "{coverage_message}"
+            );
+        }
+    }
     drop(reopened);
     drop(coordinator);
     fs::remove_dir_all(&root).ok();
+}
+
+/// A crash between the versions fsync and the coverage claim leaves the
+/// checkpoint unreclaimed and `journal.lsn` unwritten. A paged reopen retires
+/// the checkpoint, so only `index.versions` can restore the version and
+/// coverage.
+#[test]
+fn versions_fsync_precedes_wal_reclaim_crash_safe() {
+    assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+        crate::index::IndexResidency::Paged,
+        "versions_crash",
+        "coverage must come from index.versions when journal.lsn was never written",
+        crate::index::IndexResidency::Resident,
+        "after-versions-fsync",
+        PagedCrashRecovery::KeepSavedCoverage,
+    );
+}
+
+/// The supported Resident counterpart of
+/// [`versions_fsync_precedes_wal_reclaim_crash_safe`]: the same crash between
+/// the versions fsync and the coverage claim, recovered through a Resident
+/// reopen with the shared WAL.
+#[test]
+fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
+    assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+        crate::index::IndexResidency::Resident,
+        "versions_crash_resident",
+        "coverage must survive a crash before journal.lsn was written",
+        crate::index::IndexResidency::Resident,
+        "after-versions-fsync",
+        PagedCrashRecovery::KeepSavedCoverage,
+    );
+}
+
+/// Paged writers have no resident checkpoint: packs, then index.versions,
+/// then the shared-WAL coverage/reclaim are their durability handoff. Exercise
+/// each boundary with a Paged writer and recover in both supported modes.
+#[test]
+fn paged_writer_crashes_preserve_committed_versions_across_coverage_handoff() {
+    for (label, point, expected) in [
+        (
+            "packs",
+            "after-paged-packs-fsync",
+            PagedCrashRecovery::ReplayFromWal,
+        ),
+        (
+            "versions",
+            "after-paged-versions-fsync",
+            PagedCrashRecovery::KeepSavedCoverage,
+        ),
+        (
+            "reclaim",
+            "after-paged-wal-reclaim",
+            PagedCrashRecovery::KeepSavedCoverage,
+        ),
+    ] {
+        for (mode, residency) in [
+            ("resident", crate::index::IndexResidency::Resident),
+            ("paged", crate::index::IndexResidency::Paged),
+        ] {
+            assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+                residency,
+                &format!("paged_writer_crash_{label}_{mode}"),
+                "every committed version and its coverage must survive the Paged writer crash",
+                crate::index::IndexResidency::Paged,
+                point,
+                expected,
+            );
+        }
+    }
 }
 
 #[test]
@@ -13782,7 +14825,7 @@ fn paged_full_scan_uses_sidecars_under_full_checksums() {
     );
     {
         let generation = store.generation(&TEST_COLLECTION).expect("generation");
-        assert!(!generation.sealed.is_empty());
+        assert!(!generation.sealed.is_empty(), "value should not be empty");
         let sealed = usize::try_from(
             generation
                 .sealed
@@ -13948,6 +14991,201 @@ fn paged_repack_after_open_preserves_every_record() {
     }
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ordered_point_mapping_survives_growth_unmap_and_repack() {
+    let dir = test_dir("ordered_point_mapping_lifecycle");
+    let store = PackfileStorage::open(dir).unwrap();
+    let first = distinct_id(71);
+    let second = distinct_id(72);
+    store.set_point_random_mmap(true);
+
+    store
+        .put(
+            &TEST_COLLECTION,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert_eq!(
+        store
+            .get(&TEST_COLLECTION, &first)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"first"
+    );
+    let shard = store.shards.all_shards().into_iter().next().unwrap().1;
+    assert!(
+        shard.mmap.read().is_none(),
+        "point reads must not create the sequential mapping"
+    );
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert!(store
+        .get_read_committed(&TEST_COLLECTION, &[first])
+        .unwrap()[0]
+        .is_some());
+    assert!(
+        shard.mmap.read().is_none(),
+        "single-ID committed fallback must use the point mapping"
+    );
+
+    store
+        .put(
+            &TEST_COLLECTION,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert_eq!(
+        store
+            .get(&TEST_COLLECTION, &second)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"second"
+    );
+    assert!(
+        shard.mmap.read().is_none(),
+        "growth must not create the unused sequential mapping"
+    );
+
+    assert!(store.unmap_shards() > 0);
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert!(store.get(&TEST_COLLECTION, &first).unwrap().is_some());
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    for id in [first, second] {
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+}
+
+#[test]
+fn ordered_index_point_mapping_leaves_event_bodies_sequential() {
+    let dir = test_dir("ordered_index_point_mapping_scope");
+    let store = PackfileStorage::open(dir).unwrap();
+    let body_collection = [0x62; 16];
+    let body_id = distinct_id(213);
+    store
+        .put(
+            &body_collection,
+            &body_id,
+            &NodeData::new(bytes::Bytes::from_static(b"event body")),
+        )
+        .unwrap();
+
+    let scope = [0x63; 16];
+    let index = crate::timeline::OrderedIndex::<_, crate::timeline::ScopedSeqKey>::open(
+        &store,
+        "point_mapping_scope_test",
+    );
+    index
+        .build(&[crate::timeline::ScopedSeqKey::new(
+            scope,
+            1,
+            0,
+            distinct_id(214),
+            [0; 32],
+        )])
+        .unwrap();
+    store.sync_all().unwrap();
+    store
+        .generation(&index.collection_id())
+        .unwrap()
+        .cache
+        .clear();
+    store.generation(&body_collection).unwrap().cache.clear();
+    store.set_point_random_mmap_index(true);
+
+    assert_eq!(index.page(&scope, None, true, 4).unwrap().entries.len(), 1);
+    let shard = store.shards.all_shards().into_iter().next().unwrap().1;
+    assert!(
+        shard.mmap.read().is_none(),
+        "ordered-index reads should use the point mapping only"
+    );
+
+    assert!(store.get(&body_collection, &body_id).unwrap().is_some());
+    assert!(
+        shard.mmap.read().is_some(),
+        "body reads should retain the normal mapping in index-only mode"
+    );
+
+    let _ = store.unmap_shards();
+    store.generation(&body_collection).unwrap().cache.clear();
+    store.set_point_random_mmap(true);
+    assert!(store.get(&body_collection, &body_id).unwrap().is_some());
+    assert!(
+        shard.mmap.read().is_none(),
+        "the global point setting should still cover body reads"
+    );
+}
+
+#[test]
+fn ordered_point_reads_survive_concurrent_growth_and_repack() {
+    let dir = test_dir("ordered_point_mapping_concurrent");
+    let store = PackfileStorage::open(dir).unwrap();
+    let fixed = distinct_id(91);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &fixed,
+            &NodeData::new(bytes::Bytes::from_static(b"fixed")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    store.set_point_random_mmap(true);
+    let latest = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            while latest.load(Ordering::Acquire) < 80 {
+                let value = store.get(&TEST_COLLECTION, &fixed).unwrap().unwrap();
+                assert_eq!(value.bytes.as_ref(), b"fixed");
+                let published = latest.load(Ordering::Acquire);
+                if published > 0 {
+                    let id = distinct_id(u8::try_from(published - 1).unwrap());
+                    assert_eq!(
+                        store
+                            .get(&TEST_COLLECTION, &id)
+                            .unwrap()
+                            .unwrap()
+                            .bytes
+                            .len(),
+                        128
+                    );
+                }
+                std::thread::yield_now();
+            }
+        });
+        let writer = scope.spawn(|| {
+            for number in 0..80u8 {
+                let id = distinct_id(number);
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &id,
+                        &NodeData::new(bytes::Bytes::from(vec![number; 128])),
+                    )
+                    .unwrap();
+                latest.store(usize::from(number) + 1, Ordering::Release);
+                if number % 20 == 19 {
+                    store
+                        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+                        .unwrap();
+                }
+            }
+        });
+        reader.join().unwrap();
+        writer.join().unwrap();
+    });
 }
 
 #[test]
@@ -14541,7 +15779,10 @@ fn paged_repack_invalidates_a_run_over_retired_packs() {
         "the surviving covered packs answer through their sidecars"
     );
     drop(other);
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_store_matches(&store, &expected, "after repack");
     store.sync_all().unwrap();
     drop(store);
@@ -14705,7 +15946,10 @@ fn paged_run_crash_points_reopen_with_identical_answers() {
     fs::write(&temporary, b"partial run").unwrap();
     let store = paged_open(&dir);
     assert!(!temporary.exists(), "a writable open deletes a temp run");
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_store_matches(&store, &expected, "after a crash before rename");
 
     // After the rename (with or without the directory fsync), before the
@@ -14778,7 +16022,10 @@ fn paged_run_install_is_discarded_after_its_packs_retire() {
         .unwrap();
     store.install_run(built);
     assert!(!path.exists(), "a run over a retired pack is discarded");
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 0);
     for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
         assert!(store
@@ -15293,6 +16540,47 @@ fn retiring_a_delta_epoch_never_unlinks_the_live_log() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn checkpoint_tail_sweeps_rejected_epochs_but_keeps_the_live_epoch() {
+    let dir = test_dir("checkpoint_tail_delta_sweep");
+    let _cleanup = RemoveDirOnDrop(dir.clone());
+    let live_fingerprint = 0x22;
+    let rejected_fingerprint = 0x11;
+    let live_path = PackfileStorage::delta_path(&dir, live_fingerprint);
+    let rejected_path = PackfileStorage::delta_path(&dir, rejected_fingerprint);
+    fs::write(&rejected_path, b"rejected epoch").unwrap();
+
+    let (release_tail, wait_for_tail) = std::sync::mpsc::channel();
+    let tail = CheckpointTail {
+        base_dir: dir.clone(),
+        fingerprint: live_fingerprint,
+        covered_lsn: None,
+        base_delta_seq: 0,
+        logical_versions: Vec::new(),
+        blobs: Vec::new(),
+        pack_table: Vec::new(),
+        journal: None,
+        pool_tag: 0,
+        durable_coverage: Arc::new(AtomicU64::new(0)),
+        hook: Some(TailHook {
+            gate: wait_for_tail,
+            fail: false,
+        }),
+    };
+    let worker = std::thread::spawn(move || tail.run());
+
+    // A batch can be appended to the new epoch while the checkpoint tail is
+    // waiting. Cleanup must preserve this live path even with no old base
+    // fingerprint available to identify a predecessor.
+    fs::write(&live_path, b"batch appended during tail").unwrap();
+    release_tail.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+
+    assert!(!rejected_path.exists());
+    assert_eq!(fs::read(&live_path).unwrap(), b"batch appended during tail");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// What a shared-WAL store leaves after its first sync reclaimed the WAL groups
 /// that carried its collection versions: the published store directory, the
 /// reclaimed WAL, and each collection's record count and logical version.
@@ -15650,6 +16938,422 @@ fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
     assert_refuses_without_a_baseline(&stale, "the first sync's baseline");
 }
 
+/// A writable open that has to rescan must keep a delta epoch that still
+/// covers history the shared WAL has reclaimed.
+///
+/// `PackfileStorage::open` runs first and `enable_shared_journal` runs after
+/// it, so at the moment the open chooses the `FullScan` path the delta epoch is
+/// the only durable bridge between the checkpoint and the reclaimed LSN. If
+/// the rescan sweeps it first, the baseline check has nothing left to accept
+/// and the pool is permanently unopenable even though the epoch was valid.
+#[test]
+fn a_full_scan_open_keeps_the_reclaimed_version_baseline() {
+    use crate::journal::Journal;
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("full_scan_keeps_baseline");
+    // Force the second sync to write a coverage delta and reclaim the WAL.
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert_eq!(
+        Journal::scan_read_only(&shared.wal).unwrap().groups.len(),
+        0,
+        "the fixture needs a reclaimed WAL"
+    );
+    let reclaimed = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State);
+    assert!(reclaimed > 0, "the WAL must have reclaimed state history");
+    let has_delta = |dir: &std::path::Path| {
+        fs::read_dir(dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.delta.")
+        })
+    };
+    assert!(
+        has_delta(&shared.store_dir),
+        "the fixture needs a delta epoch carrying the reclaimed versions"
+    );
+
+    // An unsynced write moves the packs past the checkpoint, so the next
+    // writable open rejects the persisted pack table and takes FullScan. The
+    // delta epoch still matches the checkpoint.
+    shared.put(&TEST_COLLECTION, 6..7);
+    let wal = fs::read(&shared.wal).unwrap();
+    let current = copy_store(&shared.store_dir, "full_scan_keeps_baseline_current");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let wal_path = test_dir("full_scan_keeps_baseline_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, &wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+    let recovered = Arc::new(crate::journal::JournalCoordinator::new(journal, &scan));
+    let reopened = match PackfileStorage::open(current.clone()) {
+        Ok(store) => store,
+        Err(error) => panic!("the pool must open: {error}"),
+    };
+    assert!(
+        has_delta(&current),
+        "the rescan deleted the delta epoch before the shared-WAL baseline check"
+    );
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .expect("the surviving delta must cover the reclaimed history");
+    for i in 0..7_u8 {
+        assert!(
+            reopened
+                .get(&TEST_COLLECTION, &distinct_id(i))
+                .unwrap()
+                .is_some(),
+            "record {i} lost across the rescanned open"
+        );
+    }
+    let version = recovered.collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(
+        version >= reclaimed,
+        "the restored version {version} stops before the reclaimed LSN {reclaimed}"
+    );
+}
+
+/// A pool stopped the way a killed or restarted writer leaves it: the WAL was
+/// reclaimed past the checkpoint on the strength of a delta coverage batch, and
+/// the pack then grew beyond that batch's tail before the process went away, so
+/// the next writable open rejects the delta log into a rescan.
+struct DeltaOnlyBaseline {
+    /// The pool directory as the stopped writer left it.
+    files: PathBuf,
+    /// The shared WAL image beside it.
+    wal: Vec<u8>,
+    /// The collection's logical version the stopped writer held.
+    version: u64,
+    /// Records the pool held, which the reopen must still serve.
+    records: u8,
+}
+
+fn delta_only_baseline(label: &str) -> DeltaOnlyBaseline {
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store(label);
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    // The second sync appends a coverage batch to the delta log and reclaims
+    // the WAL past the checkpoint's own coverage.
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+
+    let checkpoint_covered = crate::index::checkpoint::read_checkpoint(
+        &PackfileStorage::index_checkpoint_path(&shared.store_dir),
+    )
+    .expect("a checkpoint")
+    .covered_lsn;
+    let versions_covered = crate::index::versions::read_coverage(
+        &PackfileStorage::index_versions_path(&shared.store_dir),
+    )
+    .unwrap_or(0);
+    let reclaimed = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State);
+    let delta_table = PackfileStorage::delta_version_table(&shared.store_dir)
+        .expect("the delta log carries a version table");
+    assert!(
+        checkpoint_covered.max(versions_covered) < reclaimed,
+        "the reclaim must have gone past the checkpoint and versions file \
+         ({checkpoint_covered}/{versions_covered} vs {reclaimed}) or the delta is not the baseline"
+    );
+    assert!(
+        delta_table.covered_lsn >= reclaimed,
+        "the delta's table must cover the reclaimed history"
+    );
+
+    // The pack grows past the delta's tail: committed to the WAL and written
+    // to the pack, but no delta batch or checkpoint follows.
+    shared.put(&TEST_COLLECTION, 6..8);
+    shared.coordinator.sync().unwrap();
+    let version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    let wal = fs::read(&shared.wal).unwrap();
+    let files = copy_store(&shared.store_dir, &format!("{label}_stopped"));
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+    DeltaOnlyBaseline {
+        files,
+        wal,
+        version,
+        records: 8,
+    }
+}
+
+fn delta_logs(store: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(store)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("index.delta."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The incident this guards: the delta log was the only durable baseline for
+/// the reclaimed WAL groups, and the writable open that follows a stop with the
+/// pack ahead of the log deleted it (the rescan path) before the baseline check
+/// that would have accepted it. Every retry then refused with "no readable
+/// version baseline". The open must keep the baseline and serve every record at
+/// the exact version.
+#[test]
+fn a_rescan_open_keeps_the_delta_baseline_beside_a_reclaimed_wal() {
+    use crate::layout::ShardType;
+
+    let fixture = delta_only_baseline("rescan_keeps_delta");
+    assert!(
+        !delta_logs(&fixture.files).is_empty(),
+        "the fixture keeps a delta log"
+    );
+
+    let reopened = reopen_state_pool(&fixture.files, &fixture.wal)
+        .expect("the delta's version table is a readable baseline");
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::FullScan,
+        "the fixture must exercise the rescan path"
+    );
+    for i in 0..fixture.records {
+        let got = reopened.get(&TEST_COLLECTION, &distinct_id(i)).unwrap();
+        assert_eq!(
+            got.map(|data| data.bytes.to_vec()),
+            Some(version_test_value(&TEST_COLLECTION, i)),
+            "record {i} lost"
+        );
+    }
+    drop(reopened);
+
+    // The baseline is durable beyond the delta log now: the file alone covers
+    // the reclaimed history, so a later open does not depend on the log.
+    let coordinator = {
+        let wal = fixture.files.join("again.wal");
+        fs::write(&wal, &fixture.wal).unwrap();
+        let (journal, scan) = crate::journal::Journal::open_shared(&wal).unwrap();
+        Arc::new(crate::journal::JournalCoordinator::new(journal, &scan))
+    };
+    let covered = crate::index::versions::read_coverage(&PackfileStorage::index_versions_path(
+        &fixture.files,
+    ))
+    .expect("the open persisted index.versions");
+    assert!(
+        covered >= coordinator.reclaimed_history_through(ShardType::State),
+        "index.versions ({covered}) must cover the reclaimed history"
+    );
+    remove_delta_logs(&fixture.files);
+    let without_delta = reopen_state_pool(&fixture.files, &fixture.wal)
+        .expect("index.versions alone is now a sufficient baseline");
+    assert!(
+        without_delta
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_some(),
+        "records survive the second open"
+    );
+    let _ = fixture.version;
+    drop(without_delta);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+fn read_if_present(path: &Path) -> Option<Vec<u8>> {
+    fs::read(path).ok()
+}
+
+/// Promotion moves the trusted delta table into `index.versions` and keeps the
+/// newer coverage and every collection either side knows: a file that already
+/// covers more is left alone, an older one is merged with `max`.
+#[test]
+fn promoting_a_delta_table_merges_and_never_lowers_coverage() {
+    let fixture = delta_only_baseline("promote_merge");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    let table = PackfileStorage::delta_version_table(&fixture.files)
+        .expect("the fixture's delta carries a table");
+    let extra = [0xEE_u8; 16];
+
+    // An older file that knows a collection the table does not, and a higher
+    // version of the table's own collection.
+    let table_version = table
+        .entries
+        .iter()
+        .find(|(collection, _)| *collection == TEST_COLLECTION)
+        .map(|(_, version)| *version)
+        .expect("the table names the test collection");
+    crate::index::versions::write_versions(
+        &versions_path,
+        &[(extra, 7), (TEST_COLLECTION, table_version + 100)],
+        1,
+    )
+    .unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    let merged = crate::index::versions::read_versions(&versions_path).unwrap();
+    assert_eq!(merged.covered_lsn, table.covered_lsn, "coverage advances");
+    let get = |collection: &[u8; 16]| {
+        merged
+            .versions
+            .iter()
+            .find(|(id, _)| id == collection)
+            .map(|(_, version)| *version)
+    };
+    assert_eq!(
+        get(&extra),
+        Some(7),
+        "a collection only the file knew stays"
+    );
+    assert_eq!(
+        get(&TEST_COLLECTION),
+        Some(table_version + 100),
+        "the larger version wins"
+    );
+
+    // A file that already covers more than the table is left byte for byte.
+    crate::index::versions::write_versions(&versions_path, &[(extra, 9)], table.covered_lsn + 10)
+        .unwrap();
+    let before = fs::read(&versions_path).unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    assert_eq!(
+        fs::read(&versions_path).unwrap(),
+        before,
+        "a newer file is never rewritten with an older table"
+    );
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// A damaged `index.versions` is not an empty baseline: promotion must fail
+/// without rewriting it, leaving the existing bytes for an operator or a later
+/// repair instead of replacing them with the older delta table.
+#[test]
+fn promotion_refuses_to_overwrite_a_damaged_versions_file() {
+    let fixture = delta_only_baseline("promote_damaged");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    fs::write(&versions_path, b"not a versions snapshot").unwrap();
+    let before = fs::read(&versions_path).unwrap();
+
+    let error = PackfileStorage::promote_delta_versions(&fixture.files)
+        .expect_err("a damaged baseline must not be promoted over");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+    assert_eq!(
+        fs::read(&versions_path).unwrap(),
+        before,
+        "the damaged baseline is preserved for repair"
+    );
+    fs::remove_file(&versions_path).unwrap();
+    fs::create_dir(&versions_path).unwrap();
+    let error = PackfileStorage::promote_delta_versions(&fixture.files)
+        .expect_err("a read failure must not be treated as a missing baseline");
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    assert!(
+        versions_path.is_dir(),
+        "the unreadable baseline is preserved"
+    );
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// Only a table the reader trusts is promoted: a delta log that does not name
+/// the current checkpoint restores nothing, so it must not reach the file.
+#[test]
+fn promotion_ignores_a_delta_that_does_not_name_the_checkpoint() {
+    let fixture = delta_only_baseline("promote_foreign");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    let delta = delta_logs(&fixture.files).pop().expect("a delta log");
+    fs::rename(
+        fixture.files.join(&delta),
+        fixture.files.join("index.delta.00000000deadbeef"),
+    )
+    .unwrap();
+    crate::index::versions::write_versions(&versions_path, &[([0xAA; 16], 1)], 1).unwrap();
+    let before = fs::read(&versions_path).unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    assert_eq!(fs::read(&versions_path).unwrap(), before);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// A store with no journal, and so no table, is left exactly as it was.
+#[test]
+fn promotion_is_a_noop_without_a_version_table() {
+    let dir = test_dir("promote_noop");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::from_slice(b"x"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+    let versions_path = PackfileStorage::index_versions_path(&dir);
+    let before = read_if_present(&versions_path);
+    PackfileStorage::promote_delta_versions(&dir).unwrap();
+    assert_eq!(read_if_present(&versions_path), before);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A read-only open writes nothing: it must not promote, and must leave the
+/// delta log in place for the writer.
+#[test]
+fn a_read_only_open_leaves_the_baseline_files_alone() {
+    let fixture = delta_only_baseline("promote_read_only");
+    let files = ["index.checkpoint", "index.versions", "journal.lsn"];
+    let before: Vec<Option<Vec<u8>>> = files
+        .iter()
+        .map(|file| read_if_present(&fixture.files.join(file)))
+        .collect();
+    let logs_before = delta_logs(&fixture.files);
+    let reader = PackfileStorage::open_read_only(fixture.files.clone()).unwrap();
+    drop(reader);
+    for (file, expected) in files.iter().zip(&before) {
+        assert_eq!(
+            &read_if_present(&fixture.files.join(file)),
+            expected,
+            "a read-only open rewrote {file}"
+        );
+    }
+    assert_eq!(delta_logs(&fixture.files), logs_before);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// When there really is no baseline (the delta log is gone), the open refuses,
+/// and the refusal destroys nothing further: the same files are on disk after,
+/// so a repair or a retry starts from what the operator had.
+#[test]
+fn a_refused_open_leaves_every_baseline_file_untouched() {
+    let fixture = delta_only_baseline("refused_destroys_nothing");
+    remove_delta_logs(&fixture.files);
+    let files = ["index.checkpoint", "index.versions", "journal.lsn"];
+    let before: Vec<Option<Vec<u8>>> = files
+        .iter()
+        .map(|file| read_if_present(&fixture.files.join(file)))
+        .collect();
+    let outcome = reopen_state_pool(&fixture.files, &fixture.wal);
+    assert_refuses_without_a_baseline(&outcome, "no delta, stale files");
+    drop(outcome);
+    for (file, expected) in files.iter().zip(&before) {
+        assert_eq!(
+            &read_if_present(&fixture.files.join(file)),
+            expected,
+            "the refused open rewrote {file}"
+        );
+    }
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
 /// The evidence is the history the WAL dropped, not what survives in the packs:
 /// a deleted collection leaves no record to find, and losing the baseline must
 /// still refuse.
@@ -15756,4 +17460,98 @@ fn imported_and_quiet_pools_open_beside_a_reclaimed_wal() {
         pool.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
             .expect("a pool with nothing reclaimed opens without a baseline");
     }
+}
+
+const GENERATION_OLD: [u8; 16] = [0x61; 16];
+const GENERATION_NEW: [u8; 16] = [0x62; 16];
+
+fn put_synced(store: &PackfileStorage, id: &[u8; 16], bytes: &[u8]) {
+    store
+        .put(&TEST_COLLECTION, id, &NodeData::from_slice(bytes))
+        .unwrap();
+    store.sync_all().unwrap();
+}
+
+#[track_caller]
+fn assert_only_new_generation(store: &PackfileStorage, when: &str) {
+    assert!(
+        store
+            .get(&TEST_COLLECTION, &GENERATION_OLD)
+            .unwrap()
+            .is_none(),
+        "{when}: a pre-delete record came back"
+    );
+    assert!(
+        store
+            .get(&TEST_COLLECTION, &GENERATION_NEW)
+            .unwrap()
+            .is_some(),
+        "{when}: the recreated record is missing"
+    );
+}
+
+fn no_edges(_: &[u8; 16], _: &[u8]) -> Vec<[u8; 16]> {
+    Vec::new()
+}
+
+#[test]
+fn resident_recreated_collection_survives_single_repack() {
+    let open = |dir: &std::path::Path| {
+        PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), 8192).unwrap()
+    };
+    let dir = test_dir("resident_recreate_single_repack");
+    let store = open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    put_synced(&store, &GENERATION_NEW, b"new generation");
+    assert_only_new_generation(&store, "before repack");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    assert_only_new_generation(&store, "after repack");
+    drop(store);
+    assert_only_new_generation(&open(&dir), "after reopen");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A repack leaves an incremental cursor holding its live map. Recreating the
+/// collection must discard it.
+#[test]
+fn recreate_discards_the_incremental_repack_cursor() {
+    let dir = test_dir("recreate_incremental_repack");
+    let store = paged_open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    put_synced(&store, &GENERATION_NEW, b"new generation");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    assert_only_new_generation(&store, "after second repack");
+    drop(store);
+    assert_only_new_generation(&paged_open(&dir), "after reopen");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_repack_does_not_revive_a_deleted_collection() {
+    let dir = test_dir("deleted_batch_repack");
+    let store = paged_open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .repack_collections_reachable(&[TEST_COLLECTION], no_edges)
+        .unwrap();
+    assert!(store
+        .get(&TEST_COLLECTION, &GENERATION_OLD)
+        .unwrap()
+        .is_none());
+    drop(store);
+    assert!(paged_open(&dir)
+        .get(&TEST_COLLECTION, &GENERATION_OLD)
+        .unwrap()
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
 }

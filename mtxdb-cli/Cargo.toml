@@ -34,6 +34,7 @@ default = ["completions"]
 # Shell-completion script generation. On by default; disable with
 # `default-features = false` to drop `clap_complete` from a lean CLI build.
 completions = ["dep:clap_complete"]
+logging = ["mtxdb/logging"]
 
 [dependencies]
 anyhow = "1.0"
@@ -43,8 +44,9 @@ clap = { version = "=4.6.7", default-features = false, features = ["std", "env",
 clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
 mimalloc = { version = "0.1.52", default-features = false }
-mtxdb = { path = "..", version = "0.1.0-beta.2" }
+mtxdb = { path = "..", version = "0.1.0-beta.2", features = ["multi-reader"] }
 rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", features = ["signing-consensus"] }
+sha2 = "0.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }

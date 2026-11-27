@@ -12,13 +12,15 @@ use anyhow::{anyhow, bail, Context};
 use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::csr_adjacency::{CsrAdjacency, EventRecord, AUTH, PREV};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
-use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
+use mtxdb::packfile::layout::{
+    avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout, PhysicalLayout,
+};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::room_flag::{Flag, FlagChange, FlagQuery, RoomFlagIndex};
 use mtxdb::server_keys::KeyTier;
-use mtxdb::shard::ShardPool;
+use mtxdb::shard::{ShardPool, MAX_SHARD_BYTES};
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
@@ -431,56 +433,13 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
-fn command_name(cmd: &Commands) -> &'static str {
-    match cmd {
-        Commands::Init => "init",
-        Commands::Put { .. } => "put",
-        Commands::Get { .. } => "get",
-        Commands::Scan { .. } => "scan",
-        Commands::Search { .. } => "search",
-        Commands::Delete { .. } => "delete",
-        Commands::Tombstones { .. } => "tombstones",
-        Commands::Remove { .. } => "remove",
-        Commands::Shards { .. } => "shards",
-        Commands::Collections { .. } => "collections",
-        Commands::Info { .. } => "info",
-        Commands::Sync { .. } => "sync",
-        Commands::ReclaimWal => "reclaim-wal",
-        Commands::Stats { .. } => "stats",
-        Commands::Memory { .. } => "memory",
-        Commands::Timeline { .. } => "timeline",
-        Commands::Flags { .. } => "flags",
-        Commands::Meta { .. } => "meta",
-        Commands::Import { .. } => "import",
-        Commands::Gaps { .. } => "gaps",
-        Commands::Export { .. } => "export",
-        Commands::Packs { .. } => "packs",
-        Commands::Repack { .. } => "repack",
-        Commands::Completions { .. } => "completions",
-        _ => "internal",
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     if cli.coalesce {
-        match &cli.command {
-            Commands::Shards { .. }
-            | Commands::Collections { .. }
-            | Commands::Stats { .. }
-            | Commands::Get { .. }
-            | Commands::Sync { .. }
-            | Commands::Scan { .. }
-            | Commands::Info { .. }
-            | Commands::Packs { .. }
-            | Commands::Repack { out: Some(_), .. } => {}
-            Commands::Repack { out: None, .. } => {
-                bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
-            }
-            _ => {
-                let name = command_name(&cli.command);
-                bail!("--coalesce is not supported by `mtxdb {name}`");
-            }
+        // clap only accepts `--coalesce` on commands that aggregate; in-place
+        // repack is the one that still needs `--out`.
+        if matches!(&cli.command, Commands::Repack { out: None, .. }) {
+            bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
         }
         if cli.dirs_or_default().len() == 1
             && !matches!(&cli.command, Commands::Repack { out: Some(_), .. })
@@ -529,9 +488,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 limit: *limit,
             },
         ),
-        Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Memory { evict, evict_pages } => cmd_memory(cli, *evict, *evict_pages),
+        Commands::Memory { evict_pages } => cmd_memory(cli, *evict_pages),
         Commands::Timeline {
             room,
             limit,
@@ -554,19 +512,35 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
         Commands::Info {
             selector,
-            pack,
-            collection,
             stats,
+            tombstones,
+            keys,
+            detail,
+            json,
         } => {
-            if let Some(pack) = pack {
-                cmd_info(cli, pack, Some(InfoTarget::Pack), *stats)
-            } else if let Some(collection) = collection {
-                cmd_info(cli, collection, Some(InfoTarget::Collection), *stats)
+            if *tombstones {
+                cli.require_single_dir("info --tombstones")?;
+            }
+            let result = if *json && *tombstones {
+                Ok(())
             } else if let Some(selector) = selector {
-                cmd_info(cli, selector, None, *stats)
+                cmd_info(
+                    cli,
+                    selector,
+                    (*tombstones).then_some(InfoTarget::Collection),
+                    *stats,
+                )
             } else {
                 cmd_info_default(cli, *stats)
+            };
+            result?;
+            if *tombstones {
+                let selector = selector
+                    .as_deref()
+                    .expect("clap requires a selector with --tombstones");
+                cmd_tombstones(cli, selector, *keys, *detail, *json)?;
             }
+            Ok(())
         }
         Commands::Scan {
             selector,
@@ -582,7 +556,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             live,
         } => cmd_scan(
             cli,
-            selector,
+            {
+                parse_collection_selector(selector)?;
+                selector
+            },
             *verbose,
             *header,
             decode.as_deref(),
@@ -593,6 +570,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             sort.as_deref(),
             *reverse,
             *live,
+            Some(InfoTarget::Collection),
         ),
         Commands::Search {
             collection,
@@ -626,14 +604,6 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             GapAction::Ingest { room, run, report } => {
                 cli.require_single_dir("gaps ingest")?;
                 cmd_gap_ingest(cli, room, run, report)
-            }
-            GapAction::List {
-                room,
-                status,
-                history,
-            } => {
-                cli.require_single_dir("gaps list")?;
-                cmd_gap_list(cli, room, status.as_deref(), *history)
             }
             GapAction::Waive {
                 room,
@@ -688,17 +658,39 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 cmd_repack(cli, collection.as_deref(), packs, *all, topo, *yes)
             }
         }
-        Commands::Delete { collections, yes } => {
-            cli.require_single_dir("delete")?;
-            cmd_delete(cli, collections, *yes)
+        Commands::Drop { collections, yes } => {
+            cli.require_single_dir("drop")?;
+            cmd_drop(cli, collections, *yes)
         }
-        Commands::Tombstones {
-            collection,
-            keys,
-            detail,
+        Commands::RoomCheck {
+            room,
+            auth,
+            prevs,
+            state_members,
+            status,
+            history,
+            limit,
         } => {
-            cli.require_single_dir("tombstones")?;
-            cmd_tombstones(cli, collection, *keys, *detail)
+            cli.require_single_dir("room check")?;
+            cmd_room_check(
+                cli,
+                room,
+                &RoomCheckOptions {
+                    sections: match (*auth, *prevs) {
+                        (false, false) | (true, true) => CheckSections::Both,
+                        (true, false) => CheckSections::Auth,
+                        (false, true) => CheckSections::Prevs,
+                    },
+                    state_members: *state_members,
+                    status: status.as_deref(),
+                    history: *history,
+                    limit: *limit,
+                },
+            )
+        }
+        Commands::Members { room, json } => {
+            cli.require_single_dir("members")?;
+            cmd_members(cli, room, *json)
         }
         Commands::Remove {
             collection,
@@ -719,52 +711,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("init")?;
             cmd_init(cli)
         }
-        Commands::SubprocessWriter { path } | Commands::SubprocessWriterAppend { path } => {
-            cmd_subprocess_writer(path, true, false)
-        }
-        Commands::SubprocessWriterUnsynced { path } => cmd_subprocess_writer(path, false, false),
-        Commands::SubprocessWriterSeed { path } => cmd_subprocess_writer(path, true, true),
-        Commands::SubprocessReader { path } => cmd_subprocess_reader(path),
     }
-}
-
-const SUBPROCESS_COLLECTION: [u8; 16] = [0x01; 16];
-const SUBPROCESS_RECORD: [u8; 16] = [0xD0; 16];
-const SUBPROCESS_SEED: [u8; 16] = [0xC0; 16];
-
-fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<()> {
-    let store = open_pool(PathBuf::from(path)).context("failed to open test store")?;
-    let id = if seed {
-        SUBPROCESS_SEED
-    } else {
-        SUBPROCESS_RECORD
-    };
-    let payload: &[u8] = if seed { b"seed" } else { b"synced" };
-    let data = NodeData::new(bytes::Bytes::from_static(payload));
-    store
-        .put(&SUBPROCESS_COLLECTION, &id, &data)
-        .context("failed to write test record")?;
-    if sync {
-        store.sync().context("failed to sync test record")?;
-    }
-    Ok(())
-}
-
-fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
-    let store =
-        open_pool_read_only(PathBuf::from(path)).context("failed to open test store read-only")?;
-    store.reset_stats();
-    let result = store
-        .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
-        .context("failed to read test record")?;
-    let stats = store.stats();
-    if result.first().and_then(Option::as_ref).is_some() {
-        println!("RECOVERED");
-    } else {
-        println!("NOT_FOUND");
-    }
-    println!("miss_refreshes={}", stats.miss_refreshes);
-    Ok(())
 }
 
 /// Create a new mtxdb database root: `db.meta` plus an empty directory for
@@ -879,6 +826,42 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
+/// Resolve a Matrix room selector in the namespace used by the selected pool.
+/// Event collections use EVNT, while the room's materialized state HAMT lives
+/// in STAT. Explicit `0x` collection IDs remain pool-independent.
+fn parse_scan_collection_selector(cli: &Cli, selector: &str) -> anyhow::Result<[u8; 16]> {
+    if selector.starts_with('!') && cli.shard_type == Some(ShardType::State) {
+        return crate::state_hamt::state_hamt_collection_id(selector)
+            .context("invalid Matrix room ID for state collection");
+    }
+    parse_collection_selector(selector)
+}
+
+/// Resolve a collection selector to the collection IDs it names *in one pool*.
+///
+/// A `0x` logical ID names exactly itself. A canonical room ID (`!room:server`)
+/// is a *group* ID whose member collections live in different pools: the event
+/// bodies (`EVNT`) in the event pool, the HAMT nodes (`STAT`), the room and
+/// event root handles (`STGP`) and the auth closures (`AUTH`) in the state pool. The same canonical ID
+/// therefore expands per pool, so `-t state '!room'` shows that room's state.
+fn parse_collection_selectors_for_pool(
+    selector: &str,
+    shard_type: ShardType,
+) -> anyhow::Result<Vec<[u8; 16]>> {
+    if !selector.starts_with('!') {
+        return Ok(vec![parse_collection_id(selector)?]);
+    }
+    let room = selector.as_bytes();
+    Ok(match shard_type {
+        ShardType::State => vec![
+            mtxdb::room_state_collection_id(room),
+            mtxdb::room_roots_collection_id(room),
+            derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room),
+        ],
+        ShardType::EventDag | ShardType::ServerInfo => vec![matrix_room_collection_id(selector)],
+    })
+}
+
 /// Parse the `MTXDB_COMPRESS` override for writable opens.
 ///
 /// `Ok(None)` means the variable is unset and the pool policies decide.
@@ -901,12 +884,15 @@ fn open_pool(dir: PathBuf) -> io::Result<PackfileStorage> {
     if let Some(compress) = compression_override()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
     {
-        PackfileStorage::open_with_cache_and_policies(
+        let store = PackfileStorage::open_with_cache_and_policies(
             dir,
             crate::runtime_config().cache_capacity,
             compress,
             mtxdb::packfile::ChecksumPolicy::Full,
-        )
+        )?;
+        store.set_point_random_mmap(crate::runtime_config().point_random_mmap);
+        store.set_point_random_mmap_index(crate::runtime_config().ordered_index_point_random_mmap);
+        Ok(store)
     } else {
         PackfileStorage::open_with_config(dir, crate::runtime_config())
     }
@@ -1036,7 +1022,7 @@ fn database_labels(paths: &[PathBuf]) -> HashMap<PathBuf, String> {
 /// Run a command over all targeted database roots.
 ///
 /// When a single directory (or default `.`) is targeted, runs `f` directly.
-/// When multiple directories are targeted (e.g. `mtxdb shards -d *`), iterates over each,
+/// When multiple directories are targeted (e.g. `mtxdb packs list -d *`), iterates over each,
 /// printing a section header for each database root and skipping non-databases with a note.
 fn run_multi_dir<F>(cli: &Cli, mut f: F) -> anyhow::Result<()>
 where
@@ -3058,7 +3044,7 @@ fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
     excess_runs >= collections.max(1)
 }
 
-/// Physical-layout block of `mtxdb shards --layout`: per-pack contiguous
+/// Physical-layout block of `mtxdb packs list --layout`: per-pack contiguous
 /// runs, interleaving excess, and — when fragmentation is worth acting on —
 /// the note that repack is never automatic.
 fn print_pack_physical_layout(
@@ -3066,7 +3052,7 @@ fn print_pack_physical_layout(
     physical: &mtxdb::packfile::layout::PhysicalLayout,
 ) {
     // Aggregate only over the packs listed in `shard_entries`: the caller
-    // passes every pack for `mtxdb shards --layout` (pool-wide totals) but a
+    // passes every pack for `mtxdb packs list --layout` (pool-wide totals) but a
     // single pack for `mtxdb info 0x…`, where reporting pool-wide runs while
     // displaying only the selected pack would mislead.
     let listed_packs = shard_entries
@@ -3420,13 +3406,11 @@ fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
 }
 
-fn cmd_memory(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
-    run_multi_dir(cli, |sub_cli| {
-        cmd_memory_single(sub_cli, evict, evict_pages)
-    })
+fn cmd_memory(cli: &Cli, evict_pages: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_memory_single(sub_cli, evict_pages))
 }
 
-fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
+fn cmd_memory_single(cli: &Cli, evict_pages: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     if evict_pages {
         let (files, bytes) = evict_database_pages(layout.root())?;
@@ -3452,35 +3436,16 @@ fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Resul
             continue;
         };
         let store = open_pool_read_only(pool.clone()).context("failed to open store")?;
-        let before = store.resident_cache_stats();
-        let evicted = if evict {
-            store.evict_resident_caches()
-        } else {
-            0
-        };
-        let after = store.resident_cache_stats();
-        if evict {
-            println!(
-                "{} ({}) — evicted {} decoded nodes; {} remain across {} collection caches (hits={}, misses={})",
-                pool.display(),
-                shard_type.as_str(),
-                evicted,
-                after.entries,
-                after.collections,
-                after.hits,
-                after.misses,
-            );
-        } else {
-            println!(
-                "{} ({}) — {} decoded nodes resident across {} collection caches (hits={}, misses={})",
-                pool.display(),
-                shard_type.as_str(),
-                before.entries,
-                before.collections,
-                before.hits,
-                before.misses,
-            );
-        }
+        let stats = store.resident_cache_stats();
+        println!(
+            "{} ({}) — {} decoded nodes resident across {} collection caches (hits={}, misses={})",
+            pool.display(),
+            shard_type.as_str(),
+            stats.entries,
+            stats.collections,
+            stats.hits,
+            stats.misses,
+        );
         reported = true;
     }
 
@@ -3547,8 +3512,11 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     let layout = open_layout(cli)?;
     let pool = pool_dir(&layout, ShardType::EventDag)?;
     let store = open_pool_read_only(pool).context("failed to open EventDag store")?;
-    let timeline_index = mtxdb::timeline::TimelineIndex::open(&store, room);
-    let room_scope = mtxdb::timeline::room_scope_id(room.as_bytes());
+    let timeline_index = mtxdb::ordered_timeline::EventTopoIndex::open(
+        &store,
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
+    let room_scope = mtxdb::room_scope_id(room.as_bytes());
     let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
     let page = timeline_index.page(&room_scope, None, !reverse, limit_usize)?;
     if page.entries.is_empty() {
@@ -3561,10 +3529,10 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     );
     println!("{}", "-".repeat(90));
     for (idx, entry) in page.entries.iter().enumerate() {
-        let node_hex = hex::encode(entry.node_id);
-        let locator_col = mtxdb::interop::event_locator_collection_id(&entry.node_id);
+        let node_hex = hex::encode(entry.event_node_id);
+        let locator_col = mtxdb::interop::event_locator_collection_id(&entry.event_node_id);
         let event_id_str = store
-            .get(&locator_col, &entry.node_id)?
+            .get(&locator_col, &entry.event_node_id)?
             .and_then(|data| {
                 let (eid, _) = mtxdb::interop::decode_event_locator(&data.bytes).ok()?;
                 std::str::from_utf8(eid).ok().map(ToOwned::to_owned)
@@ -4752,7 +4720,7 @@ fn fmt_duration(secs: u64) -> String {
 
 /// `info` accepts a collection selector (a canonical sigil, a bare `0x`-less
 /// sigil, or a `0x`-prefixed 32-hex logical ID) or a pack selector
-/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb shards`).
+/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb packs list`).
 ///
 /// A `0x`-prefixed 32-hex selector is genuinely ambiguous now that a pack's
 /// full address is 32 hex digits: it can name either a collection or a pack,
@@ -4839,6 +4807,26 @@ fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
     locations
 }
 
+/// Whether the live index in `dir` contains `collection_id`.
+///
+/// `collection_summaries_from_disk` is only a fast snapshot of the last
+/// persisted collection directory: a collection created or written since the
+/// last index checkpoint does not appear there until the writer republishes
+/// the sidecar. A miss is therefore a hint, not proof. Fall back to opening the
+/// pool, which gates the sidecar on the current pack fingerprint and rebuilds
+/// from a scan when it is stale.
+fn collection_exists_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
+    if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(dir) {
+        if summaries.iter().any(|(id, _, _, _)| id == collection_id) {
+            return true;
+        }
+    }
+    open_pool_read_only(dir.to_path_buf())
+        .ok()
+        .and_then(|store| store.collection_index_info(collection_id))
+        .is_some()
+}
+
 /// Whether a live collection with this id exists in any selected pool.
 ///
 /// Same cost caveat as [`pack_locations_in_selected_pools`]: a single `info`
@@ -4862,15 +4850,7 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 continue;
             };
-            let has = if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir)
-            {
-                summaries.iter().any(|(id, _, _, _)| id == target_id)
-            } else if let Ok(store) = open_pool_read_only(dir) {
-                store.collection_index_info(target_id).is_some()
-            } else {
-                false
-            };
-            if has {
+            if collection_exists_in_dir(&dir, target_id) {
                 return true;
             }
         }
@@ -4878,10 +4858,33 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     false
 }
 
-/// Classify an `info`/`scan` selector by inference. See
-/// [`classify_info_selector_explicit`]; this is the no-override form.
-fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
-    classify_info_selector_explicit(cli, selector, None)
+/// Whether a selector names a live collection in any selected pool.
+///
+/// A room selector expands to a different collection in each pool, so a
+/// state-only room still matches under `-t state` even though its event
+/// collection lives in another pool.
+fn collection_selector_exists(cli: &Cli, selector: &str) -> anyhow::Result<bool> {
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    for db_dir in valid_database_dirs(cli)? {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            for collection_id in parse_collection_selectors_for_pool(selector, shard_type)? {
+                if collection_exists_in_dir(&dir, &collection_id) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Classify a selector, optionally under an explicit namespace.
@@ -4965,8 +4968,7 @@ fn classify_info_selector_with_inventory(
             }
         }
         Some(InfoTarget::Collection) => {
-            let id = parse_collection_selector(selector)?;
-            if !collection_id_exists(cli, &id) {
+            if !collection_selector_exists(cli, selector)? {
                 bail!("collection {selector}: not found");
             }
             return Ok((InfoTarget::Collection, None));
@@ -5035,6 +5037,11 @@ fn classify_info_selector_explicit(
     Ok(classify_info_selector_with_inventory(cli, selector, explicit)?.0)
 }
 
+#[cfg(test)]
+fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
+    classify_info_selector_explicit(cli, selector, None)
+}
+
 #[allow(clippy::too_many_lines)]
 fn cmd_info_coalesced(
     cli: &Cli,
@@ -5052,7 +5059,6 @@ fn cmd_info_coalesced(
 
     match target {
         InfoTarget::Collection => {
-            let collection_id = parse_collection_selector(selector)?;
             let mut matches = Vec::new();
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -5062,17 +5068,14 @@ fn cmd_info_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let has_collection = if let Some(summaries) =
-                        PackfileStorage::collection_summaries_from_disk(&dir)
+                    // A room selector names a different set of collections in
+                    // each pool (event bodies vs state, roots and auth), so
+                    // expand it per pool before probing.
+                    for collection_id in parse_collection_selectors_for_pool(selector, shard_type)?
                     {
-                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = open_pool_read_only(dir.clone()) {
-                        store.collection_index_info(&collection_id).is_some()
-                    } else {
-                        false
-                    };
-                    if has_collection {
-                        matches.push((db_dir.clone(), shard_type, dir));
+                        if collection_exists_in_dir(&dir, &collection_id) {
+                            matches.push((db_dir.clone(), shard_type, dir.clone(), collection_id));
+                        }
                     }
                 }
             }
@@ -5080,19 +5083,19 @@ fn cmd_info_coalesced(
             if matches.is_empty() {
                 eprintln!(
                     "collection {}: not found across {} database(s)",
-                    format_id(&collection_id),
+                    format_id(&parse_collection_selector(selector)?),
                     valid_dirs.len()
                 );
                 return Ok(());
             }
 
             if matches.len() == 1 {
-                let (db_dir, shard_type, dir) = &matches[0];
+                let (db_dir, shard_type, dir, collection_id) = &matches[0];
                 println!("database: {}", db_dir.display());
                 println!("pool:     {}", shard_type.as_str());
-                inspect_collection_in_dir(dir, &collection_id, deep);
+                inspect_collection_in_dir(dir, collection_id, deep, None);
             } else {
-                for (i, (db_dir, shard_type, dir)) in matches.iter().enumerate() {
+                for (i, (db_dir, shard_type, dir, collection_id)) in matches.iter().enumerate() {
                     if i > 0 {
                         println!();
                     }
@@ -5101,11 +5104,11 @@ fn cmd_info_coalesced(
                         db_dir.display(),
                         shard_type.as_str()
                     );
-                    inspect_collection_in_dir(dir, &collection_id, deep);
+                    inspect_collection_in_dir(dir, collection_id, deep, None);
                 }
                 println!();
                 println!(
-                    "note: collection found in {} of {} database(s)",
+                    "note: collection found in {} location(s) across {} database(s)",
                     matches.len(),
                     valid_dirs.len()
                 );
@@ -6146,7 +6149,7 @@ fn cmd_info_single(
 
 /// Print a pack's age (header `created_at`) and how long it stayed the
 /// active append target (span to its file's last-modified time), from the
-/// same header `mtxdb shards` already validates when discovering packs.
+/// same header `mtxdb packs list` already validates when discovering packs.
 fn print_pack_lifetime(path: &Path) {
     let created_at = fs::File::open(path).ok().and_then(|file| {
         mtxdb::packfile::read_header(&mut BufReader::new(file))
@@ -6184,7 +6187,7 @@ fn print_pack_lifetime(path: &Path) {
     }
 }
 
-/// Print the same per-pack summary row `mtxdb shards` would, for one pack ID.
+/// Print the same per-pack summary row `mtxdb packs list` would, for one pack ID.
 #[allow(
     clippy::too_many_lines,
     reason = "prints one pack's stats, physical layout, and per-collection breakdown in sequence"
@@ -6436,7 +6439,26 @@ fn print_collection_info(
     print_collection_details(dir, collection_id, deep);
 }
 
-fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -> bool {
+/// Print one collection's details if `dir`'s live index contains it.
+///
+/// `section` optionally names the pool to announce first, and whether the
+/// caller already emitted a section (so this match needs the blank separator).
+fn inspect_collection_in_dir(
+    dir: &Path,
+    collection_id: &[u8; 16],
+    deep: bool,
+    section: Option<(ShardType, bool)>,
+) -> bool {
+    let print_section = || {
+        if let Some((shard_type, needs_spacing)) = section {
+            if needs_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(shard_type);
+        }
+    };
+
     if let (Some(summaries), Some(collection_shards)) = (
         PackfileStorage::collection_summaries_from_disk(dir),
         PackfileStorage::collection_shards_from_disk(dir),
@@ -6449,16 +6471,20 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -
                 .get(collection_id)
                 .cloned()
                 .unwrap_or_default();
+            print_section();
             print_collection_info(dir, collection_id, len, mem, capacity, &shards, deep);
             return true;
         }
-        return false;
+        // A missing entry is not authoritative: the sidecar can predate the
+        // collection (see `collection_exists_in_dir`). Fall through to the
+        // pooled index instead of reporting a stale snapshot's miss.
     }
 
     let Ok(store) = open_pool_read_only(dir.to_path_buf()) else {
         return false;
     };
     if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
+        print_section();
         let hex = format_id(collection_id);
         println!(
             "collection {hex}: {len} nodes, {} index ({})",
@@ -6483,23 +6509,15 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let collection_id = parse_collection_selector(collection)?;
-            let has_collection =
-                if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
-                    summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                } else if let Ok(store) = open_pool_read_only(dir.clone()) {
-                    store.collection_index_info(&collection_id).is_some()
-                } else {
-                    false
-                };
-            if has_collection {
-                if matched_any {
-                    println!();
-                    println!();
+            for collection_id in parse_collection_selectors_for_pool(collection, shard_type)? {
+                if inspect_collection_in_dir(
+                    &dir,
+                    &collection_id,
+                    deep,
+                    Some((shard_type, matched_any)),
+                ) {
+                    matched_any = true;
                 }
-                print_section_header(shard_type);
-                inspect_collection_in_dir(&dir, &collection_id, deep);
-                matched_any = true;
             }
         }
         if !matched_any {
@@ -6511,18 +6529,20 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
         return Ok(());
     }
 
-    let collection_id = parse_collection_selector(collection)?;
-    let hex = format_id(&collection_id);
+    let shard_type = cli.require_shard_type()?;
     let dir = selected_pool_dir(cli)?;
-
-    if inspect_collection_in_dir(&dir, &collection_id, deep) {
-        return Ok(());
+    let mut found = false;
+    for collection_id in parse_collection_selectors_for_pool(collection, shard_type)? {
+        found |= inspect_collection_in_dir(&dir, &collection_id, deep, None);
     }
-
-    eprintln!(
-        "collection {hex}: not found{}",
-        other_shard_type_hint(cli, &collection_id)
-    );
+    if !found {
+        let collection_id = parse_collection_selector(collection)?;
+        eprintln!(
+            "collection {}: not found{}",
+            format_id(&collection_id),
+            other_shard_type_hint(cli, &collection_id)
+        );
+    }
     Ok(())
 }
 
@@ -6998,19 +7018,11 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         ShardPool::open_read_only(dir.to_path_buf()).context("failed to open shard store")?;
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-    let collection_packs = PackfileStorage::collection_shards_from_disk(dir)
-        .and_then(|mut collections| collections.remove(collection_id))
-        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
 
     let mut stats = RoomEventStats::default();
     // Later frames supersede earlier ones for the same record id.
     let mut latest: HashMap<[u8; 16], (Arc<mtxdb::shard::Shard>, u64)> = HashMap::new();
     for (_, shard) in shards {
-        if let Some(packs) = &collection_packs {
-            if !packs.contains(&shard.pack_id) {
-                continue;
-            }
-        }
         for record in mtxdb::packfile::scan_packfile_iter(&shard.path, false)? {
             let (record_collection, record_id, offset) = record?;
             if &record_collection != collection_id {
@@ -7020,101 +7032,134 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
             latest.insert(record_id, (Arc::clone(&shard), offset));
         }
     }
+    // The physical pass above supplies frame statistics and a fallback for
+    // membership records absent from the live index. For indexed records,
+    // use the generation's winning payload: physical pack ordering is not a
+    // record-version ordering after imports, repacks, or slot reuse. The index
+    // is consumed one record at a time so its payloads are never retained as a
+    // second full copy of the collection.
+    let store = open_pool_read_only(dir.to_path_buf()).context("opening event pool index")?;
+    for item in store.scan_collection(collection_id)? {
+        let (record_id, data) = item?;
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID || latest.remove(&record_id).is_none()
+        {
+            continue;
+        }
+        accumulate_room_event(&mut stats, &data.bytes);
+    }
+    // A key whose newest version is a removal is not live, even though an
+    // older body frame is still in the pack; do not count it as a member.
+    let removed: std::collections::HashSet<[u8; 16]> =
+        store.removed_keys(collection_id)?.into_iter().collect();
     for (record_id, (shard, offset)) in latest {
-        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID || removed.contains(&record_id) {
             continue;
         }
         let record = ShardPool::read_at_committed(&shard, offset, false)?;
-        stats.records = stats.records.saturating_add(1);
-        if record.data.is_empty() {
-            stats.tombstones = stats.tombstones.saturating_add(1);
-            continue;
-        }
-        let size = record.data.len();
-        stats.payload_bytes = stats
-            .payload_bytes
-            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
-        stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
-        stats.max_size = stats.max_size.max(size);
-        let bytes = record.data.to_vec();
-        let parsed = OwnedValue::parse_bytes(&bytes).ok();
-        let Some(event @ OwnedValue::Object(_)) = parsed else {
-            let kind = classify_record_payload(&record.data);
-            let count = stats.kinds.entry(kind.to_owned()).or_default();
-            *count = count.saturating_add(1);
-            continue;
-        };
-        let OwnedValue::Object(fields) = &event else {
-            continue;
-        };
-        stats.json_events = stats.json_events.saturating_add(1);
-        let count = stats.kinds.entry("JSON event".to_owned()).or_default();
-        *count = count.saturating_add(1);
-        let kind = event_string_field(&event, "type").unwrap_or("");
-        let ts = fields.get("origin_server_ts").and_then(OwnedValue::as_i64);
-        let event_id = event_id(&event).unwrap_or("").to_owned();
-        if is_state_event(&event) {
-            stats.state_events = stats.state_events.saturating_add(1);
-            let state_key = event_string_field(&event, "state_key").unwrap_or("");
-            let when = ts.unwrap_or(0);
-            if kind == "m.room.member" {
-                let membership =
-                    nested_event_string_field(&event, "content", "membership").unwrap_or("?");
-                let newer = stats
-                    .members
-                    .get(state_key)
-                    .is_none_or(|(seen, _)| when >= *seen);
-                if newer {
-                    stats
-                        .members
-                        .insert(state_key.to_owned(), (when, membership.to_owned()));
-                }
-            } else if state_key.is_empty() && ROOM_CONFIG_TYPES.contains(&kind) {
-                let newer = stats
-                    .room_state
-                    .get(kind)
-                    .is_none_or(|(seen, _)| when >= *seen);
-                if newer {
-                    if let Some(content) = fields.get("content") {
-                        stats
-                            .room_state
-                            .insert(kind.to_owned(), (when, content.clone()));
-                    }
-                }
-            }
-        }
-        let bump = |map: &mut HashMap<String, usize>, key: &str| {
-            let count = map.entry(key.to_owned()).or_default();
-            *count = count.saturating_add(1);
-        };
-        bump(&mut stats.types, kind);
-        if let Some(sender) = event_string_field(&event, "sender") {
-            bump(&mut stats.senders, sender);
-            if let Some((_, server)) = sender.split_once(':') {
-                bump(&mut stats.servers, server);
-            }
-        }
-        if let Some(ts) = ts {
-            stats.min_ts = Some(stats.min_ts.map_or(ts, |m| m.min(ts)));
-            stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
-            bump(&mut stats.months, &format_utc_ms(ts)[..7]);
-        }
-        if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
-            stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
-            stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
-        }
-        stats.prev_refs.extend(string_array(fields, "prev_events"));
-        stats.auth_refs.extend(string_array(fields, "auth_events"));
-        stats
-            .largest
-            .push((size, event_id.clone(), kind.to_owned()));
-        stats
-            .largest
-            .sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        stats.largest.truncate(3);
-        stats.event_ids.insert(event_id);
+        accumulate_room_event(&mut stats, &record.data);
     }
     Ok(stats)
+}
+
+/// Fold one winning event payload into the room statistics.
+fn accumulate_room_event(stats: &mut RoomEventStats, bytes: &[u8]) {
+    stats.records = stats.records.saturating_add(1);
+    if bytes.is_empty() {
+        stats.tombstones = stats.tombstones.saturating_add(1);
+        return;
+    }
+    let size = bytes.len();
+    stats.payload_bytes = stats
+        .payload_bytes
+        .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+    stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
+    stats.max_size = stats.max_size.max(size);
+    // The homeserver stores `[format_version][metadata_len][metadata][json]`;
+    // an imported collection stores the event JSON directly. Try the header
+    // first, but only accept a decoded payload that parses as an object, and
+    // fall back to the raw payload otherwise.
+    let decoded = crate::auth_check::event_record_json(bytes)
+        .ok()
+        .and_then(|json| match OwnedValue::parse_bytes(json) {
+            Ok(object @ OwnedValue::Object(_)) => Some(object),
+            _ => None,
+        });
+    let parsed = decoded.or_else(|| OwnedValue::parse_bytes(bytes).ok());
+    let Some(event @ OwnedValue::Object(_)) = parsed else {
+        let kind = classify_record_payload(bytes);
+        let count = stats.kinds.entry(kind.to_owned()).or_default();
+        *count = count.saturating_add(1);
+        return;
+    };
+    let OwnedValue::Object(fields) = &event else {
+        return;
+    };
+    stats.json_events = stats.json_events.saturating_add(1);
+    let count = stats.kinds.entry("JSON event".to_owned()).or_default();
+    *count = count.saturating_add(1);
+    let kind = event_string_field(&event, "type").unwrap_or("");
+    let ts = fields.get("origin_server_ts").and_then(OwnedValue::as_i64);
+    let event_id = event_id(&event).unwrap_or("").to_owned();
+    if is_state_event(&event) {
+        stats.state_events = stats.state_events.saturating_add(1);
+        let state_key = event_string_field(&event, "state_key").unwrap_or("");
+        let when = ts.unwrap_or(0);
+        if kind == "m.room.member" {
+            let membership =
+                nested_event_string_field(&event, "content", "membership").unwrap_or("?");
+            let newer = stats
+                .members
+                .get(state_key)
+                .is_none_or(|(seen, _)| when >= *seen);
+            if newer {
+                stats
+                    .members
+                    .insert(state_key.to_owned(), (when, membership.to_owned()));
+            }
+        } else if state_key.is_empty() && ROOM_CONFIG_TYPES.contains(&kind) {
+            let newer = stats
+                .room_state
+                .get(kind)
+                .is_none_or(|(seen, _)| when >= *seen);
+            if newer {
+                if let Some(content) = fields.get("content") {
+                    stats
+                        .room_state
+                        .insert(kind.to_owned(), (when, content.clone()));
+                }
+            }
+        }
+    }
+    let bump = |map: &mut HashMap<String, usize>, key: &str| {
+        let count = map.entry(key.to_owned()).or_default();
+        *count = count.saturating_add(1);
+    };
+    bump(&mut stats.types, kind);
+    if let Some(sender) = event_string_field(&event, "sender") {
+        bump(&mut stats.senders, sender);
+        if let Some((_, server)) = sender.split_once(':') {
+            bump(&mut stats.servers, server);
+        }
+    }
+    if let Some(ts) = ts {
+        stats.min_ts = Some(stats.min_ts.map_or(ts, |m| m.min(ts)));
+        stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
+        bump(&mut stats.months, &format_utc_ms(ts)[..7]);
+    }
+    if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
+        stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
+        stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
+    }
+    stats.prev_refs.extend(string_array(fields, "prev_events"));
+    stats.auth_refs.extend(string_array(fields, "auth_events"));
+    stats
+        .largest
+        .push((size, event_id.clone(), kind.to_owned()));
+    stats
+        .largest
+        .sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    stats.largest.truncate(3);
+    stats.event_ids.insert(event_id);
 }
 
 /// Format a millisecond Unix timestamp as `YYYY-MM-DD HH:MM` UTC.
@@ -7454,7 +7499,7 @@ fn print_collection_shards(shards: &[PackId]) {
 
 /// An operator-facing pack identifier. Slots are deliberately not accepted
 /// here: they are recycled implementation details, while a pack address is the
-/// permanent identity printed by `mtxdb shards`. A selector is either the full
+/// permanent identity printed by `mtxdb packs list`. A selector is either the full
 /// 32-hex address or a 1–16 hex filename prefix; the prefix is resolved against
 /// a pool's discovered packs, where it must be unique.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7474,7 +7519,7 @@ impl PackSelector {
         let Some(hex) = selector.strip_prefix("0x") else {
             bail!(
                 "invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by \
-                 `mtxdb shards`"
+                 `mtxdb packs list`"
             );
         };
         if hex.is_empty()
@@ -7605,11 +7650,12 @@ fn cmd_scan_coalesced(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     if live {
         bail!("--live is not supported with --coalesce");
     }
-    let target = classify_info_selector(cli, selector)?;
+    let target = classify_info_selector_explicit(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -7620,7 +7666,6 @@ fn cmd_scan_coalesced(
     let mut matching_dirs = Vec::new();
     match target {
         InfoTarget::Collection => {
-            let collection_id = parse_collection_selector(selector)?;
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                     continue;
@@ -7630,17 +7675,16 @@ fn cmd_scan_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let has = if let Some(summaries) =
-                        PackfileStorage::collection_summaries_from_disk(&dir)
+                    // Expand a room selector in each pool: the room's event
+                    // bodies live in one collection, its state in others.
+                    for collection_id in parse_collection_selectors_for_pool(selector, shard_type)?
                     {
-                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = open_pool_read_only(dir) {
-                        store.collection_index_info(&collection_id).is_some()
-                    } else {
-                        false
-                    };
-                    if has {
-                        found_in_db = true;
+                        if collection_exists_in_dir(&dir, &collection_id) {
+                            found_in_db = true;
+                            break;
+                        }
+                    }
+                    if found_in_db {
                         break;
                     }
                 }
@@ -7690,7 +7734,7 @@ fn cmd_scan_coalesced(
         println!("database: {}", matching_dirs[0].display());
         cmd_scan_single(
             &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
-            live,
+            live, explicit,
         )?;
     } else {
         for (i, db_dir) in matching_dirs.iter().enumerate() {
@@ -7701,7 +7745,7 @@ fn cmd_scan_coalesced(
             let sub_cli = cli.with_dir(db_dir.clone());
             if let Err(e) = cmd_scan_single(
                 &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort,
-                reverse, live,
+                reverse, live, explicit,
             ) {
                 eprintln!("error in `{}`: {e:#}", db_dir.display());
             }
@@ -7902,16 +7946,18 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_scan_coalesced(
-            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse, live,
+            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
+            live, explicit,
         );
     }
     run_multi_dir(cli, |sub_cli| {
         cmd_scan_single(
             sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
-            live,
+            live, explicit,
         )
     })
 }
@@ -7934,6 +7980,7 @@ fn cmd_scan_single(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
     if sort_column == Some(SortColumn::Payload) && (!verbose && decode.is_none() || raw) {
@@ -7953,7 +8000,8 @@ fn cmd_scan_single(
     };
     // `info` and `scan` share `classify_info_selector`, so the same selector
     // works for both and a malformed one gets the same explanation.
-    let looks_like_pack_id = classify_info_selector(cli, selector)? == InfoTarget::Pack;
+    let looks_like_pack_id =
+        classify_info_selector_explicit(cli, selector, explicit)? == InfoTarget::Pack;
     if !looks_like_pack_id {
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
@@ -7987,11 +8035,13 @@ fn cmd_scan_single(
                 .into_iter()
                 .find(|(_, shard)| shard.pack_id == pack_id)
             {
-                if matched_any {
+                if matched_any && !opts.raw {
                     println!();
                     println!();
                 }
-                print_section_header(shard_type);
+                if !opts.raw {
+                    print_section_header(shard_type);
+                }
                 scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)?;
                 matched_any = true;
             }
@@ -8194,6 +8244,7 @@ fn cmd_scan_collection_in_pool(
     shard_type: ShardType,
     show_section_header: bool,
     needs_section_spacing: bool,
+    row_budget: usize,
 ) -> anyhow::Result<usize> {
     let pool = match ShardPool::open_read_only(pool_dir.to_path_buf()) {
         Ok(pool) => pool,
@@ -8202,12 +8253,8 @@ fn cmd_scan_collection_in_pool(
     };
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-    let collection_packs = PackfileStorage::collection_shards_from_disk(pool_dir)
-        .and_then(|mut collections| collections.remove(&collection_id))
-        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
-
     let mut packs = 0_usize;
-    let max_rows = opts.max_rows();
+    let max_rows = opts.max_rows().min(row_budget);
     let bounded = max_rows != usize::MAX;
     let mut context = CollectionScanContext {
         collection_id,
@@ -8232,11 +8279,6 @@ fn cmd_scan_collection_in_pool(
         decode: opts.decode.clone(),
     };
     for (_, shard) in shards {
-        if let Some(collection_packs) = &collection_packs {
-            if !collection_packs.contains(&shard.pack_id) {
-                continue;
-            }
-        }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
         if bounded && !opts.is_sorting() && !opts.reverse && context.frames >= max_rows {
@@ -8250,13 +8292,8 @@ fn cmd_scan_collection_in_pool(
     }
     sort_collection_records(&mut context);
     if context.mode.is_raw() {
-        if context.show_section_header && !context.raw_matches.is_empty() {
-            if context.needs_section_spacing {
-                println!();
-                println!();
-            }
-            print_section_header(context.shard_type);
-        }
+        // `--raw` promises a clean byte stream on stdout; a section banner
+        // would corrupt it, so never print one here.
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for (shard, _, offset) in context.raw_matches.iter().take(max_rows) {
@@ -8271,14 +8308,14 @@ fn cmd_scan_collection_in_pool(
             }
         }
         out.flush()?;
-        if bounded && frames >= max_rows {
-            eprintln!("note: showing first {max_rows} matching records; use -l 0 to scan all");
-        } else {
-            eprint_scan_limit_note(frames, max_rows);
+        let stopped_at_limit = bounded && !opts.is_sorting() && !opts.reverse && frames >= max_rows;
+        if let Some(note) = raw_scan_note(frames, max_rows, stopped_at_limit) {
+            eprintln!("{note}");
         }
         return Ok(frames);
     }
     if context.mode.is_sorting() || context.reverse {
+        let (displayed, truncated) = sorted_scan_display(frames, max_rows);
         if context.show_section_header && !context.header_printed {
             if context.needs_section_spacing {
                 println!();
@@ -8287,20 +8324,20 @@ fn cmd_scan_collection_in_pool(
             print_section_header(context.shard_type);
             context.header_printed = true;
         }
-        if bounded && frames >= max_rows {
+        if truncated {
             println!(
-                "collection {}: showing first {frames} physical records (at least {packs} pack{})",
+                "collection {}: showing first {displayed} of {frames} physical records across {packs} pack{}",
                 format_id(&collection_id),
-                if packs == 1 { "" } else { "s" },
-            );
-        } else {
-            println!(
-                "collection {}: {frames} physical record{} across {packs} pack{}",
-                format_id(&collection_id),
-                if frames == 1 { "" } else { "s" },
                 if packs == 1 { "" } else { "s" },
             );
             print_scan_limit_note(frames, max_rows);
+        } else {
+            println!(
+                "collection {}: {displayed} physical record{} across {packs} pack{}",
+                format_id(&collection_id),
+                if displayed == 1 { "" } else { "s" },
+                if packs == 1 { "" } else { "s" },
+            );
         }
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         let sorted_records = context.sorted_records.clone();
@@ -8325,6 +8362,29 @@ fn cmd_scan_collection_in_pool(
         print_scan_limit_note(frames, max_rows);
     }
     Ok(frames)
+}
+
+/// The note after a `--raw` scan. A bounded, unsorted scan stops as soon as it
+/// has `max_rows` matches, so reaching the limit does not show that more exist:
+/// say it stopped, not that rows were left out.
+fn raw_scan_note(frames: usize, max_rows: usize, stopped_at_limit: bool) -> Option<String> {
+    if stopped_at_limit {
+        Some(format!(
+            "note: stopped after {max_rows} matching records; use -l 0 to scan all"
+        ))
+    } else if max_rows < frames {
+        Some(format!(
+            "note: only showing top {max_rows}; use `-l 0` to show all"
+        ))
+    } else {
+        None
+    }
+}
+
+/// The sorted branch sees the full match count, so an exact limit is not
+/// evidence that any rows were truncated.
+fn sorted_scan_display(frames: usize, max_rows: usize) -> (usize, bool) {
+    (frames.min(max_rows), frames > max_rows)
 }
 
 /// Print a collection's live records from its index.
@@ -8364,7 +8424,7 @@ fn cmd_scan_collection_live_rows(
         "`scan --live` requires a specific shard type (-t state, -t events, or -t edges); \
          `-t all` cannot select a single live collection index"
     );
-    let collection_id = parse_collection_selector(selector)?;
+    let collection_id = parse_scan_collection_selector(cli, selector)?;
     let store = open_store_read_only(cli)?;
     let Some(locations) = store.collection_live_locations(&collection_id)? else {
         bail!(
@@ -8561,24 +8621,34 @@ fn render_live_scan_rows(
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
 fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
-    let collection_id = parse_collection_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
+        let mut remaining = opts.max_rows();
         for shard_type in cli.shard_types() {
+            if remaining == 0 {
+                break;
+            }
             let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
                 continue;
             };
-            let frames = cmd_scan_collection_in_pool(
-                &pool_dir,
-                collection_id,
-                opts,
-                shard_type,
-                true,
-                matched_any,
-            )?;
-            if frames > 0 {
-                matched_any = true;
+            for collection_id in parse_collection_selectors_for_pool(selector, shard_type)? {
+                if remaining == 0 {
+                    break;
+                }
+                let frames = cmd_scan_collection_in_pool(
+                    &pool_dir,
+                    collection_id,
+                    opts,
+                    shard_type,
+                    true,
+                    matched_any,
+                    remaining,
+                )?;
+                remaining = remaining.saturating_sub(frames.min(remaining));
+                if frames > 0 {
+                    matched_any = true;
+                }
             }
         }
         if !matched_any {
@@ -8588,12 +8658,29 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
     }
     let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
-    let frames =
-        cmd_scan_collection_in_pool(&pool_dir, collection_id, opts, shard_type, false, false)?;
+    let mut frames = 0_usize;
+    let mut remaining = opts.max_rows();
+    let ids = parse_collection_selectors_for_pool(selector, shard_type)?;
+    for (index, collection_id) in ids.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let scanned = cmd_scan_collection_in_pool(
+            &pool_dir,
+            *collection_id,
+            opts,
+            shard_type,
+            ids.len() > 1,
+            index > 0 && frames > 0,
+            remaining,
+        )?;
+        frames = frames.saturating_add(scanned);
+        remaining = remaining.saturating_sub(scanned.min(remaining));
+    }
     if frames == 0 {
         bail!(
             "no matching physical record found in collection {selector}{}",
-            other_shard_type_hint(cli, &collection_id)
+            other_shard_type_hint(cli, &parse_collection_selector(selector)?)
         );
     }
     Ok(())
@@ -8848,14 +8935,6 @@ fn print_scan_limit_note(total: usize, limit: usize) {
     }
 }
 
-/// Same as [`print_scan_limit_note`] but to stderr -- for use after `--raw`
-/// output, where stdout must stay a clean byte stream (see `--raw`'s help).
-fn eprint_scan_limit_note(total: usize, limit: usize) {
-    if limit < total {
-        eprintln!("note: only showing top {limit}; use `-l 0` to show all");
-    }
-}
-
 /// Print a readable payload for `scan --verbose` without ever treating an
 /// arbitrary binary record as terminal text.
 fn print_scan_payload(data: &[u8], decode: Option<&str>) {
@@ -8913,7 +8992,7 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
         return None;
     }
     Some(match data.len() {
-        0 => "0 bytes [empty payload: a removal marker or an empty value; see `mtxdb tombstones`]"
+        0 => "0 bytes [empty payload: a removal marker or an empty value; see `mtxdb info <collection> --tombstones`]"
             .to_owned(),
         _ => match data.get(0..4) {
             Some(magic) => format!(
@@ -8941,11 +9020,34 @@ fn cmd_gap_edit(
 }
 
 /// Print a room's gaps with their derived status, optionally filtered.
-fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> anyhow::Result<()> {
+///
+/// Reads through a read-only pool so it works while a writer holds the root.
+/// `limit` caps the printed entries; zero is unlimited. The summary counts
+/// always describe the full match set.
+fn cmd_gap_list(
+    cli: &Cli,
+    room: &str,
+    status: Option<&str>,
+    history: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
-    let db =
-        open_database(layout.root().to_path_buf()).context("opening the database to list gaps")?;
-    let manifest = crate::gap_manifest::read(&db, room)?;
+    let server_info_dir = pool_dir(&layout, mtxdb::interop::SERVER_INFO_POOL)?;
+    let wal_path = layout.shared_wal_path();
+    let pool = if wal_path.try_exists()? {
+        // Read committed history through the established shared-WAL path. If an
+        // existing WAL cannot be opened, fail rather than silently showing only
+        // the pack-covered prefix.
+        PackfileStorage::open_read_committed_shared(
+            server_info_dir,
+            wal_path,
+            mtxdb::interop::SERVER_INFO_POOL,
+        )
+        .context("opening the server-info pool through the shared WAL to list gaps")?
+    } else {
+        open_pool_read_only(server_info_dir).context("opening the server-info pool to list gaps")?
+    };
+    let manifest = crate::gap_manifest::read_from_pool(&pool, room)?;
     let matching: Vec<_> = manifest
         .gaps
         .iter()
@@ -8964,7 +9066,9 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
         println!("  no gaps match the requested status");
         return Ok(());
     }
-    for (id, record) in matching {
+    let shown = if limit == 0 { matching.len() } else { limit };
+    let hidden = matching.len().saturating_sub(shown);
+    for (id, record) in matching.into_iter().take(shown) {
         let derived = record.status();
         println!("{id}\t{}", derived.describe());
         if let Some(waiver) = &record.waiver {
@@ -9005,6 +9109,9 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
         } else {
             println!("  no server assessment recorded");
         }
+    }
+    if hidden > 0 {
+        println!("  ... {hidden} more gap(s) not shown (raise -l, or 0 for all)");
     }
     Ok(())
 }
@@ -10278,8 +10385,36 @@ const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
 /// Read-only `packs` group: list packs or dump one pack's frames as JSONL.
 fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
-        PacksAction::List { all } => cmd_shards(cli, *all, false, None),
-        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
+        PacksAction::List { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
+        PacksAction::Scan {
+            selector,
+            verbose,
+            header,
+            decode,
+            limit,
+            id,
+            collection,
+            raw,
+            sort,
+            reverse,
+        } => {
+            parse_pack_id_selector(selector)?;
+            cmd_scan(
+                cli,
+                selector,
+                *verbose,
+                *header,
+                decode.as_deref(),
+                *limit,
+                id.as_deref(),
+                collection.as_deref(),
+                *raw,
+                sort.as_deref(),
+                *reverse,
+                false,
+                Some(InfoTarget::Pack),
+            )
+        }
         PacksAction::Dump {
             pack,
             collection,
@@ -10570,6 +10705,9 @@ struct ImportRunCache {
     reverse: HashMap<[u8; 16], RoomReverse>,
     direct: bool,
     direct_files: usize,
+    /// Files whose dirty closure exceeded half the room and therefore took the
+    /// whole-room path instead of the direct one.
+    half_room_bails: usize,
     /// Stored signing keys by server for this run. Each lookup scans the whole
     /// server-info pool, so rooms share one read per server. Cleared when a
     /// keys file is imported.
@@ -10587,6 +10725,7 @@ impl Default for ImportRunCache {
             reverse: HashMap::new(),
             direct: direct_import_enabled(),
             direct_files: 0,
+            half_room_bails: 0,
             server_keys: HashMap::new(),
             gap_rooms: std::collections::BTreeSet::new(),
         }
@@ -10611,8 +10750,9 @@ struct RoomWaiting {
     room_id: String,
     prev: HashSet<String>,
     auth: HashSet<String>,
-    /// Timeline bodies the rebuild saw referenced. A cheap lower bound on the
-    /// room's stored events, used only to bound the direct path's dirty set.
+    /// Timeline bodies stored when the set was built, plus each written file's
+    /// arrivals since. A cheap estimate of the room's size, used only to bound
+    /// the direct path's dirty set.
     stored_events: usize,
 }
 
@@ -10681,11 +10821,17 @@ impl RoomWaiting {
     fn observe_written(
         &mut self,
         timeline_arrived: &HashSet<String>,
+        newly_stored: &HashSet<String>,
         auth_arrived: &HashSet<String>,
         references: impl IntoIterator<Item = (String, bool)>,
         timeline_present: &HashSet<String>,
         anywhere_present: &HashSet<String>,
     ) {
+        // Keep the room-size hint current: a room that began empty would
+        // otherwise report 0 for the whole run and disable the half-room bail.
+        // Only bodies new to the room grow it; repeats from overlapping files
+        // or reimports must not inflate the estimate.
+        self.stored_events = self.stored_events.saturating_add(newly_stored.len());
         // A timeline body is also an auth body, so it clears both families.
         for id in timeline_arrived {
             self.prev.remove(id);
@@ -10913,9 +11059,18 @@ impl ImportRunCache {
             .get(collection_id)
             .is_none_or(|entry| entry.room_id != room_id);
         if stale {
+            let started = Instant::now();
             let adjacency = CsrAdjacency::new(room_id);
             let prev = reverse_edges_by_event_id(db, &adjacency, PREV)?;
             let auth = reverse_edges_by_event_id(db, &adjacency, AUTH)?;
+            if direct_debug_enabled() {
+                eprintln!(
+                    "direct: reverse transpose (cold) in {:?} ({} PREV / {} AUTH parents)",
+                    started.elapsed(),
+                    prev.len(),
+                    auth.len()
+                );
+            }
             self.reverse.insert(
                 *collection_id,
                 RoomReverse {
@@ -11052,6 +11207,7 @@ impl ImportRunCache {
         collection_id: &[u8; 16],
         room_id: &str,
         timeline_arrived: &HashSet<String>,
+        newly_stored: &HashSet<String>,
         auth_arrived: &HashSet<String>,
         written_events: impl IntoIterator<Item = &'a OwnedValue>,
     ) -> anyhow::Result<()> {
@@ -11101,6 +11257,7 @@ impl ImportRunCache {
             .expect("waiting set was ensured above");
         entry.observe_written(
             timeline_arrived,
+            newly_stored,
             auth_arrived,
             references,
             &timeline_present,
@@ -11408,6 +11565,7 @@ impl ImportContext<'_> {
                     self.template,
                     &timeline_collection,
                     &room_id,
+                    &HashSet::new(),
                     &HashSet::new(),
                     &auth_arrived,
                     events_by_room.get(&room_id).into_iter().flatten().copied(),
@@ -11946,6 +12104,23 @@ fn direct_import_enabled() -> bool {
     std::env::var_os("MTXDB_DIRECT_IMPORT").is_some()
 }
 
+/// Opt-in stderr diagnostics for the direct path, enabled with
+/// `MTXDB_DIRECT_DEBUG`. Off by default so a normal import stays quiet; pair it
+/// with `MTXDB_DIRECT_IMPORT` when collecting the dirty-closure shape of a real
+/// run.
+fn direct_debug_enabled() -> bool {
+    std::env::var_os("MTXDB_DIRECT_DEBUG").is_some()
+}
+
+/// Whether re-judging a dirty closure of `closure` events would cost more than
+/// the whole-room path it replaces, judged against the room's stored-event hint.
+///
+/// The hint is a lower bound, so a zero hint disables the bail rather than
+/// bailing on no evidence.
+fn dirty_closure_exceeds_half(closure: usize, stored_events_hint: usize) -> bool {
+    stored_events_hint > 0 && closure.saturating_mul(2) > stored_events_hint
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -12209,6 +12384,8 @@ fn import_pdu_events_with_raw_state_hamts(
     // this file can change. Computing it before the writes keeps the closure
     // to the edges that existed before this file arrived.
     let mut dirty_closure_bailed = false;
+    let mut bail_reason = "";
+    let mut dirty_count = 0_usize;
     let closure_started = Instant::now();
     let dirty_ids = if direct
         && direct_identity
@@ -12217,26 +12394,25 @@ fn import_pdu_events_with_raw_state_hamts(
     {
         let cache = &mut *room_cache;
         match cache.dirty_closure(db, &collection_id, &resolved.canonical_id, &waiting_hits) {
-            Ok(ids)
-                if stored_events_hint > 0 && ids.len().saturating_mul(2) > stored_events_hint =>
-            {
-                // Re-judging most of the room costs more than the whole-room
-                // path it would replace. Bail before loading bodies or
-                // walking; the transpose has already been paid once.
-                if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
-                    eprintln!(
-                        "direct: fallback, |D|={} exceeds half of {stored_events_hint} stored event(s)",
-                        ids.len()
-                    );
+            Ok(ids) => {
+                dirty_count = ids.len();
+                if dirty_closure_exceeds_half(dirty_count, stored_events_hint) {
+                    // Re-judging most of the room costs more than the whole-room
+                    // path it would replace. Bail before loading bodies or
+                    // walking; the transpose has already been paid once.
+                    bail_reason = "over_half";
+                    dirty_closure_bailed = true;
+                    cache.half_room_bails = cache.half_room_bails.saturating_add(1);
+                    HashSet::new()
+                } else {
+                    ids
                 }
-                dirty_closure_bailed = true;
-                HashSet::new()
             }
-            Ok(ids) => ids,
             Err(error) => {
                 eprintln!(
                     "  warning: raw import reverse-edge lookup failed; using the whole-room path: {error:#}"
                 );
+                bail_reason = "error";
                 dirty_closure_bailed = true;
                 HashSet::new()
             }
@@ -12244,11 +12420,26 @@ fn import_pdu_events_with_raw_state_hamts(
     } else {
         HashSet::new()
     };
-    if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+    // Opt-in shape data for deciding whether a short-id reverse that resolves
+    // only the dirty set would pay: the closure size against the room and
+    // whether the direct path bailed back to the whole-room one.
+    if direct_debug_enabled() && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty()) {
+        // The stored-event count is a hint built with the waiting set; it can
+        // be zero when the rebuild found no timeline bodies to count.
+        let room_share = match dirty_count
+            .saturating_mul(100)
+            .checked_div(stored_events_hint)
+        {
+            Some(percent) => format!("{percent}%"),
+            None => "unknown".to_owned(),
+        };
         eprintln!(
-            "direct: closure took {:?} for {} id(s)",
-            closure_started.elapsed(),
-            dirty_ids.len()
+            "direct: late arrival room={:?} room_events={stored_events_hint} hits={}p/{}a dirty={dirty_count} (room_share={room_share}) bail={} closure={:?}",
+            resolved.canonical_id,
+            waiting_hits.prev.len(),
+            waiting_hits.auth.len(),
+            if bail_reason.is_empty() { "no" } else { bail_reason },
+            closure_started.elapsed()
         );
     }
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
@@ -12294,6 +12485,13 @@ fn import_pdu_events_with_raw_state_hamts(
                 .filter_map(event_id)
                 .map(str::to_owned)
                 .collect();
+            // Only bodies new to the room grow it; repeats from overlapping
+            // files or reimports must not inflate the room-size hint.
+            let newly_stored: HashSet<String> = body_ids
+                .iter()
+                .filter(|id| !existed_before.contains(*id))
+                .cloned()
+                .collect();
             let observe_started = Instant::now();
             cache.observe_written(
                 db,
@@ -12303,12 +12501,13 @@ fn import_pdu_events_with_raw_state_hamts(
                 &collection_id,
                 &resolved.canonical_id,
                 &body_ids,
+                &newly_stored,
                 &auth_arrived,
                 events.iter().chain(auth_chain.iter()),
             )?;
             let written_at = Instant::now();
             cache.observe_adjacency(&collection_id, &resolved.canonical_id, events.iter());
-            if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+            if direct_debug_enabled() {
                 eprintln!(
                     "direct: observe waiting {:?}, adjacency {:?}",
                     written_at.duration_since(observe_started),
@@ -16045,6 +16244,93 @@ fn resolve_repack_slots(
     ))
 }
 
+/// Print the physical islands a repack would combine, before and after.
+///
+/// Current counts match `mtxdb packs list --layout`: a run is one maximal
+/// contiguous stretch of a single collection, "excess" is runs beyond one per
+/// collection per pack, and superseded frames are included because that is
+/// what the physical scan sees. Repack writes each collection as one
+/// contiguous stretch, so the projected count is one island per collection plus
+/// at most one split per output-pack boundary. The output size is an upper
+/// bound (input minus pruned bytes), which deliberately over-counts superseded
+/// frames the repack will not copy.
+fn print_repack_layout_preview(
+    physical: &PhysicalLayout,
+    pack_ids: &[PackId],
+    collections: &[[u8; 16]],
+    total_input_bytes: u64,
+    total_dropped_bytes: u64,
+) {
+    let current_runs: u64 = pack_ids
+        .iter()
+        .filter_map(|pack_id| physical.packs.get(pack_id))
+        .map(|stats| stats.segments)
+        .sum();
+    if current_runs == 0 {
+        return;
+    }
+    let current_excess: u64 = pack_ids
+        .iter()
+        .filter_map(|pack_id| physical.packs.get(pack_id))
+        .map(|stats| {
+            stats
+                .segments
+                .saturating_sub(stats.collections.len() as u64)
+        })
+        .sum();
+    let collection_count = u64::try_from(collections.len()).unwrap_or(u64::MAX);
+    let output_upper_bound = total_input_bytes.saturating_sub(total_dropped_bytes);
+    let projected_packs = if collections.is_empty() {
+        0
+    } else {
+        output_upper_bound.div_ceil(MAX_SHARD_BYTES).max(1)
+    };
+    let projected_runs = if collections.is_empty() {
+        0
+    } else {
+        collection_count.saturating_add(projected_packs.saturating_sub(1))
+    };
+    let projected_excess = projected_runs.saturating_sub(collection_count);
+    let combined = current_runs.saturating_sub(projected_runs);
+    println!(
+        "layout before: {current_runs} contiguous runs across {} pack{} ({current_excess} excess from interleaving)",
+        pack_ids.len(),
+        if pack_ids.len() == 1 { "" } else { "s" },
+    );
+    println!(
+        "layout after:  <= {projected_runs} contiguous runs across <= {projected_packs} pack{} ({projected_excess} boundary split{}); each collection becomes one contiguous island",
+        if projected_packs == 1 { "" } else { "s" },
+        if projected_excess == 1 { "" } else { "s" },
+    );
+    println!(
+        "               {combined} island{} combined",
+        if combined == 1 { "" } else { "s" },
+    );
+
+    let mut fragmented: Vec<(u64, [u8; 16])> = collections
+        .iter()
+        .filter_map(|collection_id| {
+            physical
+                .collections
+                .get(collection_id)
+                .map(|stats| (stats.segments, *collection_id))
+        })
+        .filter(|(segments, _)| *segments > 1)
+        .collect();
+    fragmented
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    if !fragmented.is_empty() {
+        println!("most fragmented collections:");
+        for (segments, collection_id) in fragmented.into_iter().take(5) {
+            println!("  {}: {segments} islands -> 1", format_id(&collection_id));
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "preflight prints one coherent plan; splitting it would hide the sequence"
+)]
 fn repack_preview(
     cli: &Cli,
     target: &RepackTarget,
@@ -16108,6 +16394,9 @@ fn repack_preview(
         .map(PackId::filename_stem)
         .collect::<Vec<_>>()
         .join(", ");
+    let physical = selected_pool_dir(cli)
+        .ok()
+        .and_then(|dir| physical_layout(&dir).ok());
 
     println!(
         "this will repack {} collection{} across {} pack{} ({pack_labels})",
@@ -16138,6 +16427,15 @@ fn repack_preview(
         "                 {total_dropped} nodes / {} pruned",
         fmt_bytes(total_dropped_bytes),
     );
+    if let Some(physical) = &physical {
+        print_repack_layout_preview(
+            physical,
+            &pack_ids,
+            &collections,
+            total_input_bytes,
+            total_dropped_bytes,
+        );
+    }
     // preview_store (and its non-exclusive read-only handle) drops
     // here, before the confirmation prompt — nothing about a
     // read-only open blocks a real writer anyway, but there's no
@@ -16482,7 +16780,7 @@ fn record_csr_adjacency_with_raw(
     Ok(shorts)
 }
 
-fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
+fn cmd_drop(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
     let mut collection_ids: Vec<[u8; 16]> = collections
         .iter()
         .map(|collection| parse_collection_id(collection))
@@ -16492,13 +16790,13 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
 
     if !yes {
         println!(
-            "This will permanently delete all data for {} collection(s):",
+            "This will permanently drop {} collection(s) and all their data:",
             collection_ids.len()
         );
         for collection_id in &collection_ids {
             println!("  {}", format_id(collection_id));
         }
-        if !confirm("Delete these collections?")? {
+        if !confirm("Drop these collections?")? {
             println!("aborted");
             return Ok(());
         }
@@ -16518,27 +16816,702 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool, detail: bool) -> anyhow::Result<()> {
-    let collection_id = parse_collection_id(collection)?;
-    let store = open_store_read_only(cli)?;
-    let counts = store
-        .removal_counts(&collection_id)
-        .ok_or_else(|| anyhow::anyhow!("no such collection: {}", format_id(&collection_id)))?;
-    println!("collection:        {}", format_id(&collection_id));
-    println!("live keys:         {}", counts.live_keys);
-    println!("removed keys:      {}", counts.removed_keys);
-    if detail {
-        let stats = store.removal_stats(&collection_id)?;
-        println!("frames:            {}", stats.frames);
-        println!("  removal markers: {}", stats.marker_frames);
-        println!("  superseded:      {}", stats.superseded_frames);
-        println!("total bytes:       {}", stats.total_bytes);
-        println!("reclaimable bytes: {}", stats.reclaimable_bytes);
+/// `members`: count a room's latest membership per user, from its event
+/// records. This is the same one-pass scan `info --stats` uses, without
+/// requiring Matrix room metadata that this server does not write.
+fn cmd_members(cli: &Cli, room: &str, json: bool) -> anyhow::Result<()> {
+    if !room.starts_with('!') {
+        bail!("members takes a Matrix room ID (starting with `!`), got `{room}`");
     }
-    if keys {
-        for key in store.removed_keys(&collection_id)? {
-            println!("removed {}", format_id(&key));
+    let layout = open_layout(cli)?;
+    let dir = pool_dir(&layout, ShardType::EventDag)?;
+    let collection_id = matrix_room_collection_id(room);
+    let stats = scan_room_event_stats(&dir, &collection_id)?;
+
+    let mut by_membership: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, membership) in stats.members.values() {
+        let count = by_membership.entry(membership.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+    let joined = by_membership.get("join").copied().unwrap_or(0);
+
+    if json {
+        let memberships = by_membership
+            .iter()
+            .map(|(membership, count)| format!("{}:{count}", json_string(membership)))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"room\":{},\"collection\":\"0x{}\",\"users\":{},\"join\":{joined},\
+             \"by_membership\":{{{memberships}}}}}",
+            json_string(room),
+            hex::encode(collection_id),
+            stats.members.len(),
+        );
+    } else {
+        println!("room:                {room}");
+        println!("event collection:    0x{}", hex::encode(collection_id));
+        println!("distinct users:      {}", stats.members.len());
+        println!("joined (latest):     {joined}");
+        for (membership, count) in &by_membership {
+            println!("  {membership:<10} {count}");
         }
+    }
+    Ok(())
+}
+
+/// One event record found by scanning a room's event collection.
+struct ScannedEvent {
+    node_id: [u8; 16],
+    is_state: bool,
+    auth: crate::auth_check::EventAuth,
+}
+
+/// Scan a room's event collection and key each record by its derived event id.
+fn scan_room_events(
+    event_store: &PackfileStorage,
+    event_collection: &[u8; 16],
+) -> anyhow::Result<HashMap<String, ScannedEvent>> {
+    use crate::auth_check::{
+        event_record_parts, metadata_auth_ids, EventAuth, MSC4242_FORMAT_VERSION,
+    };
+
+    // Event ids are derived from each record's own JSON (reference hash under
+    // the room's version), so no key salt is needed to find a record. Records
+    // whose id cannot be derived (room versions 1-2, unparsable JSON) are
+    // reported as unreadable.
+    //
+    // The third element is the auth list recorded in internal metadata:
+    // `Ok(None)` when the record's format keeps it in the body instead.
+    type ParsedRecord = (
+        [u8; 16],
+        Result<OwnedValue, String>,
+        Result<Option<Vec<String>>, String>,
+    );
+    let mut raw: Vec<ParsedRecord> = Vec::new();
+    for entry in event_store.scan_collection(event_collection)? {
+        let (node_id, data) = entry?;
+        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            continue;
+        }
+        // Imported event collections store the event JSON directly, with no
+        // binary envelope or internal metadata. Recognize that complete shape
+        // before interpreting the first four bytes as a format tag.
+        let (parsed, metadata_auth) = match OwnedValue::parse_bytes(&data.bytes) {
+            Ok(value @ OwnedValue::Object(_)) => (Ok(value), Ok(None)),
+            _ => match event_record_parts(&data.bytes) {
+                Ok((format_version, metadata, json)) => (
+                    OwnedValue::parse_bytes(json)
+                        .map_err(|error| format!("not valid JSON: {error}")),
+                    if format_version == MSC4242_FORMAT_VERSION {
+                        metadata_auth_ids(metadata).map(Some)
+                    } else {
+                        Ok(None)
+                    },
+                ),
+                Err(reason) => (Err(reason), Ok(None)),
+            },
+        };
+        raw.push((node_id, parsed, metadata_auth));
+    }
+    let room_version = raw.iter().find_map(|(_, parsed, _)| {
+        let value = parsed.as_ref().ok()?;
+        (value.get("type").and_then(OwnedValue::as_str) == Some("m.room.create"))
+            .then(|| {
+                value
+                    .get("content")
+                    .and_then(|c| c.get("room_version"))
+                    .and_then(OwnedValue::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+    });
+    let mut scanned: HashMap<String, ScannedEvent> = HashMap::new();
+    for (node_id, parsed, metadata_auth) in raw {
+        let (event_id, entry) = match (parsed, room_version.as_deref()) {
+            (Ok(value), Some(version)) => match rezzy::reference_hash(&value, version) {
+                Ok(hash) => (
+                    format!("${hash}"),
+                    ScannedEvent {
+                        node_id,
+                        is_state: value.get("state_key").is_some(),
+                        auth: match metadata_auth {
+                            // No implicit-create append here: sithnapse records
+                            // the list computed from `auth_types_for_event`
+                            // (which includes `m.room.create`) in metadata, then
+                            // strips create from the v12 PDU body. The metadata
+                            // copy keeps it, and that same list becomes the edges.
+                            Ok(Some(ids)) => EventAuth::Ids(ids),
+                            Ok(None) => EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
+                                &value, version,
+                            )),
+                            Err(reason) => EventAuth::Unreadable(reason),
+                        },
+                    },
+                ),
+                Err(reason) => (
+                    format!("<node {}>", hex::encode(node_id)),
+                    ScannedEvent {
+                        node_id,
+                        is_state: false,
+                        auth: EventAuth::Unreadable(format!("event id not derivable: {reason}")),
+                    },
+                ),
+            },
+            (Ok(_), None) => (
+                format!("<node {}>", hex::encode(node_id)),
+                ScannedEvent {
+                    node_id,
+                    is_state: false,
+                    auth: EventAuth::Unreadable(
+                        "room has no m.room.create room_version".to_owned(),
+                    ),
+                },
+            ),
+            (Err(reason), _) => (
+                format!("<node {}>", hex::encode(node_id)),
+                ScannedEvent {
+                    node_id,
+                    is_state: false,
+                    auth: EventAuth::Unreadable(reason),
+                },
+            ),
+        };
+        scanned.insert(event_id, entry);
+    }
+    Ok(scanned)
+}
+
+#[derive(Clone, Copy)]
+enum CheckSections {
+    Both,
+    Auth,
+    Prevs,
+}
+
+/// Selected `room check` sections and their modifiers.
+struct RoomCheckOptions<'a> {
+    sections: CheckSections,
+    state_members: bool,
+    status: Option<&'a str>,
+    history: bool,
+    limit: usize,
+}
+
+/// `room check`: run the selected prev and auth completeness checks.
+fn cmd_room_check(cli: &Cli, room: &str, options: &RoomCheckOptions<'_>) -> anyhow::Result<()> {
+    let RoomCheckOptions {
+        sections,
+        state_members,
+        status,
+        history,
+        limit,
+    } = *options;
+    let (run_auth, run_prevs) = match sections {
+        CheckSections::Both => (true, true),
+        CheckSections::Auth => (true, false),
+        CheckSections::Prevs => (false, true),
+    };
+    // --state-members is an auth check even when --prevs alone was selected.
+    let run_auth = run_auth || state_members;
+    let mut failures = Vec::new();
+
+    if run_auth {
+        println!("== auth_events ==");
+        if let Err(error) = cmd_auth_check(cli, room, state_members, limit) {
+            failures.push(format!("auth_events: {error:#}"));
+        }
+    }
+    if run_prevs {
+        println!("== prev_events gaps ==");
+        if let Err(error) = cmd_gap_list(cli, room, status, history, limit) {
+            failures.push(format!("prev_events: {error:#}"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("one or more checks failed:\n{}", failures.join("\n"))
+    }
+}
+
+/// Re-derive a room's auth graph from its event records and
+/// compare it with the embedded edge table.
+#[allow(
+    clippy::too_many_lines,
+    reason = "coordinates the auth scan and report"
+)]
+fn cmd_auth_check(
+    cli: &Cli,
+    room: &str,
+    check_state_members: bool,
+    limit: usize,
+) -> anyhow::Result<crate::auth_check::Report> {
+    use crate::auth_check::EventAuth;
+
+    if !room.starts_with('!') {
+        bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
+    }
+    let collection_id = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    let event_collection = matrix_room_collection_id(room);
+    let layout = open_layout(cli)?;
+    let store = open_pool_read_only(pool_dir(&layout, ShardType::State)?)
+        .context("failed to open the state pool")?;
+    store.set_read_plan_policy(cli.read_plan);
+    let event_store = open_pool_read_only(pool_dir(&layout, ShardType::EventDag)?)
+        .context("failed to open the event pool")?;
+    event_store.set_read_plan_policy(cli.read_plan);
+
+    let scanned = scan_room_events(&event_store, &event_collection)?;
+    let graph_layout = DatabaseLayout::open_read_only(layout.root().to_path_buf())?;
+    let mut graph_pools = Vec::with_capacity(ShardType::ALL.len());
+    for shard_type in ShardType::ALL {
+        let pool = PackfileStorage::open_read_committed_shared(
+            pool_dir(&graph_layout, shard_type)?,
+            graph_layout.shared_wal_path(),
+            shard_type,
+        )
+        .with_context(|| {
+            format!(
+                "auth-check requires a readable shared WAL (multi-reader read-committed path); opening the {shard_type:?} pool for adjacency reads"
+            )
+        })?;
+        pool.set_read_plan_policy(cli.read_plan);
+        graph_pools.push(Arc::new(pool));
+    }
+    let graph_pools: [Arc<PackfileStorage>; ShardType::ALL.len()] = graph_pools
+        .try_into()
+        .map_err(|_| anyhow!("failed to open every pool for adjacency reads"))?;
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout, graph_pools);
+    // The homeserver records each event's edges in the room's event
+    // collection scope (`CsrAdjacency::for_collection`).
+    let adjacency = CsrAdjacency::for_collection(&event_collection);
+    let graph_records = auth_check_records_from_csr(&adjacency, &graph)?;
+    let use_csr = graph_records.contains_key(&crate::auth_check::counter_node_id());
+    let unreadable_by_node: HashMap<[u8; 16], String> = scanned
+        .values()
+        .filter_map(|entry| match &entry.auth {
+            EventAuth::Unreadable(reason) => Some((entry.node_id, reason.clone())),
+            EventAuth::Ids(_) | EventAuth::Absent => None,
+        })
+        .collect();
+    let template = default_matrix_import_template();
+
+    let report = crate::auth_check::check(
+        |id| -> anyhow::Result<_> {
+            if use_csr {
+                Ok(graph_records.get(id).cloned())
+            } else {
+                Ok(store
+                    .get(&collection_id, id)?
+                    .map(|data| data.bytes.to_vec()))
+            }
+        },
+        |event_id| -> anyhow::Result<_> {
+            let auth = if let Some(entry) = scanned.get(event_id) {
+                match &entry.auth {
+                    EventAuth::Ids(ids) => EventAuth::Ids(ids.clone()),
+                    EventAuth::Unreadable(reason) => EventAuth::Unreadable(reason.clone()),
+                    EventAuth::Absent => EventAuth::Absent,
+                }
+            } else {
+                let node_id = template_event_id_node_id(&template, event_id)?;
+                unreadable_by_node
+                    .get(&node_id)
+                    .map_or(EventAuth::Absent, |reason| {
+                        EventAuth::Unreadable(reason.clone())
+                    })
+            };
+            Ok(auth)
+        },
+    )?;
+
+    // Persisted state events no short id names: closures are built only for
+    // state events, so a message event with no short id is expected.
+    let named: HashSet<&String> = report.names.values().collect();
+    let unembedded: Vec<[u8; 16]> = scanned
+        .iter()
+        .filter(|(event_id, entry)| entry.is_state && !named.contains(event_id))
+        .map(|(_, entry)| entry.node_id)
+        .collect();
+    // Records that could not be parsed at all. They carry no state flag, so
+    // they never appear in `unembedded`; report them separately rather than
+    // letting them vanish.
+    let unreadable: Vec<([u8; 16], String)> = scanned
+        .values()
+        .filter_map(|entry| match &entry.auth {
+            EventAuth::Unreadable(reason) => Some((entry.node_id, reason.clone())),
+            EventAuth::Ids(_) | EventAuth::Absent => None,
+        })
+        .collect();
+
+    let missing_state_members = if check_state_members {
+        collect_missing_state_members_with_graph(
+            &store,
+            room,
+            &collection_id,
+            &adjacency,
+            Some(&graph),
+            use_csr,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    print_auth_check_report(
+        &report,
+        &unembedded,
+        &unreadable,
+        &missing_state_members,
+        check_state_members,
+        &AuthCheckHeader {
+            room,
+            auth_collection: collection_id,
+            event_collection,
+        },
+        limit,
+    );
+    Ok(report)
+}
+
+/// Adapt the maintained CSR adjacency to the auth-check report's compact
+/// edge-record interface. The homeserver writes these rows to the graph store
+/// under `CsrAdjacency::for_collection`, not to the legacy AUTH pack collection.
+///
+/// Stored AUTH owners and their numeric targets come from the CSR rows directly,
+/// so an owner whose event body was not scanned still gets its edge record and
+/// a missing reverse mapping becomes an unresolved target in the report rather
+/// than an error. Names come only from the stored reverse mapping: a missing
+/// one stays absent so the checker reports it, and is never filled in from a
+/// body scan. The authoritative comparison is
+/// [`crate::auth_check::check`]'s.
+fn auth_check_records_from_csr(
+    adjacency: &CsrAdjacency,
+    graph: &impl mtxdb::short_id::GraphReader,
+) -> anyhow::Result<HashMap<NodeId, Vec<u8>>> {
+    let next_id = adjacency.events_index().counter(graph)?;
+    let allocated = next_id.saturating_sub(1);
+    if allocated == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut records = HashMap::new();
+    records.insert(
+        crate::auth_check::counter_node_id(),
+        u64::from(allocated).to_be_bytes().to_vec(),
+    );
+    // The counter and the rows are read separately, so an append between the
+    // two reads can leave owners above the reported counter. Compare only the
+    // owners the counter covers.
+    let auth_rows: Vec<_> = adjacency
+        .auth_target_ids(graph)?
+        .into_iter()
+        .filter(|(owner, _)| *owner <= allocated)
+        .collect();
+    let mut referenced = std::collections::BTreeSet::new();
+    for (owner, targets) in &auth_rows {
+        referenced.insert(*owner);
+        referenced.extend(targets.iter().copied());
+    }
+    let ids: Vec<u32> = referenced.into_iter().collect();
+    let names = adjacency.resolve_event_ids(graph, &ids)?;
+    for (&short_id, name) in ids.iter().zip(names) {
+        if let Some(name) = name {
+            records.insert(
+                crate::auth_check::reverse_node_id(short_id),
+                name.into_bytes(),
+            );
+        }
+    }
+    for (owner, targets) in auth_rows {
+        records.insert(
+            crate::auth_check::edge_node_id(owner),
+            crate::auth_check::encode_edges(&targets),
+        );
+    }
+    Ok(records)
+}
+
+/// Compare authoritative persisted state-group members with the AUTH forward map.
+/// Multiple groups containing one event are reported on a single row.
+#[cfg(test)]
+fn collect_missing_state_members(
+    store: &PackfileStorage,
+    room: &str,
+    auth_collection: &[u8; 16],
+) -> anyhow::Result<Vec<crate::auth_check::MissingStateMember>> {
+    collect_missing_state_members_with_graph(
+        store,
+        room,
+        auth_collection,
+        &CsrAdjacency::for_collection(&matrix_room_collection_id(room)),
+        None,
+        false,
+    )
+}
+
+fn collect_missing_state_members_with_graph(
+    store: &PackfileStorage,
+    room: &str,
+    auth_collection: &[u8; 16],
+    adjacency: &CsrAdjacency,
+    graph: Option<&dyn mtxdb::short_id::GraphReader>,
+    use_csr: bool,
+) -> anyhow::Result<Vec<crate::auth_check::MissingStateMember>> {
+    let Some(groups_collection) = mtxdb::state_group_collection_id(room) else {
+        return Ok(Vec::new());
+    };
+    let mut groups = Vec::new();
+    let mut seen_xxp = false;
+    for item in store.scan_collection(&groups_collection)? {
+        let (group_id, _) = item?;
+        if group_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            continue;
+        }
+        let Some(entries) = crate::state_hamt::load_state_group_entries(store, room, &group_id)?
+        else {
+            continue;
+        };
+        let event_ids = entries
+            .into_iter()
+            .map(|(_, _, event_id)| {
+                seen_xxp |= event_id.contains("xxpSMID");
+                event_id
+            })
+            .collect::<Vec<_>>();
+        groups.push((group_id, event_ids));
+    }
+    eprintln!(
+        "state-members diagnostic: groups={} xxp_present={seen_xxp}",
+        groups.len()
+    );
+    crate::auth_check::missing_state_members(groups, |event_id| {
+        if use_csr {
+            return Ok(adjacency
+                .events_index()
+                .lookup(
+                    graph.expect("CSR mode supplies its reader"),
+                    event_id.as_bytes(),
+                )?
+                .is_some());
+        }
+        let forward_id = crate::auth_check::forward_node_id(event_id);
+        let data = store.get(auth_collection, &forward_id)?;
+        Ok(forward_short_id_present(
+            data.as_ref().map(|data| data.bytes.as_ref()),
+        ))
+    })
+}
+
+/// Whether an AUTH forward record holds a short id.
+///
+/// Only a present four-byte record counts: an absent record and one of any
+/// other length do not map the member to a short id.
+fn forward_short_id_present(bytes: Option<&[u8]>) -> bool {
+    bytes.is_some_and(|bytes| bytes.len() == 4)
+}
+
+/// Where an `auth-check` report was read from.
+struct AuthCheckHeader<'a> {
+    room: &'a str,
+    auth_collection: [u8; 16],
+    event_collection: [u8; 16],
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "prints the summary and every report category in a fixed order"
+)]
+fn print_auth_check_report(
+    report: &crate::auth_check::Report,
+    unembedded: &[[u8; 16]],
+    unreadable: &[([u8; 16], String)],
+    missing_state_members: &[crate::auth_check::MissingStateMember],
+    state_members_checked: bool,
+    header: &AuthCheckHeader<'_>,
+    limit: usize,
+) {
+    println!("room:                {}", header.room);
+    println!(
+        "auth collection:     {}",
+        format_id(&header.auth_collection)
+    );
+    println!(
+        "event collection:    {}",
+        format_id(&header.event_collection)
+    );
+    if report.allocated == 0
+        && report.corrupt.is_empty()
+        && unembedded.is_empty()
+        && unreadable.is_empty()
+        && missing_state_members.is_empty()
+        && !state_members_checked
+    {
+        println!("no auth-chain short ids recorded for this room");
+        return;
+    }
+    println!("short ids allocated: {}", report.allocated);
+    println!("with edge records:   {}", report.with_edges);
+    println!("dangling targets:    {}", report.dangling.len());
+    println!("unreadable records:  {}", report.corrupt.len());
+    println!("edge mismatches:     {}", report.mismatched.len());
+    println!("no event record:     {}", report.no_record.len());
+    println!("unnamed short ids:   {}", report.unnamed.len());
+    println!("bad event records:   {}", report.bad_records.len());
+    println!("unreadable event records: {}", unreadable.len());
+    println!("state events with no short id: {}", unembedded.len());
+    if state_members_checked {
+        println!(
+            "state members with no short id: {}",
+            missing_state_members.len()
+        );
+    }
+    let name = |short_id: u32| {
+        report
+            .names
+            .get(&short_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<short id {short_id}, no event id>"))
+    };
+    let shown = if limit == 0 { usize::MAX } else { limit };
+    for dangling in report.dangling.iter().take(shown) {
+        println!(
+            "DANGLING short_id={} event_id={}",
+            dangling.short_id,
+            dangling.event_id.as_deref().unwrap_or("<unmapped>")
+        );
+        for citer in dangling.cited_by.iter().take(5) {
+            println!("    cited by {}", name(*citer));
+        }
+        if dangling.cited_by.len() > 5 {
+            println!(
+                "    ... and {} more",
+                dangling.cited_by.len().saturating_sub(5)
+            );
+        }
+    }
+    if report.dangling.len() > shown {
+        println!(
+            "... {} more not shown (use --limit 0)",
+            report.dangling.len().saturating_sub(shown)
+        );
+    }
+    for mismatch in report.mismatched.iter().take(shown) {
+        println!("MISMATCH {}", mismatch.event_id);
+        for id in mismatch.missing.iter().take(5) {
+            println!("    in auth_events, not in embedded edges: {id}");
+        }
+        for id in mismatch.extra.iter().take(5) {
+            println!("    in embedded edges, not in auth_events: {id}");
+        }
+    }
+    for event_id in report.no_record.iter().take(shown) {
+        println!("NO_EVENT_RECORD {event_id}");
+    }
+    for short_id in report.unnamed.iter().take(shown) {
+        println!("UNNAMED short_id={short_id}");
+    }
+    for (event_id, reason) in report.bad_records.iter().take(shown) {
+        println!("BAD_EVENT_RECORD {event_id}: {reason}");
+    }
+    for node_id in unembedded.iter().take(shown) {
+        println!("NO_SHORT_ID node={}", hex::encode(node_id));
+    }
+    for (node_id, reason) in unreadable.iter().take(shown) {
+        println!(
+            "UNREADABLE_EVENT_RECORD node={}: {reason}",
+            hex::encode(node_id)
+        );
+    }
+    for member in missing_state_members.iter().take(shown) {
+        let group_ids = member
+            .groups
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("NO_SHORT_ID group={group_ids} event={}", member.event_id);
+    }
+    for (short_id, reason) in report.corrupt.iter().take(shown) {
+        println!("UNREADABLE short_id={short_id}: {reason}");
+    }
+}
+
+fn cmd_tombstones(
+    cli: &Cli,
+    collection: &str,
+    keys: bool,
+    detail: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // A room selector names a different collection in each pool (the event
+    // bodies in EVNT, the state, roots and auth collections in STAT), so
+    // expand it per pool and report every collection that exists.
+    let shard_type = cli.require_shard_type()?;
+    let collection_ids = parse_collection_selectors_for_pool(collection, shard_type)?;
+    let store = open_store_read_only(cli)?;
+    let mut reported = 0_usize;
+    for collection_id in collection_ids {
+        let Some(counts) = store.removal_counts(&collection_id) else {
+            continue;
+        };
+        reported = reported.saturating_add(1);
+        let stats = detail
+            .then(|| store.removal_stats(&collection_id))
+            .transpose()?;
+        let removed = if keys {
+            store.removed_keys(&collection_id)?
+        } else {
+            Vec::new()
+        };
+        if json {
+            let mut fields = vec![
+                ("collection", json_string(&format_id(&collection_id))),
+                ("live_keys", counts.live_keys.to_string()),
+                ("removed_keys", counts.removed_keys.to_string()),
+            ];
+            if let Some(stats) = stats {
+                fields.extend([
+                    ("frames", stats.frames.to_string()),
+                    ("removal_markers", stats.marker_frames.to_string()),
+                    ("superseded_frames", stats.superseded_frames.to_string()),
+                    ("total_bytes", stats.total_bytes.to_string()),
+                    ("reclaimable_bytes", stats.reclaimable_bytes.to_string()),
+                ]);
+            }
+            if keys {
+                let values = removed
+                    .iter()
+                    .map(|key| json_string(&format_id(key)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                fields.push(("removed", format!("[{values}]")));
+            }
+            println!("{}", json_object(&fields, ""));
+            continue;
+        }
+
+        println!("collection:        {}", format_id(&collection_id));
+        println!("live keys:         {}", counts.live_keys);
+        println!("removed keys:      {}", counts.removed_keys);
+        if let Some(stats) = stats {
+            println!("frames:            {}", stats.frames);
+            println!("  removal markers: {}", stats.marker_frames);
+            println!("  superseded:      {}", stats.superseded_frames);
+            println!("total bytes:       {}", stats.total_bytes);
+            println!("reclaimable bytes: {}", stats.reclaimable_bytes);
+        }
+        if keys {
+            for key in removed {
+                println!("removed {}", format_id(&key));
+            }
+        }
+    }
+    if reported == 0 {
+        bail!(
+            "no such collection: {}",
+            format_id(&parse_collection_selector(collection)?)
+        );
     }
     Ok(())
 }
@@ -16598,29 +17571,159 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// Force a full checkpoint in every pool through the shared `Database`, so
 /// each pool reports coverage to the same journal coordinator and the WAL can
 /// reclaim through the oldest covered group.
+///
+/// A shared segment can only be reclaimed past a group once every pool that
+/// contributed a frame to it has reported coverage, so this always checkpoints
+/// all pools regardless of `-t`. The output reports the reclaim's effect on the
+/// segment's numbering, each pool's coverage, and where the checkpoint time
+/// went; nothing here is written to a log file.
 fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
+    // Read the segment before opening it: a writer open replays and reclaims
+    // during recovery, so a snapshot taken afterwards would not show what this
+    // command started from.
+    let wal_path = layout.shared_wal_path();
+    let position_before = wal_position_on_disk(&wal_path);
+    let bytes_before = fs::metadata(&wal_path).ok().map(|metadata| metadata.len());
+
     let db = open_database(layout.root().to_path_buf())
         .context("opening the shared database to reclaim its WAL")?;
-    let before = db.coordinator().segment_len();
+    let coordinator = db.coordinator();
+    let before = bytes_before.unwrap_or_else(|| coordinator.segment_len());
 
+    let mut checkpoints = Vec::with_capacity(ShardType::ALL.len());
     for shard in ShardType::ALL {
+        let started = Instant::now();
         db.pool(shard)
             .force_index_checkpoint()
             .with_context(|| format!("checkpointing the {shard:?} pool to reclaim the WAL"))?;
+        checkpoints.push((shard, started.elapsed()));
     }
     for shard in ShardType::ALL {
         db.pool(shard).wait_for_checkpoint();
     }
 
-    let coordinator = db.coordinator();
     let after = coordinator.segment_len();
-    println!("shared WAL: {before} -> {after} bytes");
+    let position_after = coordinator.segment_position();
+
+    println!(
+        "shared WAL: {before} -> {after} bytes ({} reclaimed)",
+        before.saturating_sub(after)
+    );
+    if let Some(position_before) = position_before {
+        println!(
+            "  groups: {} -> {} ({} dropped)",
+            position_before.groups,
+            position_after.groups,
+            position_before.groups.saturating_sub(position_after.groups)
+        );
+        println!(
+            "  retained LSNs: {} -> {}",
+            retained_lsns(position_before),
+            retained_lsns(position_after)
+        );
+        println!(
+            "  retained sequences: {} -> {}",
+            retained_sequences(position_before),
+            retained_sequences(position_after)
+        );
+    } else {
+        println!("  groups: {}", position_after.groups);
+        println!("  retained LSNs: {}", retained_lsns(position_after));
+        println!(
+            "  retained sequences: {}",
+            retained_sequences(position_after)
+        );
+    }
+    let committed_through = committed_through(coordinator.committed_lsn(), position_after.base_lsn);
+    println!(
+        "  next append: LSN {}, sequence {} (committed through LSN {committed_through})",
+        position_after.next_lsn, position_after.next_sequence,
+    );
+    println!(
+        "  segment: {after} of {} bytes; reclaim trigger {}",
+        coordinator.segment_cap(),
+        coordinator.reclaim_trigger_len()
+    );
+    if coordinator.is_reclaim_stalled() {
+        println!(
+            "  reclaim is stalled ({} stall(s) recorded)",
+            coordinator.reclaim_stalls()
+        );
+    }
     let blockers = coordinator.reclaim_blockers();
     if !blockers.is_empty() {
-        println!("reclaim still blocked by pools: {blockers:?}");
+        println!("  reclaim still blocked by pools: {blockers:?}");
     }
+    if coordinator.replay_lease_count() > 0 {
+        println!(
+            "  replay leases: {} active, oldest LSN {}, lag {} bytes",
+            coordinator.replay_lease_count(),
+            coordinator
+                .oldest_replay_lease_lsn()
+                .map_or_else(|| "none".to_owned(), |lsn| lsn.to_string()),
+            coordinator
+                .replay_lease_lag_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string())
+        );
+    }
+
+    let coverage: Vec<String> = ShardType::ALL
+        .iter()
+        .map(|shard| format!("{}={}", shard.as_str(), db.pool(*shard).durable_coverage()))
+        .collect();
+    println!("  pool coverage: {}", coverage.join(" "));
+    let timings: Vec<String> = checkpoints
+        .iter()
+        .map(|(shard, elapsed)| format!("{}={elapsed:.1?}", shard.as_str()))
+        .collect();
+    println!("  checkpoint calls: {}", timings.join(" "));
     Ok(())
+}
+
+/// Committed-through LSN to report for the shared WAL.
+///
+/// A header-only segment reopened after a reclaim has no live groups, so the
+/// in-memory watermark can sit below the history already reclaimed before the
+/// segment's base. The base is authoritative for that case; a fresh segment
+/// (base 1) still reports zero, and a populated segment keeps its watermark.
+fn committed_through(committed_lsn: u64, base_lsn: u64) -> u64 {
+    committed_lsn.max(base_lsn.saturating_sub(1))
+}
+
+/// A read-only snapshot of a WAL segment's numbering as found on disk.
+///
+/// Uses the file header for the base and the last live group for the next
+/// numbers; a header-only segment records the next numbers as its base.
+fn wal_position_on_disk(path: &Path) -> Option<mtxdb::journal::SegmentPosition> {
+    let scan = mtxdb::journal::Journal::scan_read_only(path).ok()?;
+    let last = scan.groups.last();
+    Some(mtxdb::journal::SegmentPosition {
+        base_sequence: scan.base_sequence,
+        next_sequence: last.map_or(scan.base_sequence, |group| group.sequence.saturating_add(1)),
+        base_lsn: scan.base_lsn,
+        next_lsn: last.map_or(scan.base_lsn, |group| group.last_lsn.saturating_add(1)),
+        groups: u64::try_from(scan.groups.len()).unwrap_or(u64::MAX),
+    })
+}
+
+/// The live LSN range of a segment, or its base when it holds no groups.
+fn retained_lsns(position: mtxdb::journal::SegmentPosition) -> String {
+    if position.groups == 0 {
+        return format!("empty (base {})", position.base_lsn);
+    }
+    let end = position.next_lsn.saturating_sub(1);
+    format!("{}..={end}", position.base_lsn)
+}
+
+/// The live sequence range of a segment, or the next sequence when it holds no
+/// groups.
+fn retained_sequences(position: mtxdb::journal::SegmentPosition) -> String {
+    if position.groups == 0 {
+        return format!("empty (next {})", position.next_sequence);
+    }
+    let end = position.next_sequence.saturating_sub(1);
+    format!("{}..={end}", position.base_sequence)
 }
 
 fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
@@ -16666,6 +17769,10 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "test_cmd.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "test_direct_reverse_timing.rs"]
+mod direct_reverse_timing;
 
 /// Test-only experiment: fill-only seeding of a missing-prev gap root's base
 /// state from the `(type, state_key)` keys its cited `auth_events` name. It

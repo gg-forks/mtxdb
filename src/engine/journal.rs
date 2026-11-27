@@ -327,6 +327,10 @@ struct TxnStageData {
     expectations: Vec<CollectionExpectation>,
     /// Per-record version preconditions validated at publication.
     record_expectations: Vec<RecordExpectation>,
+    /// Keys that already have a [`RecordExpectation`] above. A staged write is
+    /// not enough: a blind put never validated the live value it replaced, so
+    /// callers that need a read-modify-write precondition must still add one.
+    record_expectation_keys: HashSet<(usize, [u8; 16], [u8; 16])>,
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
@@ -462,6 +466,7 @@ impl TxnStage {
                 applied: std::array::from_fn(|_| Vec::new()),
                 expectations: Vec::new(),
                 record_expectations: Vec::new(),
+                record_expectation_keys: HashSet::new(),
                 bytes: 0,
                 appended: [false; ShardType::ALL.len()],
                 receipt: None,
@@ -573,6 +578,7 @@ impl TxnStage {
             data.applied.iter_mut().for_each(Vec::clear);
             data.expectations.clear();
             data.record_expectations.clear();
+            data.record_expectation_keys.clear();
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
         }
@@ -892,6 +898,8 @@ impl TxnStage {
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = total;
         for (node_id, expected) in pending {
+            data.record_expectation_keys
+                .insert((index, collection_id, *node_id));
             data.record_expectations.push(RecordExpectation {
                 pool,
                 collection_id,
@@ -972,6 +980,29 @@ impl TxnStage {
         collection_id: [u8; 16],
         entries: &[([u8; 16], Vec<u8>)],
     ) -> io::Result<()> {
+        self.stage_puts_inner(pool, collection_id, None, entries)
+    }
+
+    /// Atomically add record-version preconditions and puts. Used by
+    /// transaction primitives that must not leave partial staged state when
+    /// the staging budget or an expectation check fails.
+    pub(crate) fn stage_puts_with_record_expectations(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expectations: &[([u8; 16], u64)],
+        entries: &[([u8; 16], Vec<u8>)],
+    ) -> io::Result<()> {
+        self.stage_puts_inner(pool, collection_id, Some(expectations), entries)
+    }
+
+    fn stage_puts_inner(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expectations: Option<&[([u8; 16], u64)]>,
+        entries: &[([u8; 16], Vec<u8>)],
+    ) -> io::Result<()> {
         let charge = entries
             .iter()
             .try_fold(0usize, |total, (_, payload)| {
@@ -996,13 +1027,28 @@ impl TxnStage {
         if total > self.limit_bytes {
             return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
-        let pool_mutations = &mut data.pools[pool_index(pool)];
-        pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
+        let index = pool_index(pool);
+        if let Some(expectations) = expectations {
+            for (node_id, expected) in expectations {
+                if data
+                    .record_expectation_keys
+                    .insert((index, collection_id, *node_id))
+                {
+                    data.record_expectations.push(RecordExpectation {
+                        pool,
+                        collection_id,
+                        node_id: *node_id,
+                        expected: *expected,
+                    });
+                }
+            }
+        }
+        data.pools[index].extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
             collection_id,
             node_id: *node_id,
             payload: payload.clone(),
         }));
-        data.applied[pool_index(pool)].extend(vec![false; entries.len()]);
+        data.applied[index].extend(vec![false; entries.len()]);
         data.bytes = total;
         Ok(())
     }
@@ -1106,6 +1152,8 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
+        data.record_expectation_keys
+            .insert((pool_index(pool), collection_id, node_id));
         data.record_expectations.push(RecordExpectation {
             pool,
             collection_id,
@@ -1113,6 +1161,22 @@ impl TxnStage {
             expected,
         });
         Ok(())
+    }
+
+    /// Whether a per-record version precondition is already staged for this
+    /// key, regardless of whether the key also has a staged write.
+    #[must_use]
+    pub fn has_record_expectation(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> bool {
+        self.data.lock().record_expectation_keys.contains(&(
+            pool_index(pool),
+            *collection_id,
+            *node_id,
+        ))
     }
 
     /// Snapshot the staged per-record version preconditions.
@@ -1452,6 +1516,20 @@ impl Drop for SyncInFlightGuard<'_> {
 #[cfg(test)]
 type FsyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
+/// Work that must be durable before the WAL group covering a captured boundary
+/// is: run by every commit path (explicit sync, background committer, close)
+/// after the boundary is captured and before the fsync.
+///
+/// A derived structure that is written outside the WAL (the CSR adjacency
+/// tails) uses it to make its writes for the group durable first, so a crash
+/// can leave orphan derived rows but never a durable record whose derived rows
+/// are missing. Publishers take no lock the hook needs, so they keep appending
+/// while it runs; anything published after the capture is outside the group
+/// being made durable and is covered by the next one. An `Err` fails the sync
+/// without poisoning the journal: it says the hook's own work failed, not that
+/// the kernel dropped WAL pages.
+pub type PreSyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// What a sync captured under the journal lock so it can flush without it.
 struct SyncCapture {
     /// Duplicate of the segment file handle current at capture time.
@@ -1545,6 +1623,25 @@ pub struct GroupDirectoryStats {
     pub allocated_bytes: u64,
 }
 
+/// The live numbering of a journal segment: what reclaim has left, and what the
+/// next append will take. Read from the in-memory header and group directory,
+/// so this never scans the segment file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentPosition {
+    /// Sequence of the oldest live group, or the sequence the next group would
+    /// take when the segment holds none.
+    pub base_sequence: u64,
+    /// Sequence the next appended group will take.
+    pub next_sequence: u64,
+    /// LSN of the first mutation of the oldest live group, or the LSN the next
+    /// group would take when the segment holds none.
+    pub base_lsn: u64,
+    /// LSN the next appended mutation will take.
+    pub next_lsn: u64,
+    /// Complete committed groups currently in the segment.
+    pub groups: u64,
+}
+
 /// The smallest group the format allows: a header, one mutation frame and a
 /// trailer.
 const MIN_GROUP_LEN: u64 = (GROUP_HEADER_LEN + MIN_FRAME_LEN + GROUP_TRAILER_LEN) as u64;
@@ -1633,6 +1730,10 @@ pub struct Scan {
     /// there are no groups to compare but the base still moved past what the
     /// reader's index incorporated.
     pub base_lsn: u64,
+    /// Sequence the segment's first group would carry — the file header's base
+    /// sequence. Like [`Self::base_lsn`], this survives a reclaim that removed
+    /// every group.
+    pub base_sequence: u64,
     /// The last bytes (up to [`CONSUMED_TAIL_LEN`]) of the complete groups this
     /// scan consumed, never reaching into the file header. A read-only overlay
     /// remembers them, appended to what it already remembered, so it later
@@ -1667,6 +1768,7 @@ impl Scan {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 0,
+            base_sequence: 0,
             consumed_tail: Vec::new(),
             group_ends: Vec::new(),
         }
@@ -2299,6 +2401,9 @@ pub struct JournalCoordinator {
     /// An `Err` it returns is treated as the fsync failing.
     #[cfg(test)]
     fsync_hook: Mutex<Option<FsyncHook>>,
+    /// Work to make durable before each WAL group's fsync. See
+    /// [`PreSyncHook`].
+    pre_sync_hook: Mutex<Option<PreSyncHook>>,
     /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
     /// waiters re-check [`Self::committed_lsn`] and the committer's presence
     /// after every wake, so this only provides the required mutex pairing.
@@ -2499,6 +2604,7 @@ impl JournalCoordinator {
             sync_lock: Mutex::new(()),
             #[cfg(test)]
             fsync_hook: Mutex::new(None),
+            pre_sync_hook: Mutex::new(None),
             durable_lock: Mutex::new(()),
             durable_cv: Condvar::new(),
             background: Mutex::new(BackgroundState::Stopped),
@@ -2842,6 +2948,13 @@ impl JournalCoordinator {
         // and coverage last.
         {
             let _sync = self.sync_lock.lock();
+            // Rewriting fsyncs the retained suffix, which can include groups
+            // that were published but are not yet durable. Run the pre-sync
+            // hook first, outside the journal lock (it can wait on derived-store
+            // writers that are themselves waiting to publish), so their derived
+            // rows are durable before the groups can be.
+            let hooked_through = self.published_lsn();
+            let had_hook = self.run_pre_sync_hook()?;
             let mut journal = self.journal.lock();
             self.revoke_over_cap_leases(&journal);
             let boundary = {
@@ -2850,6 +2963,11 @@ impl JournalCoordinator {
             };
             match boundary {
                 SharedBoundary::Through(covered_lsn, blocked_by) => {
+                    if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+                        // A group landed after the hook ran; rewriting would make
+                        // it durable through an unhooked fsync.
+                        return Ok(Some(journal.skipped_reclaim()));
+                    }
                     // Shared reclaim computes its own per-group/per-pool
                     // boundary, so apply the replay floor after that decision
                     // and before the segment rewrite. The lease is global to
@@ -3567,6 +3685,12 @@ impl JournalCoordinator {
         self.published_lsn.load(Ordering::Acquire)
     }
 
+    /// Install (or clear) the work to make durable before each WAL group's
+    /// fsync. See [`PreSyncHook`].
+    pub fn set_pre_sync_hook(&self, hook: Option<PreSyncHook>) {
+        *self.pre_sync_hook.lock() = hook;
+    }
+
     /// Capture the latest fully published mutation as this sync caller's
     /// acknowledgement boundary.
     #[must_use]
@@ -3738,6 +3862,22 @@ impl JournalCoordinator {
         })
     }
 
+    /// Run the installed [`PreSyncHook`] before WAL durability work. Returns
+    /// whether a hook was installed.
+    ///
+    /// Callers must not hold the journal lock: the hook syncs derived stores
+    /// whose writers can be waiting on the journal while holding those stores'
+    /// locks.
+    fn run_pre_sync_hook(&self) -> io::Result<bool> {
+        let hook = self.pre_sync_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Fsync the captured handle with no journal lock held, recording the
     /// fsync time in `timings`.
     fn flush_captured_file(
@@ -3745,6 +3885,10 @@ impl JournalCoordinator {
         capture: &SyncCapture,
         timings: &mut JournalSyncTimings,
     ) -> io::Result<()> {
+        // The boundary is already captured and no journal lock is held, so the
+        // hook's work covers everything published up to that boundary while
+        // publishers carry on past it.
+        self.run_pre_sync_hook()?;
         let fsync_started = std::time::Instant::now();
         #[cfg(test)]
         let _trace = crate::test_trace::span("wal.group_fsync", std::path::Path::new("wal"));
@@ -4189,6 +4333,24 @@ impl JournalCoordinator {
     #[must_use]
     pub fn segment_len(&self) -> u64 {
         self.journal.lock().file_len
+    }
+
+    /// The segment's live LSN and sequence numbering without scanning it.
+    ///
+    /// A reclaim moves the base forward but never changes `next_lsn` or
+    /// `next_sequence`: reclaim drops already-assigned groups, it does not
+    /// assign new numbers. Compare two snapshots to see how far reclaim advanced
+    /// the retained window.
+    #[must_use]
+    pub fn segment_position(&self) -> SegmentPosition {
+        let journal = self.journal.lock();
+        SegmentPosition {
+            base_sequence: journal.base_sequence,
+            next_sequence: journal.next_sequence,
+            base_lsn: journal.base_lsn,
+            next_lsn: journal.next_lsn,
+            groups: journal.directory_stats().groups,
+        }
     }
 
     /// Largest the segment may grow before commits are refused.
@@ -4757,9 +4919,18 @@ impl JournalCoordinator {
         // Wait out any in-flight fsync: the rewrite replaces the segment file,
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
+        // The rebuilt file fsyncs every retained group. Run the derived-store
+        // hook first, without the journal lock, and remember the boundary it
+        // covered. A group published after that boundary must not become
+        // durable through this rewrite.
+        let hooked_through = self.published_lsn();
+        let had_hook = self.run_pre_sync_hook()?;
         let mut journal = self.journal.lock();
         self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
+        if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+            return Ok(journal.skipped_reclaim());
+        }
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
@@ -4778,9 +4949,14 @@ impl JournalCoordinator {
         blocked_by: Option<ShardType>,
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
+        let hooked_through = self.published_lsn();
+        let had_hook = self.run_pre_sync_hook()?;
         let mut journal = self.journal.lock();
         self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
+        if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+            return Ok(journal.skipped_reclaim());
+        }
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let blocked_by = (replay_limit == covered_lsn)
             .then_some(blocked_by)
@@ -4831,6 +5007,25 @@ impl Journal {
         })
     }
 
+    /// Read only the segment header's base LSN without scanning journal groups.
+    /// A read-only worker uses this after a publish-signal change to detect a
+    /// reclaim that rewrote the segment without changing its length.
+    pub(crate) fn read_base_lsn_read_only(path: impl AsRef<Path>) -> io::Result<u64> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let len = file.metadata()?.len();
+        if len < u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX) {
+            return Ok(0);
+        }
+        let mut header = vec![0; FILE_HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let (_, base_lsn) = validate_file_header(&header)?;
+        Ok(base_lsn)
+    }
+
     /// Scan only the committed groups appended at or after `start`, a group
     /// boundary returned by an earlier scan's `valid_len`.
     ///
@@ -4877,7 +5072,7 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (_base_sequence, base_lsn) = validate_file_header(&header)?;
+        let (base_sequence, base_lsn) = validate_file_header(&header)?;
         let scan_end = end.min(len);
         if start >= scan_end {
             return Ok(Scan {
@@ -4885,6 +5080,7 @@ impl Journal {
                 valid_len: start.min(scan_end),
                 truncated_tail: false,
                 base_lsn,
+                base_sequence,
                 consumed_tail: Vec::new(),
                 group_ends: Vec::new(),
             });
@@ -4893,9 +5089,15 @@ impl Journal {
         let mut tail = Vec::new();
         file.take(scan_end.saturating_sub(start))
             .read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, || {
-            read_durable_len_from_header(&header, len)
-        })
+        scan_groups_from(
+            &tail,
+            start,
+            0,
+            expected_lsn,
+            base_lsn,
+            base_sequence,
+            || read_durable_len_from_header(&header, len),
+        )
     }
 
     /// Read up to `max_len` bytes of the segment ending at `end_offset` from an
@@ -5371,6 +5573,18 @@ impl Journal {
         self.next_sequence
     }
 
+    /// A no-op reclaim result for a rewrite that must wait until a newer group
+    /// is durable and covered by the pre-sync hook.
+    fn skipped_reclaim(&self) -> Reclaim {
+        Reclaim {
+            retained_groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
+            retained_bytes: self
+                .file_len
+                .saturating_sub(u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX)),
+            ..Default::default()
+        }
+    }
+
     /// Compact this segment, dropping committed groups the checkpoint has
     /// already materialized.
     ///
@@ -5596,6 +5810,7 @@ impl Journal {
                 first.sequence,
                 first.first_lsn,
                 new_base_lsn,
+                first.sequence,
                 || u64::MAX,
             ) else {
                 return self.reclaim_through_scan(covered_lsn);
@@ -6179,6 +6394,7 @@ fn scan_bytes(
         base_sequence,
         base_lsn,
         base_lsn,
+        base_sequence,
         durable_len,
     )
 }
@@ -6289,6 +6505,7 @@ fn scan_groups_from(
     mut expected_sequence: u64,
     mut expected_lsn: u64,
     segment_base_lsn: u64,
+    segment_base_sequence: u64,
     durable_len: impl Fn() -> u64,
 ) -> io::Result<Scan> {
     let mut cursor = 0usize;
@@ -6348,6 +6565,7 @@ fn scan_groups_from(
         valid_len,
         truncated_tail,
         base_lsn: segment_base_lsn,
+        base_sequence: segment_base_sequence,
         consumed_tail,
         group_ends,
     })

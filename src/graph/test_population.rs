@@ -12,7 +12,8 @@ use std::path::PathBuf;
 const SCOPE: [u8; 16] = [0x61; 16];
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-population-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-population-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
@@ -74,7 +75,7 @@ fn an_empty_store_has_an_empty_population() {
     let root = test_root("empty");
     let db = Database::open(root.clone()).unwrap();
     let snapshot = index().population_snapshot(&db).unwrap();
-    assert!(snapshot.is_empty());
+    assert!(snapshot.is_empty(), "value should be empty");
     assert_eq!(snapshot.manifest_version(), 0);
     assert_eq!(snapshot.owner_seq_ceiling(), 1);
     drop(db);

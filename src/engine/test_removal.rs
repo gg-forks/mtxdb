@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-removal-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-removal-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
@@ -105,7 +106,7 @@ fn a_metadata_less_removed_frame_round_trips_on_the_flag_alone() {
         .unwrap()
         .unwrap();
     assert!(decoded.metadata.is_some_and(|metadata| metadata.removed));
-    assert!(decoded.data.is_empty());
+    assert!(decoded.data.is_empty(), "value should be empty");
 }
 
 /// With a metadata block present the flag and the block both survive.

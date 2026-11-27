@@ -56,14 +56,12 @@
 
 /// Transitive auth closures: pure in-memory computation plus the persisted
 /// generation layer, both under `bitmaps`.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/auth_closure.rs"]
 pub mod auth_closure;
 /// Named application-owned lookup indexes sharing the normal packfile engine.
 #[path = "graph/auxiliary.rs"]
 pub mod auxiliary;
 /// Domain-tagged `u32` bitmap sets with generic set algebra.
-#[cfg(feature = "bitmaps")]
 #[path = "graph/bitmap_set.rs"]
 pub mod bitmap_set;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
@@ -87,6 +85,12 @@ pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
 #[path = "engine/database.rs"]
 pub mod database;
+/// Ordinal-universe tag shared by bitmap sets and ordered indexes.
+#[path = "graph/domain_tag.rs"]
+pub mod domain_tag;
+/// Journaled write-ahead log of event edges, replayed into the CSR after a crash.
+#[path = "matrix/edge_log.rs"]
+pub mod edge_log;
 #[path = "matrix/export_schema.rs"]
 pub mod export_schema;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
@@ -117,18 +121,23 @@ mod io;
 #[path = "engine/journal.rs"]
 pub mod journal;
 /// Content-addressed state lattice checkpoint/chain codec.
-#[cfg(feature = "state-lattice")]
 #[path = "matrix/lattice.rs"]
 pub mod lattice;
 /// Database-root layout and named independent packfile pools.
 #[path = "engine/layout.rs"]
 pub mod layout;
+/// mtxdb's optional tracing macros and stderr subscriber.
+#[cfg(feature = "logging")]
+pub mod logging;
 /// Stable logical-ID to current physical-record pointers.
 #[path = "graph/logical_head.rs"]
 pub mod logical_head;
 /// Matrix-specific room-version policy.
 #[path = "matrix/matrix_policy.rs"]
 pub mod matrix_policy;
+/// Matrix event timeline key layouts over the generic ordered sidecar tree.
+#[path = "matrix/ordered_timeline.rs"]
+pub mod ordered_timeline;
 /// On-disk packfile format and the storage engine built on top of it.
 #[path = "engine/packfile/mod.rs"]
 pub mod packfile;
@@ -140,11 +149,9 @@ pub mod population;
 #[path = "engine/record_class.rs"]
 pub mod record_class;
 /// Public façade and error surface over a room's auth closures.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/room_auth.rs"]
 pub mod room_auth;
 /// Room-scoped flag and disposition bitmap index.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/room_flag.rs"]
 pub mod room_flag;
 /// Rebuildable full-text and field secondary indexes.
@@ -178,10 +185,8 @@ pub mod template;
 #[path = "graph/timeline.rs"]
 pub mod timeline;
 
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_auth_closure.rs"]
 mod test_auth_closure;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "graph/test_bitmap_set.rs"]
 mod test_bitmap_set;
 #[cfg(test)]
@@ -200,10 +205,8 @@ mod test_logical_head;
 #[cfg(feature = "reconcile")]
 #[path = "graph/test_population.rs"]
 mod test_population;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_flag.rs"]
 mod test_room_flag;
 #[cfg(test)]
@@ -218,23 +221,24 @@ mod test_short_id;
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
 };
-#[cfg(feature = "bitmaps")]
-pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
-pub use cache::{LruCache, NodeCache};
+pub use bitmap_set::{BitmapSet, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
+pub use cache::{CacheBudget, LruCache, NodeCache};
 pub use config::{ConfigError, RuntimeConfig};
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };
+pub use domain_tag::DomainTag;
 pub use index::LossyIndex;
 pub use interop::{
     commit_state_batches, decode_import_marker, decode_server_key, decode_state_root_handle_v1,
     decode_verdict, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
-    encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, notary_record_id, room_flag_collection_id,
-    room_roots_collection_id, room_state_collection_id, room_state_root_node_id,
-    server_keys_collection_id, state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict,
-    DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
-    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
+    encode_verdict, event_id_ref, event_record_id, event_state_root_node_id,
+    event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
+    notary_record_id, room_flag_collection_id, room_roots_collection_id, room_scope_id,
+    room_state_collection_id, room_state_root_node_id, server_keys_collection_id,
+    state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict, DATA_FORMAT, KEY_RECORD_VERSION,
+    MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL, STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS,
+    VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{
@@ -270,7 +274,6 @@ pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
 pub use rezzy::hamt;
 #[cfg(feature = "reconcile")]
 pub use rezzy_recon as recon;
-#[cfg(feature = "bitmaps")]
 pub use room_flag::{
     flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY, FLAG_META_ID,
     FLAG_META_MAGIC, FLAG_META_VERSION,
@@ -295,14 +298,15 @@ pub use template::{
     CollectionMetadata, CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy,
     PayloadPolicy, RecordIdentityRule, COLLECTION_METADATA_RECORD_ID,
     COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
-    MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV,
-    MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT,
-    NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV,
-    NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
+    MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_ORDX,
+    MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH,
+    NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL,
+    NAMESPACE_BIAS_ORDX, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };
 pub use timeline::{
-    event_id_ref, room_scope_id, timeline_collection_id, EventRef, TimelineCursor, TimelineEntry,
-    TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+    ordered_collection_id, timeline_collection_id, EventRef, KeyTag, OrderedCursor, OrderedIndex,
+    OrderedKey, OrderedPage, ScopedSeqKey, TimelineCursor, TimelineEntry, TimelineIndex,
+    TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
 
 #[cfg(test)]

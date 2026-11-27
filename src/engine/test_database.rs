@@ -9,54 +9,86 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-shared-db-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-shared-db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
 
 #[test]
-fn paged_residency_is_rejected_before_the_root_is_created() {
+fn point_mapping_config_reaches_database_and_standalone_pools() {
+    for (point_enabled, index_enabled) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let root = test_root(&format!(
+            "config-point-mapping-{point_enabled}-{index_enabled}"
+        ));
+        let config = RuntimeConfig {
+            point_random_mmap: point_enabled,
+            ordered_index_point_random_mmap: index_enabled,
+            ..RuntimeConfig::default()
+        };
+        let database = Database::open_with_config(root.clone(), config).unwrap();
+        for shard in ShardType::ALL {
+            assert_eq!(
+                database.pool(shard).read_plan_policy().point_random_mmap,
+                point_enabled,
+                "{shard:?}"
+            );
+            assert_eq!(
+                database
+                    .pool(shard)
+                    .read_plan_policy()
+                    .point_random_mmap_index,
+                index_enabled,
+                "{shard:?}"
+            );
+        }
+        drop(database);
+
+        let standalone = root.join("standalone");
+        let writer = PackfileStorage::open_with_config(standalone.clone(), &config).unwrap();
+        assert_eq!(writer.read_plan_policy().point_random_mmap, point_enabled);
+        assert_eq!(
+            writer.read_plan_policy().point_random_mmap_index,
+            index_enabled
+        );
+        drop(writer);
+        let reader = PackfileStorage::open_read_only_with_config(standalone, &config).unwrap();
+        assert_eq!(reader.read_plan_policy().point_random_mmap, point_enabled);
+        assert_eq!(
+            reader.read_plan_policy().point_random_mmap_index,
+            index_enabled
+        );
+        drop(reader);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn paged_residency_is_supported_with_the_shared_wal() {
     let root = test_root("config-paged-before-io");
     let config = RuntimeConfig {
         index_residency: Some(IndexResidency::Paged),
         ..RuntimeConfig::default()
     };
-    let Err(error) = Database::open_with_config(root.clone(), config) else {
-        panic!("paged residency must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("cannot be used with Database/shared WAL"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !root.exists(),
-        "validation must run before the layout creates the root"
-    );
+    let db = Database::open_with_config(root.clone(), config)
+        .expect("Paged residency must work with shared-WAL pools");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
+fn a_paged_pool_policy_is_supported_with_the_shared_wal() {
     let root = test_root("policy-paged-before-io");
     let policy = PoolPolicy {
         index_residency: IndexResidency::Paged,
         ..PoolPolicy::default()
     };
-    let Err(error) = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
-    else {
-        panic!("paged residency must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("cannot use shared WAL journaling"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !root.exists(),
-        "validation must run before the layout creates the root"
-    );
+    let db = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
+        .expect("Paged pool policies must work with shared-WAL pools");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1800,6 +1832,98 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
     let _ = std::fs::remove_dir_all(image);
 }
 
+/// A shared-WAL barrier syncs the journal globally, but a Paged pool only
+/// reports coverage after its own packs and versions file are durable. The
+/// first crash image therefore has to replay the other pool's WAL-only write;
+/// after both pools sync, the second image has to recover from their Paged
+/// baselines with the WAL reclaimed.
+#[test]
+fn paged_shared_wal_crash_images_preserve_each_pool_across_partial_barriers() {
+    let root = test_root("paged_shared_wal_cut_source");
+    let first_image = test_root("paged_shared_wal_cut_one_pool_synced");
+    let second_image = test_root("paged_shared_wal_cut_all_pools_synced");
+    let collection = [0x6f; 16];
+    let state_node = [0x31; 16];
+    let event_node = [0x42; 16];
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root.clone(), config).unwrap();
+    db.coordinator().set_reclaim_trigger_len(1);
+    db.state()
+        .put(
+            &collection,
+            &state_node,
+            &NodeData::from_slice(b"paged state"),
+        )
+        .unwrap();
+    db.event_dag()
+        .put(
+            &collection,
+            &event_node,
+            &NodeData::from_slice(b"paged event"),
+        )
+        .unwrap();
+
+    // This commits both writes to the shared WAL, but only State's Paged
+    // baseline is made durable, so the retained WAL must recover EventDag.
+    db.state().sync().unwrap();
+    crash_image(&db, &root, &first_image);
+    let recovered = Database::open_with_config(first_image.clone(), config).unwrap();
+    assert_eq!(
+        recovered
+            .state()
+            .get(&collection, &state_node)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"paged state"
+    );
+    assert_eq!(
+        recovered
+            .event_dag()
+            .get(&collection, &event_node)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"paged event",
+        "the other pool's durable WAL group must replay after its pack is cut"
+    );
+    drop(recovered);
+
+    // Once EventDag's own packs and versions are durable, both pools cover
+    // the shared group and the WAL can be reclaimed safely.
+    db.event_dag().sync().unwrap();
+    assert!(
+        Journal::scan_read_only(db.layout().shared_wal_path())
+            .unwrap()
+            .groups
+            .is_empty(),
+        "both Paged baselines should let the shared WAL reclaim the covered group"
+    );
+    crash_image(&db, &root, &second_image);
+    let recovered = Database::open_with_config(second_image.clone(), config).unwrap();
+    assert!(recovered
+        .state()
+        .get(&collection, &state_node)
+        .unwrap()
+        .is_some());
+    assert!(recovered
+        .event_dag()
+        .get(&collection, &event_node)
+        .unwrap()
+        .is_some());
+
+    drop(recovered);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(first_image);
+    let _ = std::fs::remove_dir_all(second_image);
+}
+
 /// The same lag, but the database can make the silent pool checkpoint. Once
 /// the segment reaches the emergency zone it does, reclaim succeeds, and no
 /// commit ever fails. The full-scale policy loop lives in
@@ -2198,7 +2322,7 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
         .scan_collection_at_snapshot(&collection)
         .unwrap();
     let scanned = scan.collect::<Result<Vec<_>, _>>().unwrap();
-    assert!(!scanned.is_empty());
+    assert!(!scanned.is_empty(), "value should not be empty");
     assert!(db
         .pool(pool)
         .recheck_collection_version(&collection, scan_version)
@@ -3458,6 +3582,157 @@ fn record_versions_are_stable_and_survive_reopen() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn transaction_counter_increment_batches_and_reads_its_staged_view() {
+    let root = test_root("counter_increment_batch");
+    let db = Database::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x7au8; 16];
+    let missing = node(1);
+    let removed = node(2);
+    let seed = db.begin_transaction();
+    seed.put(
+        pool,
+        collection,
+        removed,
+        &NodeData::from_slice(&9i64.to_be_bytes()),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+
+    let txn = db.begin_transaction();
+    txn.remove(pool, collection, removed).unwrap();
+    let values = txn
+        .increment_counters(
+            pool,
+            collection,
+            &[(missing, 1), (missing, 2), (removed, 4)],
+        )
+        .unwrap();
+    assert_eq!(values, [1, 3, 4]);
+    let own = txn.get(pool, &collection, &[missing, removed]).unwrap();
+    assert_eq!(
+        i64::from_be_bytes(own[0].as_ref().unwrap().bytes[..].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        i64::from_be_bytes(own[1].as_ref().unwrap().bytes[..].try_into().unwrap()),
+        4
+    );
+    txn.commit().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn transaction_counter_reuses_an_existing_record_expectation() {
+    let root = test_root("counter_reuse_expectation");
+    let db = Database::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x7bu8; 16];
+    let key = node(1);
+    let txn = db.begin_transaction();
+    let (_, versions) = txn
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    txn.expect_record_version(pool, collection, key, versions[0])
+        .unwrap();
+    assert_eq!(txn.stage.record_expectations().len(), 1);
+    assert_eq!(
+        txn.increment_counters(pool, collection, &[(key, 1)])
+            .unwrap(),
+        [1]
+    );
+    assert_eq!(txn.stage.record_expectations().len(), 1);
+    txn.commit().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn transaction_counter_blind_put_detects_a_concurrent_writer() {
+    let root = test_root("counter_blind_put_conflict");
+    let db = Database::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x7cu8; 16];
+    let key = node(1);
+    let blind = db.begin_transaction();
+    blind
+        .put(
+            pool,
+            collection,
+            key,
+            &NodeData::from_slice(&5i64.to_be_bytes()),
+        )
+        .unwrap();
+    assert_eq!(
+        blind
+            .increment_counters(pool, collection, &[(key, 1)])
+            .unwrap(),
+        [6]
+    );
+
+    let writer = db.begin_transaction();
+    writer
+        .put(
+            pool,
+            collection,
+            key,
+            &NodeData::from_slice(&20i64.to_be_bytes()),
+        )
+        .unwrap();
+    writer.commit().unwrap();
+    assert!(blind.commit().unwrap_err().is_stale_read());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn transaction_counter_rejects_corruption_and_overflow_without_partial_staging() {
+    let root = test_root("counter_corrupt_overflow");
+    let db = Database::open(root.clone()).unwrap();
+    let pool = ShardType::State;
+    let collection = [0x7du8; 16];
+    let good = node(1);
+    let corrupt = node(2);
+    let overflow = node(3);
+    let seed = db.begin_transaction();
+    seed.put(pool, collection, corrupt, &NodeData::from_slice(b"bad"))
+        .unwrap();
+    seed.put(
+        pool,
+        collection,
+        overflow,
+        &NodeData::from_slice(&i64::MAX.to_be_bytes()),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+
+    let txn = db.begin_transaction();
+    assert!(matches!(
+        txn.increment_counters(pool, collection, &[(good, 1), (corrupt, 1)]),
+        Err(crate::storage::StorageError::Corrupt(_))
+    ));
+    assert_eq!(txn.stage.record_expectations(), []);
+    assert!(txn.get(pool, &collection, &[good]).unwrap()[0].is_none());
+    assert!(matches!(
+        txn.increment_counters(pool, collection, &[(overflow, 1)]),
+        Err(crate::storage::StorageError::Corrupt(_))
+    ));
+    assert_eq!(txn.stage.record_expectations(), []);
+    assert_eq!(
+        txn.get(pool, &collection, &[overflow]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        i64::MAX.to_be_bytes()
+    );
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A record the live map does not know (its WAL group was reclaimed) is seeded
 /// from its frame's own `last_write_lsn`.
 #[test]
@@ -4466,4 +4741,182 @@ fn reclaim_trigger_config_reaches_the_journal_coordinator() {
         ..RuntimeConfig::default()
     };
     assert!(Database::open_with_config(root, bad).is_err());
+}
+
+fn counter_value(db: &Database, pool: ShardType, collection: [u8; 16], key: NodeId) -> Option<i64> {
+    let txn = db.begin_transaction();
+    let records = txn.get(pool, &collection, &[key]).unwrap();
+    payload_of(records[0].as_ref()).map(|b| i64::from_be_bytes(b.try_into().unwrap()))
+}
+
+#[test]
+fn increment_counters_applies_duplicates_in_order_from_zero() {
+    let root = test_root("incr_dups");
+    let db = Database::open(root.clone()).unwrap();
+    let (pool, collection) = (ShardType::State, [0x91u8; 16]);
+    let (a, b) = (node(1), node(2));
+
+    let txn = db.begin_transaction();
+    let out = txn
+        .increment_counters(pool, collection, &[(a, 1), (b, 5), (a, 2), (b, -7)])
+        .unwrap();
+    assert_eq!(out, vec![1, 5, 3, -2]);
+    assert_eq!(txn.increment_counters(pool, collection, &[]).unwrap(), []);
+    txn.commit().unwrap();
+
+    assert_eq!(counter_value(&db, pool, collection, a), Some(3));
+    assert_eq!(counter_value(&db, pool, collection, b), Some(-2));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn increment_counters_treats_removed_counter_as_zero_and_rejects_corrupt() {
+    let root = test_root("incr_corrupt");
+    let db = Database::open(root.clone()).unwrap();
+    let (pool, collection) = (ShardType::State, [0x92u8; 16]);
+    let (gone, bad, big) = (node(1), node(2), node(3));
+
+    let seed = db.begin_transaction();
+    seed.increment_counters(pool, collection, &[(gone, 4)])
+        .unwrap();
+    seed.put(pool, collection, bad, &data(b"abc")).unwrap();
+    seed.put(
+        pool,
+        collection,
+        big,
+        &NodeData::new(bytes::Bytes::copy_from_slice(&i64::MAX.to_be_bytes())),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+
+    let txn = db.begin_transaction();
+    txn.delete_collection(pool, collection).unwrap();
+    assert_eq!(
+        txn.increment_counters(pool, collection, &[(gone, 2)])
+            .unwrap(),
+        vec![2],
+        "a staged delete hides the live counter"
+    );
+    drop(txn);
+
+    let txn = db.begin_transaction();
+    let err = txn
+        .increment_counters(pool, collection, &[(gone, 1), (bad, 1)])
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::storage::StorageError::Corrupt(_)),
+        "{err:?}"
+    );
+    assert!(txn
+        .increment_counters(pool, collection, &[(big, 1)])
+        .is_err());
+    txn.commit().unwrap();
+    assert_eq!(
+        counter_value(&db, pool, collection, gone),
+        Some(4),
+        "a failed batch must not leave partial staged writes"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn increment_counters_after_blind_put_still_conflicts_with_concurrent_writer() {
+    let root = test_root("incr_blind");
+    let db = Database::open(root.clone()).unwrap();
+    let (pool, collection, key) = (ShardType::State, [0x93u8; 16], node(1));
+
+    let seed = db.begin_transaction();
+    seed.increment_counters(pool, collection, &[(key, 10)])
+        .unwrap();
+    seed.commit().unwrap();
+
+    let stale = db.begin_transaction();
+    stale
+        .put(
+            pool,
+            collection,
+            key,
+            &NodeData::new(bytes::Bytes::copy_from_slice(&0i64.to_be_bytes())),
+        )
+        .unwrap();
+    assert!(!stale.stage.has_record_expectation(pool, &collection, &key));
+    stale
+        .increment_counters(pool, collection, &[(key, 1)])
+        .unwrap();
+    assert!(stale.stage.has_record_expectation(pool, &collection, &key));
+
+    let concurrent = db.begin_transaction();
+    concurrent
+        .increment_counters(pool, collection, &[(key, 5)])
+        .unwrap();
+    concurrent.commit().unwrap();
+
+    assert!(stale.commit().unwrap_err().is_stale_read());
+    assert_eq!(counter_value(&db, pool, collection, key), Some(15));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn increment_counters_reuses_existing_expectation() {
+    let root = test_root("incr_reuse");
+    let db = Database::open(root.clone()).unwrap();
+    let (pool, collection, key) = (ShardType::State, [0x94u8; 16], node(1));
+
+    let seed = db.begin_transaction();
+    seed.increment_counters(pool, collection, &[(key, 1)])
+        .unwrap();
+    seed.commit().unwrap();
+
+    let txn = db.begin_transaction();
+    let (_, versions) = txn
+        .get_with_record_versions(pool, &collection, &[key])
+        .unwrap();
+    txn.expect_record_version(pool, collection, key, versions[0])
+        .unwrap();
+    txn.increment_counters(pool, collection, &[(key, 1)])
+        .unwrap();
+    txn.increment_counters(pool, collection, &[(key, 1)])
+        .unwrap();
+    assert_eq!(
+        txn.stage
+            .record_expectations()
+            .iter()
+            .filter(|e| e.node_id == key)
+            .count(),
+        1
+    );
+    txn.commit().unwrap();
+    assert_eq!(counter_value(&db, pool, collection, key), Some(3));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn increment_counters_overflow_errors_without_staging() {
+    let root = test_root("incr_overflow");
+    let db = Database::open(root.clone()).unwrap();
+    let (pool, collection, key) = (ShardType::State, [0x95u8; 16], node(1));
+
+    let seed = db.begin_transaction();
+    seed.put(
+        pool,
+        collection,
+        key,
+        &NodeData::new(bytes::Bytes::copy_from_slice(&i64::MAX.to_be_bytes())),
+    )
+    .unwrap();
+    seed.commit().unwrap();
+
+    let txn = db.begin_transaction();
+    assert!(txn
+        .increment_counters(pool, collection, &[(key, 1)])
+        .is_err());
+    assert!(!txn.stage.has_record_expectation(pool, &collection, &key));
+    txn.commit().unwrap();
+    assert_eq!(counter_value(&db, pool, collection, key), Some(i64::MAX));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }

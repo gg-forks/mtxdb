@@ -47,7 +47,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::time::{Instant, SystemTime};
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -63,6 +65,13 @@ const SEGMENT_VERSION: u8 = 1;
 const MAX_READ_ATTEMPTS: usize = 16;
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".csr";
+/// Upper bound on one buffered read of a family's contiguous row span. A row
+/// larger than this is still read whole, so the buffer is at most one row over.
+#[cfg(not(test))]
+const FAMILY_READ_CHUNK: usize = 4 * 1024 * 1024;
+/// Tests use a tiny cap so a handful of rows exercises several chunks.
+#[cfg(test)]
+const FAMILY_READ_CHUNK: usize = 512;
 const TAIL_FILE: &str = "tail.log";
 
 /// Seal once the tail reaches this many bytes.
@@ -147,7 +156,10 @@ impl CsrWriter<'_> {
         self.store.append_rows(scope, rows)
     }
 
-    /// Append while the caller holds [`CsrStore::with_write_lock`].
+    /// Append and sync while the caller holds [`CsrStore::with_write_lock`].
+    /// Only tests need the sync-inside-the-lock form; production appends use
+    /// [`Self::append_rows_deferred_locked`] and sync after releasing the lock.
+    #[cfg(test)]
     pub(crate) fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
         self.store.append_rows_locked(scope, rows, true)
     }
@@ -172,6 +184,11 @@ impl CsrWriter<'_> {
         self.store.purge_scope(scope)
     }
 
+    /// Append a purge while the caller already holds the store's write lock.
+    pub(crate) fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+        self.store.purge_scope_locked(scope)
+    }
+
     /// Fold the tail into a new immutable segment.
     ///
     /// # Errors
@@ -190,8 +207,29 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Whether this thread's last tail sync ran while the store's write lock
+    /// was held (by any thread). Tests assert a durable append releases the
+    /// lock before it syncs, so overlapping readers never wait on the flush.
+    static LAST_SYNC_HELD_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 fn count_tail_sync() {
     TAIL_SYNCS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Tail syncs issued by the current thread (test builds only).
+#[cfg(test)]
+pub(crate) fn test_tail_syncs() -> usize {
+    TAIL_SYNCS.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread's most recent tail sync ran under the store's
+/// write lock (test builds only).
+#[cfg(test)]
+pub(crate) fn test_last_sync_held_lock() -> bool {
+    LAST_SYNC_HELD_LOCK.with(std::cell::Cell::get)
 }
 
 impl CsrStore {
@@ -227,7 +265,10 @@ impl CsrStore {
     /// Readers may overlap each other.
     fn with_read_lock<R>(&self, operation: impl FnOnce() -> R) -> R {
         let lock = self.store_lock();
+        let waited = Instant::now();
         let _guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+        READ_LOCK_WAITS.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&READ_LOCK_WAIT_NANOS, waited);
         operation()
     }
 
@@ -266,14 +307,25 @@ impl CsrStore {
 
     /// Append changed rows and sync the tail.
     ///
+    /// The rows are written under the store's write lock and the tail is
+    /// synced after releasing it: holding the lock across `fsync` would stall
+    /// every overlapping reader for the length of the flush. This returns only
+    /// after the rows are durable.
+    ///
     /// Empty input does nothing and does not create the store directory.
     ///
     /// # Errors
     /// I/O errors, or a row with more than `u32::MAX` edges.
     pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let lock = self.store_lock();
-        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
-        self.append_rows_locked(scope, rows, true)
+        {
+            let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+            self.append_rows_locked(scope, rows, false)?;
+        }
+        self.sync_tail()
     }
 
     /// Make the tail's contents durable. Its directory entry was made durable
@@ -294,6 +346,8 @@ impl CsrStore {
             Ok(file) => {
                 #[cfg(test)]
                 let _trace = crate::test_trace::span("csr.tail_sync", &self.dir);
+                #[cfg(test)]
+                LAST_SYNC_HELD_LOCK.with(|held| held.set(self.store_lock().try_write().is_err()));
                 file.sync_data()?;
                 #[cfg(test)]
                 count_tail_sync();
@@ -366,7 +420,16 @@ impl CsrStore {
     }
 
     /// Append a purge while the caller holds this directory's write lock.
-    fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+    pub(crate) fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+        self.purge_scopes_locked(&[scope])
+    }
+
+    /// Append tombstones for several scopes and sync the tail once, while the
+    /// caller holds this directory's write lock.
+    pub(crate) fn purge_scopes_locked(&self, scopes: &[ScopeId]) -> io::Result<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
         fs::create_dir_all(&self.dir)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -380,15 +443,38 @@ impl CsrStore {
             file.set_len(valid)?;
         }
         file.seek(SeekFrom::End(0))?;
-        let payload = encode_row(scope, EdgeFamily::plain(0), 0, &[], true)?;
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &payload);
+        for scope in scopes {
+            let payload = encode_row(*scope, EdgeFamily::plain(0), 0, &[], true)?;
+            write_frame(&mut buffer, &payload);
+        }
         file.write_all(&buffer)?;
         file.sync_data()?;
         // Tombstones grow the tail like rows do, so a purge-only workload must
         // seal at the same threshold or the tail and its cache grow unbounded.
         self.maybe_seal()?;
         Ok(())
+    }
+
+    /// Every scope with rows in sealed segments or the verified tail.
+    pub(crate) fn all_scopes(&self) -> io::Result<std::collections::BTreeSet<[u8; 16]>> {
+        self.with_read_lock(|| {
+            let mut scopes = std::collections::BTreeSet::new();
+            for (_, path) in self.segments()? {
+                let (_, index_bytes, _, _) = open_segment(&path)?;
+                for entry in index_bytes.as_chunks::<SCOPE_ENTRY>().0 {
+                    let mut scope = [0_u8; 16];
+                    scope.copy_from_slice(&entry[..16]);
+                    scopes.insert(scope);
+                }
+            }
+            let (frames, _) = self.read_tail()?;
+            for frame in &frames {
+                let (scope, _, _, _, _) = decode_row(&frame.payload)?;
+                scopes.insert(scope.0);
+            }
+            Ok(scopes)
+        })
     }
 
     /// Apply the tail as a new immutable segment, then truncate the tail.
@@ -403,10 +489,48 @@ impl CsrStore {
 
     /// Seal while the caller holds this directory's write lock.
     fn seal_locked(&self) -> io::Result<()> {
+        self.replace_scopes_locked(&[])
+    }
+
+    /// Seal, replacing each listed scope's rows, while the caller holds this
+    /// directory's write lock. All listed scopes reach the directory together:
+    /// the new segment is published by one rename, so a crash before it leaves
+    /// every listed scope as it was.
+    ///
+    /// That is not the whole guarantee. The tail truncate below is unsynced,
+    /// and the process can stop between the rename and the truncate. Either
+    /// way the old tail survives, and it is applied after sealed segments, so
+    /// its rows override the new segment: rows the replacement deleted can
+    /// reappear, while rows that only lived in older sealed segments stay
+    /// replaced. The state is mixed, not old-or-new.
+    ///
+    /// Recovery is therefore mandatory before the store serves reads or writes.
+    /// Writes matter as much as reads: a reused short id could inherit a
+    /// resurrected orphan row. Recovery re-filters the existing rows against
+    /// the recovered id limits rather than rebuilding them from the log, so
+    /// running it again converges. It is not automatic: a caller must invoke it
+    /// after opening a writable store.
+    ///
+    /// The tail truncate is not synced here: a caller replacing rows must sync
+    /// the tail after.
+    pub(crate) fn replace_scopes_locked(
+        &self,
+        replacements: &[(ScopeId, Vec<RowRecord>)],
+    ) -> io::Result<()> {
         if !self.dir.is_dir() {
             return Ok(());
         }
-        let (records, valid) = self.read_tail()?;
+        let (mut records, valid) = self.read_tail()?;
+        // A tombstone then the survivors, grouped like tail records but never
+        // written to the tail, where a crash could keep only some of them.
+        for (scope, rows) in replacements {
+            let payload = encode_row(*scope, EdgeFamily::plain(0), 0, &[], true)?;
+            records.push(Frame { payload });
+            for row in rows {
+                let payload = encode_row(*scope, row.family, row.owner, &row.edges, false)?;
+                records.push(Frame { payload });
+            }
+        }
         let tail = self.tail_path();
         if records.is_empty() {
             if tail.exists() {
@@ -435,7 +559,9 @@ impl CsrStore {
         fs::rename(&temp, &target)?;
         sync_dir(&self.dir)?;
         // The segment is durable; only now is it safe to drop the tail.
-        OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
+        if tail.exists() {
+            OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
+        }
         Ok(())
     }
 
@@ -628,7 +754,63 @@ impl CsrStore {
         })
     }
 
+    /// The sealed segments in order, listing the directory only when it may
+    /// have changed.
+    ///
+    /// A listing is reused while the directory's identity and modification
+    /// time match the cached ones, and only if the directory was already
+    /// quiet for [`SEGMENT_CACHE_QUIET`] when it was listed. The quiet margin
+    /// covers coarse timestamps: a seal landing in the same timestamp tick as
+    /// the listing would otherwise leave a stale list that still matches.
     fn segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
+        let stamp = dir_stamp(&self.dir);
+        if let Some(stamp) = &stamp {
+            let cache = SEGMENT_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = cache.get(&self.dir) {
+                if entry.stamp == *stamp && entry.quiet {
+                    return Ok(entry.segments.clone());
+                }
+            }
+        }
+        // Judged before listing: the quiet margin must already have held when
+        // the listing began, not become true while it ran.
+        let quiet = stamp.as_ref().is_some_and(|stamp| {
+            SystemTime::now()
+                .duration_since(stamp.modified)
+                .is_ok_and(|age| age >= SEGMENT_CACHE_QUIET)
+        });
+        let started = Instant::now();
+        let listed = self.list_segments();
+        SEGMENT_LISTINGS.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&SEGMENT_LISTING_NANOS, started);
+        #[cfg(test)]
+        {
+            let mut counts = SEGMENT_LISTINGS_BY_DIR
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let count = counts.entry(self.dir.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        let segments = listed?;
+        // Stamp taken before the listing: a change during the listing makes
+        // the stamp differ on the next read, never the other way round.
+        if let Some(stamp) = stamp {
+            SEGMENT_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    self.dir.clone(),
+                    SegmentCacheEntry {
+                        stamp,
+                        quiet,
+                        segments: segments.clone(),
+                    },
+                );
+        }
+        Ok(segments)
+    }
+
+    fn list_segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
         if !self.dir.is_dir() {
             return Ok(Vec::new());
         }
@@ -670,34 +852,50 @@ impl CsrStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error),
         };
-        // Take the entry out so no lock is held across disk reads.
-        let cached = TAIL_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.dir);
-        let mut state = match cached {
-            Some(state) if state.valid <= len && state.generation == generation => state,
-            _ => TailState::default(),
-        };
+        // One shared entry per directory, locked for the read. A reader that
+        // arrives while another holds it waits for a short extension instead of
+        // finding no entry and re-decoding the whole tail from byte 0.
+        let entry = Arc::clone(
+            TAIL_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(self.dir.clone())
+                .or_default(),
+        );
+        let mut state = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.valid > len || state.generation != generation {
+            *state = TailState::default();
+        }
         state.generation = generation;
+        TAIL_READS.fetch_add(1, Ordering::Relaxed);
         if state.valid < len {
+            let decoding = Instant::now();
+            let from_start = state.valid == 0;
+            if from_start {
+                TAIL_FULL_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(test)]
+            if state.valid == 0 {
+                let mut counts = TAIL_FULL_DECODES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let count = counts.entry(self.dir.clone()).or_default();
+                *count = count.saturating_add(1);
+            }
             let (frames, valid) = self.read_tail_from(state.valid)?;
             for frame in &frames {
                 state.apply(&frame.payload)?;
             }
             state.valid = state.valid.saturating_add(valid as u64);
+            TAIL_DECODED_BYTES.fetch_add(valid as u64, Ordering::Relaxed);
+            add_nanos(&TAIL_DECODE_NANOS, decoding);
         }
         // A seal publishes a segment before truncating the tail. If its
         // sequence changed while we loaded the tail, this view is stale.
         if self.segment_generation()? != generation {
             return Ok(None);
         }
-        let result = read(&state);
-        TAIL_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.dir.clone(), state);
-        Ok(Some(result))
+        Ok(Some(read(&state)))
     }
 
     fn segment_generation(&self) -> io::Result<Option<u64>> {
@@ -903,7 +1101,107 @@ impl TailState {
     }
 }
 
-static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
+/// Process-wide read-path counters for the CSR stores, so a slow forward read
+/// can be attributed to lock wait, tail decoding or directory listings.
+static READ_LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+static READ_LOCK_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READS: AtomicU64 = AtomicU64::new(0);
+static TAIL_FULL_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TAIL_DECODED_BYTES: AtomicU64 = AtomicU64::new(0);
+static TAIL_DECODE_NANOS: AtomicU64 = AtomicU64::new(0);
+static SEGMENT_LISTINGS: AtomicU64 = AtomicU64::new(0);
+static SEGMENT_LISTING_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn add_nanos(counter: &AtomicU64, started: Instant) {
+    counter.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// A snapshot of the CSR read-path counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadStats {
+    /// Store read-lock acquisitions.
+    pub read_lock_waits: u64,
+    /// Total nanoseconds spent acquiring the store read lock.
+    pub read_lock_wait_nanos: u64,
+    /// Tail reads (`with_tail` calls that reached the cache).
+    pub tail_reads: u64,
+    /// Tail reads that had to decode from byte 0.
+    pub tail_full_decodes: u64,
+    /// Bytes decoded from the tail, extensions included.
+    pub tail_decoded_bytes: u64,
+    /// Total nanoseconds spent decoding the tail.
+    pub tail_decode_nanos: u64,
+    /// `read_dir` listings of a store directory.
+    pub segment_listings: u64,
+    /// Total nanoseconds spent listing store directories.
+    pub segment_listing_nanos: u64,
+}
+
+/// Snapshot the CSR read-path counters (cumulative since process start).
+#[must_use]
+pub fn read_stats() -> ReadStats {
+    ReadStats {
+        read_lock_waits: READ_LOCK_WAITS.load(Ordering::Relaxed),
+        read_lock_wait_nanos: READ_LOCK_WAIT_NANOS.load(Ordering::Relaxed),
+        tail_reads: TAIL_READS.load(Ordering::Relaxed),
+        tail_full_decodes: TAIL_FULL_DECODE_COUNT.load(Ordering::Relaxed),
+        tail_decoded_bytes: TAIL_DECODED_BYTES.load(Ordering::Relaxed),
+        tail_decode_nanos: TAIL_DECODE_NANOS.load(Ordering::Relaxed),
+        segment_listings: SEGMENT_LISTINGS.load(Ordering::Relaxed),
+        segment_listing_nanos: SEGMENT_LISTING_NANOS.load(Ordering::Relaxed),
+    }
+}
+
+/// How long a store directory must have been unchanged before a listing of it
+/// is trusted without listing again.
+const SEGMENT_CACHE_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Identity and modification time of a store directory. Creating, renaming or
+/// removing an entry in it changes the modification time.
+#[derive(Clone, PartialEq, Eq)]
+struct DirStamp {
+    modified: SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+struct SegmentCacheEntry {
+    stamp: DirStamp,
+    /// The directory had been unchanged for [`SEGMENT_CACHE_QUIET`] when it
+    /// was listed, so the stamp is a safe validator.
+    quiet: bool,
+    segments: Vec<(u64, PathBuf)>,
+}
+
+fn dir_stamp(dir: &Path) -> Option<DirStamp> {
+    let meta = fs::metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some(DirStamp {
+        modified: meta.modified().ok()?,
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&meta),
+    })
+}
+
+static SEGMENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, SegmentCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tests count directory listings per store.
+#[cfg(test)]
+static SEGMENT_LISTINGS_BY_DIR: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tests count reads that decoded a tail from byte 0.
+#[cfg(test)]
+static TAIL_FULL_DECODES: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<TailState>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One read/write lock per store directory, shared by every handle in the
@@ -965,11 +1263,6 @@ fn write_frame(out: &mut Vec<u8>, payload: &[u8]) {
 fn le_u32(data: &[u8], at: usize) -> Option<u32> {
     let bytes: [u8; 4] = data.get(at..at.checked_add(4)?)?.try_into().ok()?;
     Some(u32::from_le_bytes(bytes))
-}
-
-fn le_u16(data: &[u8], at: usize) -> Option<u16> {
-    let bytes: [u8; 2] = data.get(at..at.checked_add(2)?)?.try_into().ok()?;
-    Some(u16::from_le_bytes(bytes))
 }
 
 fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
@@ -1196,6 +1489,9 @@ fn apply_segment(
     if wanted.is_some() {
         return dir_cache::apply_point(path, scope, wanted, rows);
     }
+    if let Some(family) = family {
+        return dir_cache::apply_family(path, scope, family, rows);
+    }
     let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
     if let Some(dir) = read_scope_dir(
         path,
@@ -1262,13 +1558,20 @@ mod dir_cache {
 
     static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
 
-    pub(super) fn apply_point(
-        path: &Path,
-        scope: ScopeId,
-        wanted: Option<&HashSet<(u16, u32)>>,
-        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
-    ) -> io::Result<()> {
-        let mut file = File::open(path)?;
+    /// What one cache entry costs. A present directory keeps its entry count;
+    /// an absent one still holds its key and an `Option`, so it is never free
+    /// (otherwise a scan over many absent scopes would grow the map unbounded).
+    fn dir_charge(key: &CacheKey, dir: Option<&Arc<ScopeDir>>) -> usize {
+        dir.map_or_else(
+            || key.0.as_os_str().len().saturating_add(64),
+            |dir| dir.entries.len().max(1),
+        )
+    }
+
+    /// Open `path` and return its cached verified directory, if the segment
+    /// still has the identity the cached entry was built from.
+    fn cached_dir(path: &Path, scope: ScopeId) -> io::Result<(File, Option<Arc<ScopeDir>>)> {
+        let file = File::open(path)?;
         let stamp = stamp_of(&file)?;
         let key = (path.to_path_buf(), scope.0);
         let hit = CACHE
@@ -1291,22 +1594,46 @@ mod dir_cache {
                 scope,
             )?
             .map(Arc::new);
-            let size = dir.as_ref().map_or(0, |dir| dir.entries.len());
+            let size = dir_charge(&key, dir.as_ref());
             let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
             if cache.bytes.saturating_add(size) > CAP_BYTES {
                 cache.map.clear();
                 cache.bytes = 0;
             }
-            if let Some((_, old)) = cache.map.insert(key, (stamp, dir.clone())) {
-                cache.bytes = cache
-                    .bytes
-                    .saturating_sub(old.as_ref().map_or(0, |dir| dir.entries.len()));
+            if let Some((_, old)) = cache.map.insert(key.clone(), (stamp, dir.clone())) {
+                cache.bytes = cache.bytes.saturating_sub(dir_charge(&key, old.as_ref()));
             }
             cache.bytes = cache.bytes.saturating_add(size);
             dir
         };
+        Ok((file, dir))
+    }
+
+    pub(super) fn apply_point(
+        path: &Path,
+        scope: ScopeId,
+        wanted: Option<&HashSet<(u16, u32)>>,
+        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+    ) -> io::Result<()> {
+        let (mut file, dir) = cached_dir(path, scope)?;
         if let Some(dir) = dir {
             apply_scope_dir(&mut file, &dir, scope, wanted, None, rows)?;
+        }
+        Ok(())
+    }
+
+    /// Family reads reuse the verified immutable scope directory. Without
+    /// this cache every sparse family read rereads and checksums entries for
+    /// all the other families in the scope.
+    pub(super) fn apply_family(
+        path: &Path,
+        scope: ScopeId,
+        family: super::EdgeFamily,
+        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+    ) -> io::Result<()> {
+        let (mut file, dir) = cached_dir(path, scope)?;
+        if let Some(dir) = dir {
+            apply_scope_dir(&mut file, &dir, scope, None, Some(family), rows)?;
         }
         Ok(())
     }
@@ -1413,10 +1740,18 @@ fn read_family_directory(
     family_id: u16,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    for item in entries.as_chunks::<DIR_ENTRY>().0 {
-        if le_u16(item, 0) != Some(family_id) {
-            continue;
-        }
+    let directory = entries.as_chunks::<DIR_ENTRY>().0;
+    // Entries are encoded in `(family, owner)` order. Find this family's
+    // contiguous range so an empty family doesn't scan unrelated rows.
+    let start =
+        directory.partition_point(|item| u16::from_le_bytes([item[0], item[1]]) < family_id);
+    let end = directory.partition_point(|item| u16::from_le_bytes([item[0], item[1]]) <= family_id);
+    let selected = &directory[start..end];
+    let Some(first) = selected.first() else {
+        return Ok(());
+    };
+
+    let fields = |item: &[u8; DIR_ENTRY]| -> io::Result<(usize, usize, u32)> {
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1425,15 +1760,81 @@ fn read_family_directory(
                 "csr family directory entry is truncated",
             ));
         };
-        read_row_at(
-            file,
-            data_start,
-            data_len,
-            offset as usize,
-            len as usize,
-            crc,
-            rows,
-        )?;
+        Ok((offset as usize, len as usize, crc))
+    };
+
+    let (first_offset, first_len, _) = fields(first)?;
+    let mut expected_offset = first_offset
+        .checked_add(first_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    let mut contiguous = true;
+    for item in selected.iter().skip(1) {
+        let (offset, len, _) = fields(item)?;
+        if offset != expected_offset {
+            contiguous = false;
+        }
+        expected_offset = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    }
+
+    if !contiguous {
+        // Preserve the general reader's behavior for any valid future layout
+        // whose selected rows are not stored contiguously.
+        for item in selected {
+            let (offset, len, crc) = fields(item)?;
+            read_row_at(file, data_start, data_len, offset, len, crc, rows)?;
+        }
+        return Ok(());
+    }
+
+    if expected_offset > data_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "csr row out of range",
+        ));
+    }
+    // The rows are contiguous, so read them in bounded chunks on row
+    // boundaries (a row larger than the chunk is read alone) rather than one
+    // allocation for the whole family. Every row is still checksummed.
+    let out_of_range = || io::Error::new(io::ErrorKind::InvalidData, "csr row out of range");
+    let mut next = 0;
+    while next < selected.len() {
+        let (chunk_start, first_len, _) = fields(&selected[next])?;
+        let mut chunk_end = next.saturating_add(1);
+        let mut span = first_len;
+        while chunk_end < selected.len() {
+            let (_, len, _) = fields(&selected[chunk_end])?;
+            let prospective = span.checked_add(len).ok_or_else(out_of_range)?;
+            if prospective > FAMILY_READ_CHUNK {
+                break;
+            }
+            span = prospective;
+            chunk_end = chunk_end.saturating_add(1);
+        }
+        let mut batch = vec![0_u8; span];
+        let absolute_start = data_start
+            .checked_add(chunk_start)
+            .ok_or_else(out_of_range)?;
+        file.seek(SeekFrom::Start(absolute_start as u64))?;
+        file.read_exact(&mut batch)?;
+        for item in &selected[next..chunk_end] {
+            let (offset, len, crc) = fields(item)?;
+            let relative_start = offset.checked_sub(chunk_start).ok_or_else(out_of_range)?;
+            let relative_end = relative_start.checked_add(len).ok_or_else(out_of_range)?;
+            let row = batch
+                .get(relative_start..relative_end)
+                .ok_or_else(out_of_range)?;
+            if crc32fast::hash(row) != crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "csr row checksum mismatch",
+                ));
+            }
+            apply_payload(row, rows)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed csr row"))?;
+        }
+        next = chunk_end;
     }
     Ok(())
 }
@@ -1503,7 +1904,7 @@ mod tests {
         // each other's directory when they run in parallel.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_scratch::root().join(format!(
             "mtxdb-csr-store-{name}-{}-{unique}",
             std::process::id()
         ));
@@ -1581,6 +1982,129 @@ mod tests {
             store.append_rows(scope, &[row_for(owner, 9)]).unwrap();
         }
         assert_eq!(tail_syncs() - before, 3);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn durable_append_syncs_after_releasing_the_write_lock() {
+        let layout = layout("sync-outside-lock");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([5; 16]);
+        store.append_rows(scope, &[row_for(1, 9)]).unwrap();
+        assert!(
+            !test_last_sync_held_lock(),
+            "a durable append must release the write lock before it fsyncs"
+        );
+        // The probe really does see the lock: a sync issued under it reports so.
+        store.with_write_lock(|| store.sync_tail()).unwrap();
+        assert!(test_last_sync_held_lock());
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn concurrent_readers_share_one_decoded_tail() {
+        let layout = layout("shared-tail");
+        let store = Arc::new(CsrStore::open(&layout, ShardType::State));
+        let scope = ScopeId([7; 16]);
+        let batch: Vec<_> = (2..=400).map(|owner| row_for(owner, 9)).collect();
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &batch, false))
+            .unwrap();
+        let family = row_for(1, 9).family;
+        // Warm the cache, then count decodes from byte 0 across racing readers.
+        store.read_rows(scope, &[(family, 2)]).unwrap();
+        let decodes = |dir: &Path| {
+            TAIL_FULL_DECODES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(dir)
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = decodes(store.dir());
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for owner in 2..300 {
+                        let rows = store.read_rows(scope, &[(family, owner)]).unwrap();
+                        assert!(rows[0].is_some());
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            decodes(store.dir()),
+            before,
+            "readers must extend one shared decoded tail, not re-decode it"
+        );
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    fn listings(dir: &Path) -> usize {
+        SEGMENT_LISTINGS_BY_DIR
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dir)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_quiet_store_directory_is_listed_once_and_a_seal_is_still_seen() {
+        let layout = layout("segment-cache");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([8; 16]);
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &[row_for(1, 9)], false))
+            .unwrap();
+        let family = row_for(1, 9).family;
+        // The first read lists and caches; the rest must not list again.
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        // Mark the just-listed entry as quiet to exercise cache reuse without
+        // sleeping for the production quiet interval.
+        SEGMENT_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(store.dir())
+            .unwrap()
+            .quiet = true;
+        let before = listings(store.dir());
+        for _ in 0..50 {
+            assert!(store.read_rows(scope, &[(family, 1)]).unwrap()[0].is_some());
+        }
+        assert_eq!(listings(store.dir()), before, "a quiet directory is cached");
+        // A seal changes the directory, so the cache must notice at once and the
+        // sealed rows must still be read.
+        store.seal().unwrap();
+        assert!(store.read_rows(scope, &[(family, 1)]).unwrap()[0].is_some());
+        assert!(
+            listings(store.dir()) > before,
+            "a seal invalidates the cache"
+        );
+        assert_eq!(store.segments().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn a_recently_changed_directory_is_never_trusted_from_the_cache() {
+        let layout = layout("segment-cache-racy");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([9; 16]);
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &[row_for(1, 9)], false))
+            .unwrap();
+        store.seal().unwrap();
+        // Just changed, so every read lists again instead of risking a stale
+        // list inside one timestamp tick.
+        let family = row_for(1, 9).family;
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        let before = listings(store.dir());
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        assert!(listings(store.dir()) > before);
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -1720,6 +2244,148 @@ mod tests {
         let _ = fs::remove_dir_all(layout.root());
     }
 
+    /// Rows for three families in one scope: a typed family with edges, a plain
+    /// family with edges for some owners, and a plain family of empty rows.
+    fn mixed_family_rows() -> Vec<RowRecord> {
+        let mut rows = Vec::new();
+        for owner in 1..=200_u32 {
+            rows.push(RowRecord {
+                family: EdgeFamily::typed(3),
+                owner,
+                edges: vec![
+                    Edge {
+                        target: owner.saturating_add(1),
+                        kind: 1,
+                    },
+                    Edge {
+                        target: owner.saturating_add(2),
+                        kind: 2,
+                    },
+                ],
+            });
+            if owner % 2 == 0 {
+                rows.push(RowRecord {
+                    family: EdgeFamily::plain(1),
+                    owner,
+                    edges: vec![Edge {
+                        target: owner / 2,
+                        kind: 0,
+                    }],
+                });
+            }
+            rows.push(RowRecord {
+                family: EdgeFamily::plain(2),
+                owner,
+                edges: Vec::new(),
+            });
+        }
+        rows
+    }
+
+    fn sorted_family(
+        store: &CsrStore,
+        scope: ScopeId,
+        family: EdgeFamily,
+    ) -> Vec<(u32, Vec<(u32, u16)>)> {
+        let mut rows: Vec<(u32, Vec<(u32, u16)>)> = store
+            .read_family(scope, family)
+            .unwrap()
+            .into_iter()
+            .map(|(owner, edges)| {
+                (
+                    owner,
+                    edges.into_iter().map(|e| (e.target, e.kind)).collect(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn family_read_matches_point_reads_across_families() {
+        let layout = layout("family-batched");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([9; 16]);
+        let rows = mixed_family_rows();
+        for chunk in rows.chunks(37) {
+            store.append_rows(scope, chunk).unwrap();
+        }
+        // Once from the tail, then again from a sealed segment.
+        for sealed in [false, true] {
+            if sealed {
+                store.seal().unwrap();
+            }
+            for family in [
+                EdgeFamily::typed(3),
+                EdgeFamily::plain(1),
+                EdgeFamily::plain(2),
+            ] {
+                let expected: Vec<(u32, Vec<(u32, u16)>)> = {
+                    let mut e: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.family.id == family.id)
+                        .map(|r| {
+                            (
+                                r.owner,
+                                r.edges.iter().map(|e| (e.target, e.kind)).collect(),
+                            )
+                        })
+                        .collect();
+                    e.sort();
+                    e
+                };
+                let got = sorted_family(&store, scope, family);
+                assert_eq!(got, expected, "family {} sealed={sealed}", family.id);
+                // A point read of every owner agrees with the family read.
+                let keys: Vec<(EdgeFamily, u32)> =
+                    expected.iter().map(|(owner, _)| (family, *owner)).collect();
+                let points = store.read_rows(scope, &keys).unwrap();
+                for ((owner, edges), point) in expected.iter().zip(points) {
+                    let point: Vec<(u32, u16)> = point
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|e| (e.target, e.kind))
+                        .collect();
+                    assert_eq!(&point, edges, "owner {owner} family {}", family.id);
+                }
+            }
+            // A family with no rows reads as empty, not as an error.
+            assert_eq!(
+                store.read_family(scope, EdgeFamily::plain(9)).unwrap(),
+                Vec::new()
+            );
+        }
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn family_read_rejects_a_corrupted_sealed_row() {
+        let layout = layout("family-batched-corrupt");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([10; 16]);
+        let rows: Vec<RowRecord> = mixed_family_rows()
+            .into_iter()
+            .filter(|r| r.family.id == EdgeFamily::typed(3).id)
+            .collect();
+        store.append_rows(scope, &rows).unwrap();
+        store.seal().unwrap();
+        assert_eq!(
+            sorted_family(&store, scope, EdgeFamily::typed(3)).len(),
+            200
+        );
+        let segment = store.segments().unwrap().pop().unwrap().1;
+        let mut bytes = fs::read(&segment).unwrap();
+        let at = bytes.len() * 2 / 3;
+        bytes[at] ^= 0xFF;
+        fs::write(&segment, &bytes).unwrap();
+        let error = store
+            .read_family(scope, EdgeFamily::typed(3))
+            .expect_err("a flipped byte in a sealed row must not read back");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
     #[test]
     fn appends_and_reads_one_scope() {
         let layout = layout("roundtrip");
@@ -1773,7 +2439,10 @@ mod tests {
         store.seal().unwrap();
         assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 2);
         assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
-        assert!(store.read_scope(ScopeId([3; 16])).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(ScopeId([3; 16])).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -1898,7 +2567,10 @@ mod tests {
         // A tombstone in the new tail hides the sealed rows, only for its scope.
         store.purge_scope(scope).unwrap();
         assert_eq!(point(1), None);
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         assert_eq!(store.read_scope(other).unwrap().rows.len(), 1);
         // Rows recorded after the purge are visible again.
         store.append_rows(scope, &[row(7, 1)]).unwrap();
@@ -1914,9 +2586,15 @@ mod tests {
         store.append_rows(scope, &[row(2, 1)]).unwrap();
         store.seal().unwrap();
         store.purge_scope(scope).unwrap();
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         store.seal().unwrap();
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -1960,7 +2638,10 @@ mod tests {
         store.purge_scope(scope).unwrap();
         assert_eq!(tail_len(), 0, "the purge seals the tail");
         assert_eq!(store.segments().unwrap().len(), 1);
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -1984,7 +2665,10 @@ mod tests {
             writer.append_rows(scope, &[row(2, 1)]).unwrap();
             assert_eq!(store.read_scope(scope).unwrap().rows.len(), 1);
             writer.purge_scope(scope).unwrap();
-            assert!(store.read_scope(scope).unwrap().rows.is_empty());
+            assert!(
+                store.read_scope(scope).unwrap().rows.is_empty(),
+                "value should be empty"
+            );
         }
         let _ = fs::remove_dir_all(owner_root);
         let _ = fs::remove_dir_all(other_root);
@@ -2120,7 +2804,10 @@ mod tests {
         }
         for thread in 0..THREADS {
             let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
-            assert!(store.read_scope(purge_scope).unwrap().rows.is_empty());
+            assert!(
+                store.read_scope(purge_scope).unwrap().rows.is_empty(),
+                "value should be empty"
+            );
         }
         let _ = fs::remove_dir_all(layout.root());
     }
@@ -2228,7 +2915,10 @@ mod tests {
         store.seal().unwrap();
         store.purge_scope(scope).unwrap();
         // Prime the cache with the purge, then seal it into a new segment.
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let old_len = fs::metadata(store.tail_path()).unwrap().len();
         store.seal().unwrap();
         // Simulate another process refilling the tail until it is at least as

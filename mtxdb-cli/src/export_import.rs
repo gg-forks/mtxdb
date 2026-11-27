@@ -442,6 +442,23 @@ pub(crate) fn timeline_orderings(
     }
 }
 
+/// The event's `origin_server_ts` as a timeline key position. Synapse orders
+/// same-depth events by `COALESCE(origin_server_ts, 0)`, so an absent or
+/// non-integer value is `0`.
+pub(crate) fn timeline_origin_server_ts(event: &RoomEvent) -> i64 {
+    event
+        .pdu
+        .get("origin_server_ts")
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_u64()
+                    .map(|ts| i64::try_from(ts).unwrap_or(i64::MAX))
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// The rejection the source recorded, or `None` when the export carried no
 /// verdict at all. An absent verdict is not a claim that the event was
 /// accepted, so disagreement reporting must skip it.
@@ -2320,10 +2337,11 @@ pub(crate) fn write_room_with_resolved_findings(
         version_node,
     )?);
 
-    let room_scope = mtxdb::timeline::room_scope_id(room);
-    let timeline_index =
-        mtxdb::timeline::TimelineIndex::open(db.pool(EVENT_POOL).as_ref(), &export.room_id);
+    let room_scope = mtxdb::room_scope_id(room);
+    let (topo_index, stream_index) =
+        mtxdb::ordered_timeline::open_event_timeline_indexes(db.pool(EVENT_POOL).as_ref());
     let mut batch_timeline_entries = Vec::new();
+    let mut batch_payloads = Vec::new();
 
     for (position, event) in export.events.iter().enumerate() {
         let event_id = event.event_id.as_bytes();
@@ -2370,12 +2388,18 @@ pub(crate) fn write_room_with_resolved_findings(
                     export.room_id
                 );
             }
-            if !batch_timeline_entries.is_empty() {
-                timeline_index
-                    .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
-                    .context("staging room timeline index")?;
-                batch_timeline_entries.clear();
-            }
+            mtxdb::ordered_timeline::stage_event_timeline_batch(
+                &tx,
+                EVENT_POOL,
+                event_collection,
+                &batch_payloads,
+                &topo_index,
+                &stream_index,
+                &batch_timeline_entries,
+            )
+            .context("staging event payloads and timeline indexes")?;
+            batch_payloads.clear();
+            batch_timeline_entries.clear();
             tx.commit().context("committing an import batch")?;
             reclaim_journal(db)?;
             tx = db.begin_transaction();
@@ -2394,7 +2418,7 @@ pub(crate) fn write_room_with_resolved_findings(
         let locator_collection = event_locator_collection_id(&record);
         check_locator_collision(&tx, record, &event.event_id)?;
 
-        tx.put(EVENT_POOL, event_collection, record, &node(stored.to_vec()))?;
+        batch_payloads.push((record, node(stored.to_vec())));
         tx.put(
             EVENT_POOL,
             locator_collection,
@@ -2431,13 +2455,12 @@ pub(crate) fn write_room_with_resolved_findings(
         if let Some((topological_ordering, stream_ordering)) =
             timeline_orderings(export, event, rejected)
         {
-            let event_ref = mtxdb::timeline::event_id_ref(event_id);
-            batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
+            batch_timeline_entries.push(mtxdb::ordered_timeline::EventTimelineEntry::new(
                 room_scope,
                 topological_ordering,
+                timeline_origin_server_ts(event),
                 stream_ordering,
                 record,
-                event_ref,
             ));
         }
 
@@ -2445,11 +2468,16 @@ pub(crate) fn write_room_with_resolved_findings(
         written = written.saturating_add(1);
     }
 
-    if !batch_timeline_entries.is_empty() {
-        timeline_index
-            .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
-            .context("staging room timeline index")?;
-    }
+    mtxdb::ordered_timeline::stage_event_timeline_batch(
+        &tx,
+        EVENT_POOL,
+        event_collection,
+        &batch_payloads,
+        &topo_index,
+        &stream_index,
+        &batch_timeline_entries,
+    )
+    .context("staging event payloads and timeline indexes")?;
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
     crate::cmd::report_import_phase(
@@ -3338,7 +3366,7 @@ mod auth_findings_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         crate::sweep_stale_test_dirs();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb-closure-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3642,8 +3670,8 @@ mod auth_findings_tests {
     #[test]
     fn a_reclaim_shrinks_the_segment_and_clears_its_blockers() {
         crate::sweep_stale_test_dirs();
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb-reclaim-outcome-test-{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb-reclaim-outcome-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The trigger has to sit above an empty segment's header, or the
         // segment could never come back under it.
@@ -3713,7 +3741,7 @@ mod auth_findings_tests {
     fn events_survive_a_reopen_after_a_reclaim() {
         for barrier in [false, true] {
             crate::sweep_stale_test_dirs();
-            let dir = std::env::temp_dir().join(format!(
+            let dir = crate::test_scratch::root().join(format!(
                 "mtxdb-reclaim-test-{}-{barrier}",
                 std::process::id()
             ));

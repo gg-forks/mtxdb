@@ -127,6 +127,53 @@ fn poisoned_shard_refuses_append_and_flush() {
 }
 
 #[test]
+fn failed_flush_rollback_retires_both_mappings_and_allows_later_io() {
+    let dir = test_dir("point_mapping_flush_rollback");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let first = test_record(0x41, 0x01, b"committed before failure");
+    let (slot, first_offset) = pool.put_record(&first).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+
+    assert_eq!(
+        pool.read_at_mode(&shard, first_offset, true, true)
+            .unwrap()
+            .data,
+        first.data
+    );
+    assert!(shard.point_mmap.read().is_some());
+    assert!(shard.mmap().unwrap().is_some());
+
+    shard.fail_next_flush.store(true, Ordering::Release);
+    let failed = test_record(0x41, 0x02, b"must be rolled back");
+    let error = pool
+        .put_record(&failed)
+        .expect_err("injected flush failure must reach append rollback");
+    assert!(error.to_string().contains("injected test flush failure"));
+    assert!(shard.pending.lock().is_empty(), "value should be empty");
+    assert!(shard.point_mmap.read().is_none());
+    assert!(shard.mmap.read().is_none());
+
+    let later = test_record(0x41, 0x03, b"append after rollback");
+    let (later_slot, later_offset) = pool.put_record(&later).unwrap();
+    assert_eq!(later_slot, slot);
+    assert_eq!(
+        pool.read_at_mode(&shard, first_offset, true, true)
+            .unwrap()
+            .data,
+        first.data
+    );
+    assert_eq!(
+        pool.read_at_mode(&shard, later_offset, true, true)
+            .unwrap()
+            .data,
+        later.data
+    );
+
+    drop(pool);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn raw_reads_borrow_the_mmap_and_survive_a_remap() {
     let dir = test_dir("raw_read_mmap_owner");
     let pool = ShardPool::open(dir).unwrap();
@@ -174,7 +221,7 @@ fn record_disk_len_rejects_truncated_frame_body() {
 
     let len = shard.file.metadata().unwrap().len();
     // Windows refuses to truncate a file while any view of it is mapped.
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     shard.file.set_len(len - 1).unwrap();
 
     assert!(matches!(
@@ -186,7 +233,7 @@ fn record_disk_len_rejects_truncated_frame_body() {
 /// Overwrite bytes in a committed pack behind the mmap, so the next read sees
 /// them. Clearing the mapping first keeps the old snapshot from answering.
 fn corrupt_committed_bytes(shard: &Shard, offset: u64, bytes: &[u8]) {
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     crate::io::write_all_at(&shard.file, bytes, offset).unwrap();
 }
 
@@ -268,7 +315,7 @@ fn read_at_committed_rejects_bad_prefixes_flags_and_truncation() {
 
     let len = shard.file.metadata().unwrap().len();
     // Windows refuses to truncate a file while any view of it is mapped.
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     shard.file.set_len(len - 1).unwrap();
     let error = ShardPool::read_at_committed(&shard, offset, false)
         .expect_err("a frame whose tail is gone must be corrupt");
@@ -309,9 +356,9 @@ fn record_identity_at_rejects_a_damaged_removal_crc() {
 fn test_sync_dirty_noop_when_nothing_written() {
     let dir = test_dir("sync_dirty_noop");
     let pool = ShardPool::open(dir).unwrap();
-    assert!(pool.dirty.lock().is_empty());
+    assert!(pool.dirty.lock().is_empty(), "value should be empty");
     pool.sync_dirty().unwrap();
-    assert!(pool.dirty.lock().is_empty());
+    assert!(pool.dirty.lock().is_empty(), "value should be empty");
 }
 
 #[test]
@@ -2143,8 +2190,14 @@ fn seal_queue_skips_a_pack_retired_while_queued() {
     pool.wait_for_seals();
     let ready = pool.take_sealed_ready();
     assert_eq!(ready, vec![(packs[1].slot, packs[1].pack_id)]);
-    assert!(pool.seal_queue.state.lock().pending.is_empty());
-    assert!(pool.seal_queue.state.lock().outstanding.is_empty());
+    assert!(
+        pool.seal_queue.state.lock().pending.is_empty(),
+        "value should be empty"
+    );
+    assert!(
+        pool.seal_queue.state.lock().outstanding.is_empty(),
+        "value should be empty"
+    );
 }
 
 /// Dropping the pool drains submitted work and joins the workers.

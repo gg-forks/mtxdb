@@ -18,7 +18,7 @@ fn pack_id_for(n: u64) -> PackId {
 
 #[test]
 fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb_layout_{}_{}",
         std::process::id(),
         std::thread::current()
@@ -87,7 +87,7 @@ fn avoidable_spread_excludes_a_collections_required_spill() {
 
 #[test]
 fn physical_layout_ignores_unrelated_pack_files_but_rejects_bad_pool_packs() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb_layout_foreign_{}_{}",
         std::process::id(),
         std::thread::current()
@@ -97,7 +97,10 @@ fn physical_layout_ignores_unrelated_pack_files_but_rejects_bad_pool_packs() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("other-app.pack"), b"not an mdb pack").unwrap();
-    assert!(physical_layout(&dir).unwrap().packs.is_empty());
+    assert!(
+        physical_layout(&dir).unwrap().packs.is_empty(),
+        "value should be empty"
+    );
 
     std::fs::write(dir.join("pack_0000000000000000.pack"), b"not an mdb pack").unwrap();
     assert_eq!(

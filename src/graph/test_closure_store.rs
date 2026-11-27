@@ -12,7 +12,8 @@ const POOL: ShardType = ShardType::ServerInfo;
 const SCOPE: [u8; 16] = [0xC1; 16];
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-closure-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-closure-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
@@ -577,7 +578,7 @@ fn the_coverage_record_round_trips_and_a_zero_count_writes_none() {
     assert_eq!(complete.skipped_count, 0);
     assert!(complete.is_complete());
     let snapshot = store().snapshot(&db).unwrap().unwrap();
-    assert!(snapshot.skipped.is_empty());
+    assert!(snapshot.skipped.is_empty(), "value should be empty");
     assert_eq!(snapshot.skipped.runs(), &[]);
     assert!(store()
         .raw_coverage_record(&db, complete.generation)
@@ -687,7 +688,7 @@ fn snapshot_retries_when_the_head_moves_under_it() {
     let fresh = published.lock().unwrap().unwrap();
     assert_eq!(snapshot.head.generation, fresh.generation);
     assert_eq!(snapshot.head.count, 3);
-    assert!(snapshot.skipped.is_empty());
+    assert!(snapshot.skipped.is_empty(), "value should be empty");
 
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -706,7 +707,7 @@ fn a_complete_generation_costs_one_head_read_and_no_coverage_read() {
         1,
         "a complete generation reads the head once and skips the coverage record"
     );
-    assert!(snapshot.skipped.is_empty());
+    assert!(snapshot.skipped.is_empty(), "value should be empty");
 
     drop(db);
     let _ = std::fs::remove_dir_all(&root);

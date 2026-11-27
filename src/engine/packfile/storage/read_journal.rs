@@ -731,6 +731,19 @@ impl PackfileStorage {
             if overlay.last_epoch == Some(epoch) && overlay.last_revision == Some(revision) {
                 return Ok(ReadRefresh::Applied);
             }
+            // Reclaim can replace the segment while retaining exactly the
+            // same length (including an empty segment). The normal refresh
+            // detects a gap while scanning a changed-length file, but that
+            // path is skipped for an equal-length rewrite. The publish signal
+            // tells us when to inspect the small header; if its base advanced
+            // beyond this reader's durable coverage, rebuild the durable
+            // paged index before trusting the now-shorter journal history.
+            if overlay.observed_len != 0
+                && Journal::read_base_lsn_read_only(&overlay.path)?
+                    > overlay.covered.saturating_add(1)
+            {
+                return Ok(ReadRefresh::NeedsReload);
+            }
         }
         let before = overlay.scanned_bytes;
         let result = overlay.refresh(false);
@@ -761,12 +774,17 @@ impl PackfileStorage {
     /// Coverage is captured before the checkpoint is read, so the new bound can
     /// never be newer than the index loaded below.
     pub(super) fn reload_index_from_checkpoint(&self) -> bool {
-        // Paged mode keeps no primary-index checkpoint, and a resident
-        // checkpoint would re-materialize sealed locators. Fail closed here;
-        // the caller's durable-read path remains authoritative.
+        // Paged mode keeps no primary-index checkpoint. Rebuild its compact
+        // tail and sealed sidecar tables from durable packs instead.
         if self.index_residency == crate::index::IndexResidency::Paged {
-            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-            return false;
+            let Some(covered) = self.reload_paged_index_from_packs() else {
+                self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            self.read_covered_lsn.store(covered, Ordering::Release);
+            self.materialized_lsn.fetch_max(covered, Ordering::Release);
+            self.read_reloads.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         // A writer may have created new packs since this handle opened, and the
         // checkpoint it wrote names that new pack set. Rediscover before
@@ -800,6 +818,7 @@ impl PackfileStorage {
             Self::checkpoint_scan_out(
                 &self.base_dir,
                 self.cache_capacity,
+                self.cache_budget.as_ref(),
                 &self.shards,
                 &open_shards,
                 &deleted_collections,
@@ -845,6 +864,18 @@ impl PackfileStorage {
     /// On success the held overlay guard is returned so the caller can read the
     /// applied overlay without releasing and reacquiring the mutex, which could
     /// otherwise expose an empty or partially rebuilt overlay to another reader.
+    /// Sleep for a refresh backoff and account for it, so a slow read can be
+    /// attributed to retry sleeps rather than decoding or lock waits.
+    fn note_refresh_sleep(&self, delay_ms: u64) {
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        self.read_refresh_sleeps.fetch_add(1, Ordering::Relaxed);
+        self.read_refresh_sleep_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     pub(super) fn refresh_read_journal(
         &self,
     ) -> Result<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>, StorageError>
@@ -881,9 +912,15 @@ impl PackfileStorage {
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
+            // A reader may open while one writer is active and outlive a
+            // restart that changes residency. Check before returning a result.
+            if overlay.pool.is_some() {
+                self.validate_shared_reader_reload_mode()?;
+            }
             if self.refresh_worker_overlay(overlay)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
+            self.validate_shared_reader_reload_mode()?;
             if !self.reload_index_from_checkpoint() {
                 reload_failed = true;
                 drop(guard);
@@ -891,7 +928,7 @@ impl PackfileStorage {
                     .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
                     .unwrap_or(MAX_BACKOFF_MS)
                     .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                self.note_refresh_sleep(delay_ms);
                 continue;
             }
             overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
@@ -927,11 +964,16 @@ impl PackfileStorage {
                     .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
                     .unwrap_or(MAX_BACKOFF_MS)
                     .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                self.note_refresh_sleep(delay_ms);
             }
         }
         let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;
         if reload_failed || advanced {
+            // If durable shared-WAL coverage advanced without a resident
+            // checkpoint, this is not a transient read race: the worker was
+            // opened resident against a paged writer. Surface the configuration
+            // mismatch instead of telling callers to retry indefinitely.
+            self.validate_shared_reader_reload_mode()?;
             Err(StorageError::WouldBlock(
                 "read-committed reload failed or checkpoint coverage advanced; retry the read"
                     .to_owned(),

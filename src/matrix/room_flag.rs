@@ -14,12 +14,12 @@ use crate::csr_adjacency::CsrAdjacency;
 use crate::database::{Database, DatabaseTransaction};
 use crate::interop::{
     decode_verdict, derive_id, event_record_id, event_verdict_collection_id,
-    room_event_collection_id, room_flag_collection_id,
+    room_event_collection_id, room_flag_collection_id, room_scope_id,
 };
 use crate::layout::ShardType;
+use crate::ordered_timeline::EventTopoIndex;
 use crate::short_id::ShortIdIndex;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
-use crate::timeline::{room_scope_id, TimelineIndex};
 
 /// Magic prefix for the flag index metadata record (`b"FLGM"`).
 pub const FLAG_META_MAGIC: [u8; 4] = *b"FLGM";
@@ -997,9 +997,10 @@ impl RoomFlagIndex {
     }
 
     fn timeline_nodes(&self, db: &Database) -> Result<Vec<NodeId>, StorageError> {
-        let room_name = String::from_utf8_lossy(&self.room_id);
-        let timeline_index =
-            TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_name.as_ref());
+        let timeline_index = EventTopoIndex::open(
+            db.pool(ShardType::EventDag).as_ref(),
+            crate::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        );
         let room_scope = room_scope_id(&self.room_id);
         let mut cursor = None;
         let mut timeline_nodes = Vec::new();
@@ -1009,7 +1010,7 @@ impl RoomFlagIndex {
                 break;
             }
             for entry in &page.entries {
-                timeline_nodes.push(entry.node_id);
+                timeline_nodes.push(entry.event_node_id);
             }
             if page.next_cursor.is_none() {
                 break;

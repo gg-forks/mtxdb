@@ -1,7 +1,7 @@
 use super::{
     changes_since_full_scans, set_changes_since_before_read_hook,
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation, MAX_RECLAIM_TRIGGER_LEN,
+    Journal, JournalCoordinator, Mutation, SegmentPosition, MAX_RECLAIM_TRIGGER_LEN,
 };
 use super::{TxnStage, TxnStageState};
 use std::fs;
@@ -20,7 +20,7 @@ impl ReplayTestDir {
     fn new(label: &str) -> Self {
         loop {
             let id = REPLAY_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::test_scratch::root().join(format!(
                 "mtxdb_replay_{label}_{}_{}",
                 std::process::id(),
                 id
@@ -45,7 +45,7 @@ impl Drop for ReplayTestDir {
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    crate::test_scratch::root().join(format!(
         "mtxdb_journal_{label}_{}_{}",
         std::process::id(),
         std::thread::current()
@@ -2558,6 +2558,59 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 }
 
 #[test]
+fn segment_position_moves_the_base_but_not_the_next_number_on_reclaim() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("segment_position");
+    let path = dir.journal_path();
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+
+    let initial = coordinator.segment_position();
+    assert_eq!(
+        initial,
+        SegmentPosition {
+            base_sequence: 1,
+            next_sequence: 1,
+            base_lsn: 1,
+            next_lsn: 1,
+            groups: 0,
+        }
+    );
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let second = coordinator
+        .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    let before = coordinator.segment_position();
+    assert_eq!(before.groups, 2);
+    assert_eq!(before.base_sequence, first.sequence);
+    assert_eq!(before.base_lsn, first.first_lsn);
+    assert_eq!(before.next_sequence, second.sequence.saturating_add(1));
+    assert_eq!(before.next_lsn, second.last_lsn.saturating_add(1));
+
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.report_pool_coverage(ShardType::EventDag, second.last_lsn);
+    let reclaimed = coordinator.reclaim_shared().unwrap().unwrap();
+    assert!(reclaimed.reclaimed_bytes > 0);
+
+    // Reclaim drops assigned groups: the retained window's base becomes the
+    // next number, while nothing new is assigned.
+    let after = coordinator.segment_position();
+    assert_eq!(after.groups, 0);
+    assert_eq!(after.base_sequence, before.next_sequence);
+    assert_eq!(after.base_lsn, before.next_lsn);
+    assert_eq!(after.next_sequence, before.next_sequence);
+    assert_eq!(after.next_lsn, before.next_lsn);
+}
+
+#[test]
 fn shared_reclaim_revokes_a_lease_over_the_cap() {
     use crate::layout::ShardType;
 
@@ -2720,6 +2773,176 @@ fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn pre_sync_hook_runs_after_the_boundary_is_captured_and_before_it_is_durable() {
+    let coordinator = open_arc("pre_sync_order");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let hooked = coordinator.clone();
+        let seen = seen.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            // Not durable yet when the hook runs.
+            seen.lock().push(hooked.committed_lsn());
+            Ok(())
+        })));
+    }
+
+    coordinator.sync_through(first.last_lsn).unwrap();
+
+    assert_eq!(
+        *seen.lock(),
+        vec![0],
+        "the hook runs once, before the fsync"
+    );
+    assert_eq!(coordinator.committed_lsn(), first.last_lsn);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn a_group_published_while_the_hook_runs_is_not_in_the_boundary() {
+    let coordinator = open_arc("pre_sync_late_publish");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let late = Arc::new(AtomicU64::new(0));
+    {
+        let hooked = coordinator.clone();
+        let late = late.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            // A writer publishes after the boundary was captured: its record
+            // must not become durable on the strength of this hook's work.
+            if late.load(Ordering::SeqCst) == 0 {
+                let receipt = hooked.publish_group(&[put(2, 2, b"late")]).unwrap();
+                late.store(receipt.last_lsn, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+    }
+
+    coordinator.sync_through(first.last_lsn).unwrap();
+
+    let late_lsn = late.load(Ordering::SeqCst);
+    assert!(late_lsn > first.last_lsn);
+    assert_eq!(
+        coordinator.committed_lsn(),
+        first.last_lsn,
+        "the late group is outside the captured boundary"
+    );
+    // The next sync covers it, running the hook again first.
+    coordinator.sync_through(late_lsn).unwrap();
+    assert_eq!(coordinator.committed_lsn(), late_lsn);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn reclaim_runs_the_pre_sync_hook_before_making_retained_groups_durable() {
+    let coordinator = open_arc("reclaim_pre_sync");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    coordinator
+        .publish_group(&[put(1, 2, b"retained")])
+        .unwrap();
+    let runs = Arc::new(AtomicU64::new(0));
+    {
+        let runs = runs.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+    }
+
+    let reclaim = coordinator.reclaim_through(first.last_lsn).unwrap();
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the hook covers the retained suffix before its fsync"
+    );
+    assert!(reclaim.reclaimed_bytes > 0);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn reclaim_skips_a_group_published_after_the_hook_boundary() {
+    let coordinator = open_arc("reclaim_pre_sync_late");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let late = Arc::new(AtomicU64::new(0));
+    {
+        let hooked = coordinator.clone();
+        let late = late.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            if late.load(Ordering::SeqCst) == 0 {
+                let receipt = hooked.publish_group(&[put(2, 2, b"late")]).unwrap();
+                late.store(receipt.last_lsn, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+    }
+    let reclaim = coordinator.reclaim_through(first.last_lsn).unwrap();
+
+    assert!(late.load(Ordering::SeqCst) > first.last_lsn);
+    assert_eq!(
+        reclaim.reclaimed_bytes, 0,
+        "a late group must not become durable through the rewrite"
+    );
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn a_failing_pre_sync_hook_fails_the_sync_without_poisoning_the_journal() {
+    let coordinator = open_arc("pre_sync_failure");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    coordinator.set_pre_sync_hook(Some(Arc::new(|| {
+        Err(std::io::Error::other("adjacency flush failed"))
+    })));
+
+    assert!(coordinator.sync_through(first.last_lsn).is_err());
+    assert_eq!(coordinator.committed_lsn(), 0, "nothing became durable");
+
+    // The hook's failure is not a dropped-pages fsync failure: clearing it
+    // lets the same group commit.
+    coordinator.set_pre_sync_hook(None);
+    coordinator.sync_through(first.last_lsn).unwrap();
+    assert_eq!(coordinator.committed_lsn(), first.last_lsn);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn the_background_committer_runs_the_pre_sync_hook_before_its_group_commit() {
+    let coordinator = open_arc("pre_sync_background");
+    let runs = Arc::new(AtomicU64::new(0));
+    {
+        let runs = runs.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+    }
+    coordinator
+        .start_background_committer(GroupCommitConfig {
+            interval: Duration::from_millis(20),
+            max_pending: u64::MAX,
+        })
+        .unwrap();
+
+    let lsn = coordinator
+        .publish_group(&[put(3, 3, b"timer")])
+        .map(|receipt| receipt.last_lsn)
+        .unwrap();
+    let token = coordinator.request_durable(lsn);
+    coordinator.wait_durable(token).unwrap();
+
+    assert!(
+        runs.load(Ordering::SeqCst) >= 1,
+        "a timer commit must run the hook before it fsyncs"
+    );
+    coordinator.stop_background_committer().unwrap();
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
 }
 
 #[test]
@@ -4057,7 +4280,7 @@ fn inactive_stage_rejects_every_staging_call_without_changing_state() {
     stage
         .stage_remove_records(ShardType::State, [1; 16], &[])
         .unwrap();
-    assert!(stage.is_empty());
+    assert!(stage.is_empty(), "value should be empty");
 }
 
 #[test]

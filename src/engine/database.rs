@@ -45,6 +45,14 @@ pub struct PoolPolicy {
     /// root, HAMT nodes after their children); any other policy keeps id
     /// order. Logical ordering only: it never changes what is stored.
     pub ordering: crate::record_class::OrderingPolicy,
+    /// Rotation threshold, in bytes, for this pool's active pack.
+    ///
+    /// `None` uses [`crate::shard::MAX_SHARD_BYTES`], the hard ceiling imposed
+    /// by the 32-bit locator offset. A smaller threshold seals the active pack
+    /// sooner, which is what produces per-pack index sidecars and lets a reader
+    /// page locators instead of scanning one large pack. It changes only when
+    /// rotation happens, never what a record means.
+    pub max_shard_bytes: Option<u64>,
     /// When appended frames reach the pack file.
     ///
     /// The default [`crate::shard::AppendPolicy::Eager`] writes each frame as
@@ -68,6 +76,7 @@ impl Default for PoolPolicy {
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
             index_residency: crate::index::IndexResidency::Resident,
             ordering: crate::record_class::OrderingPolicy::None,
+            max_shard_bytes: None,
             append_policy: crate::shard::AppendPolicy::Eager,
         }
     }
@@ -271,6 +280,92 @@ impl DatabaseTransaction<'_> {
             .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
     }
 
+    /// Atomically increment signed 64-bit big-endian counters in this transaction.
+    /// Missing or removed records are zero. Duplicate keys are applied in input
+    /// order and the returned values correspond to each input delta.
+    ///
+    /// Each distinct key is read once. A record-version precondition is reused
+    /// when already staged; otherwise the live record version is captured,
+    /// including when the transaction has a blind staged put for the key.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] for malformed counters or arithmetic
+    /// overflow, and propagates storage or transaction-staging errors.
+    pub fn increment_counters(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        deltas: &[(NodeId, i64)],
+    ) -> Result<Vec<i64>, StorageError> {
+        let _lifecycle = self.lifecycle.lock();
+        if deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut positions = std::collections::HashMap::with_capacity(deltas.len());
+        let mut ids = Vec::new();
+        for (id, _) in deltas {
+            if !positions.contains_key(id) {
+                positions.insert(*id, ids.len());
+                ids.push(*id);
+            }
+        }
+
+        // Read live values and versions even for staged keys: a blind put
+        // still needs a live-version precondition before the counter write.
+        let (live, versions) = self
+            .database
+            .pool(pool)
+            .get_with_record_versions(&collection_id, &ids)?;
+        let staged = self.stage.lookup_many(pool, &collection_id, &ids);
+
+        let mut values = Vec::with_capacity(ids.len());
+        let mut new_expectations = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let value = match &staged[i] {
+                StagedLookup::Put(bytes) => Some(bytes.as_slice()),
+                StagedLookup::Deleted => None,
+                StagedLookup::Absent => live[i].as_ref().map(|v| v.bytes.as_ref()),
+            };
+            let value = match value {
+                None | Some([]) => 0,
+                Some(bytes) if bytes.len() == 8 => {
+                    let mut encoded = [0u8; 8];
+                    encoded.copy_from_slice(bytes);
+                    i64::from_be_bytes(encoded)
+                }
+                Some(_) => {
+                    return Err(StorageError::Corrupt(format!(
+                        "counter {id:?} is not 8 bytes"
+                    )))
+                }
+            };
+            values.push(value);
+            if !self.stage.has_record_expectation(pool, &collection_id, id) {
+                new_expectations.push((*id, versions[i]));
+            }
+        }
+
+        let mut results = Vec::with_capacity(deltas.len());
+        for (id, delta) in deltas {
+            let value = &mut values[positions[id]];
+            *value = value
+                .checked_add(*delta)
+                .ok_or_else(|| StorageError::Corrupt("counter overflow".to_owned()))?;
+            results.push(*value);
+        }
+
+        let writes: Vec<_> = ids
+            .iter()
+            .zip(&values)
+            .map(|(id, value)| (*id, value.to_be_bytes().to_vec()))
+            .collect();
+        self.stage
+            .stage_puts_with_record_expectations(pool, collection_id, &new_expectations, &writes)
+            .map_err(StorageError::Io)?;
+        Ok(results)
+    }
+
     /// Stage removal of a collection.
     ///
     /// # Errors
@@ -314,6 +409,31 @@ impl DatabaseTransaction<'_> {
         node_ids: &[NodeId],
     ) -> io::Result<()> {
         self.remove_many_inner(pool, collection_id, node_ids, None)
+    }
+
+    /// Stage removals for IDs obtained from a consistent metadata-only
+    /// collection scan, guarded by the collection version sampled with that
+    /// scan. Unlike [`Self::remove_many`], this does not fetch record payloads.
+    /// The caller must not have staged other mutations for these IDs.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive, its byte limit is exceeded,
+    /// or the collection version precondition cannot be staged.
+    pub(crate) fn remove_known_live_many(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[NodeId],
+        expected_collection_version: u64,
+    ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        if self.stage.state() != TxnStageState::Active {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        self.stage
+            .stage_expectation(pool, collection_id, expected_collection_version)?;
+        self.stage
+            .stage_remove_records(pool, collection_id, node_ids)
     }
 
     /// Stage removals with versions observed alongside a transaction-view
@@ -842,9 +962,13 @@ impl Database {
 
     /// Open with explicit policies and runtime settings.
     ///
-    /// A `Some` index residency in `config` overrides every pool's policy.
-    /// Paged residency is rejected before any I/O because shared-WAL
-    /// journaling cannot advance durable coverage from a paged sync.
+    /// A `Some` index residency in `config` overrides every pool's policy,
+    /// including paged. A paged pool advances durable coverage from its
+    /// sidecar sync, so a read-only worker sharing that pool's WAL must open
+    /// with the same residency (see
+    /// `PackfileStorage::open_read_committed_shared_with_config`, available
+    /// with the `multi-reader` feature); the plain shared reader opens
+    /// resident and cannot reload a paged writer's reclaimed WAL.
     ///
     /// # Errors
     /// Returns an error for an invalid config, unsupported residency, if the
@@ -858,13 +982,6 @@ impl Database {
         if let Some(residency) = config.index_residency {
             for shard in ShardType::ALL {
                 policies.for_shard_mut(shard).index_residency = residency;
-            }
-        }
-        for shard in ShardType::ALL {
-            if policies.for_shard(shard).index_residency == crate::index::IndexResidency::Paged {
-                return Err(StorageError::Unsupported(format!(
-                    "{shard:?} uses Paged index residency, which cannot use shared WAL journaling; use Resident residency"
-                )));
             }
         }
         Self::open_with_policies_and_config_unchecked(root, policies, config)
@@ -898,6 +1015,9 @@ impl Database {
         }
         coordinator.configure_replay_lease_cap(config.replay_lease_max_retained_bytes);
 
+        let cache_budget = config
+            .cache_bytes
+            .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes)));
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {
             let dir = layout.pool_path(shard);
@@ -905,12 +1025,16 @@ impl Database {
             let store = PackfileStorage::open_shared_member(
                 dir,
                 config.cache_capacity,
+                cache_budget.clone(),
+                policy.max_shard_bytes,
                 policy.compress,
                 policy.checksum_policy,
                 policy.index_residency,
             )?
             .with_append_policy(policy.append_policy);
             store.set_stats_enabled(config.stats_enabled);
+            store.set_point_random_mmap(config.point_random_mmap);
+            store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.
             // Left on, every miss after a sync (which moves the durable
